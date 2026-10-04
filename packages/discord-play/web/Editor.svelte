@@ -89,9 +89,7 @@
       <span class="workspace-brand">teapilot</span>
       <span class="workspace-crumb" title={file?.name}>workspace <span aria-hidden="true">/</span> {file?.name ?? 'opening file…'}</span>
       <div class="workspace-head-actions">
-        <span class="workspace-state" class:unsaved={dirty} role="status">{saving ? 'saving…' : busy ? 'opening file…' : error ? 'needs attention' : dirty ? 'unsaved changes' : file ? 'all changes saved' : 'file unavailable'}</span>
         <button class="workspace-theme" onclick={toggleTheme} aria-label="switch theme">{dark ? 'light' : 'dark'}</button>
-        <button class="workspace-button workspace-save header-save" onclick={save} disabled={!dirty || saving}>save changes <kbd>{shortcut}</kbd></button>
       </div>
     </header>
     <div class="workspace-canvas">
@@ -121,11 +119,10 @@
       </div>
       <div class="workspace-toolbar">
         <button class="workspace-button workspace-save" onclick={save} disabled={!dirty || saving}><span class="workspace-button-icon" aria-hidden="true">◀</span>{saving ? 'saving…' : 'save changes'} <kbd>{shortcut}</kbd></button>
-        <span class="workspace-hint">changes only apply when you save.</span>
+        <span class="workspace-hint" class:unsaved={dirty} role="status">{saving ? 'saving…' : busy ? 'opening file…' : error ? 'needs attention' : dirty ? 'unsaved changes' : file ? 'all changes saved' : 'file unavailable'}</span>
       </div>
     </div>
     <img class="workspace-teacup" src={teacup} alt="" aria-hidden="true">
   </section>
   <p class="workspace-credit">💖 rendered with <a href="https://github.com/touchifyapp/svelte-codemirror-editor">@touchifyapp/svelte-codemirror-editor</a></p>
 </main>
-
