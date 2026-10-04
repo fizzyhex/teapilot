@@ -19,3 +19,4 @@ coverage/
 extensions/vscode/runtime/
 extensions/vscode/.vscode-test/
 .claude/
+.slim/deepwork/

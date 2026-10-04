@@ -48,7 +48,7 @@ const interaction = (customId: string, message: any) => ({
   reply: vi.fn(async () => undefined),
 });
 
-async function setup() {
+async function setup(extraHandlers: Record<string, any> = {}) {
   let nextId = 0;
   const sent: any[] = [];
   const channel: any = {
@@ -61,7 +61,7 @@ async function setup() {
   };
   harness.client = undefined;
   let incoming: any;
-  const handlers = { message(value: any) { incoming = value; }, command: vi.fn(), reply: vi.fn(), component: vi.fn(), asides: { keep: vi.fn(), find: vi.fn(), summarise: vi.fn() } };
+  const handlers = { message(value: any) { incoming = value; }, command: vi.fn(), reply: vi.fn(), component: vi.fn(), asides: { keep: vi.fn(), find: vi.fn(), summarise: vi.fn() }, ...extraHandlers };
   const gateway = await connect({ token: 'test', allowedUserIds: [operator], channelIds: [], root: '.', startMode: 'ask' } as any,
     handlers, vi.fn());
   harness.client.channels = { fetch: async () => channel };
@@ -70,6 +70,17 @@ async function setup() {
   harness.client.emit('messageCreate', source);
   return { gateway, sent, channel, client: harness.client, transport: incoming.transport() };
 }
+
+it('opens a fresh private editor link from an authorized file-reply button', async () => {
+  const openEditorForMessage = vi.fn((messageId: string, user: { id: string }) => user.id === operator ? `https://edit.test/${messageId}/fresh` : undefined);
+  const { gateway, client } = await setup({ openEditorForMessage });
+  const click = interaction('teapilot:edit-file:open', { id: 'file-reply-1' });
+  client.emit('interactionCreate', click);
+  await vi.waitFor(() => expect(click.reply).toHaveBeenCalledOnce());
+  expect(openEditorForMessage).toHaveBeenCalledWith('file-reply-1', { id: operator, name: operator });
+  expect(click.reply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('https://edit.test/file-reply-1/fresh'), flags: 64 }));
+  await gateway.close();
+});
 
 afterEach(() => { vi.useRealTimers(); });
 

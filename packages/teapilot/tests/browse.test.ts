@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inflateRawSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
-import { browseSubmit, workspaceBrowser } from '../src/discord/browse.js';
+import { browseButtons, browseSubmit, workspaceBrowser } from '../src/discord/browse.js';
 import { WorkspaceStore } from '../src/workspace/store.js';
 import { zipFile } from '../src/workspace/zip.js';
 
@@ -68,6 +68,15 @@ describe('open file', () => {
       const view = await browser.file(input);
       expect(view, input).toEqual({ note: "here's `project/scripts/tea.py` (8 B)", file: { name: 'tea.py', data: Buffer.from('print(1)') } });
     }
+  });
+
+  it('keeps file opening as a reply target for the browser context menu, without a third tree form', async () => {
+    const store = WorkspaceStore.at(await mkdtemp(join(tmpdir(), 'teapilot-browse-')));
+    await store.saveAt('a', 'project/scripts/tea.py', Buffer.from('print(1)'), 'op');
+    const browser = workspaceBrowser(store, 'a');
+    expect(Object.keys(browseButtons)).toEqual(['folder', 'file']);
+    expect(browser.filePath?.('tea.py')).toBe('project/scripts/tea.py');
+    expect(browser.filePath?.('../secret')).toBeUndefined();
   });
 
   it('says what went wrong, and what might have been meant', async () => {

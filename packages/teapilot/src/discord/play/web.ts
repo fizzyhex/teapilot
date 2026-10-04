@@ -7,14 +7,17 @@ import { WebSocketServer, WebSocket } from 'ws';
 import type { User } from '@teapilot/discord-play';
 import { publishPlay } from './funnel.js';
 import type { PlayRuntime } from './runtime.js';
+import { WorkspaceEditor } from './editor.js';
+import type { WorkspaceStore } from '../../workspace/store.js';
 
 interface Grant { id: string; user: User; until: number }
 const nonce = () => randomBytes(32).toString('base64url');
 const types: Record<string, string> = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.png': 'image/png', '.jpg': 'image/jpeg', '.woff2': 'font/woff2', '.ttf': 'font/ttf', '.md': 'text/plain', '.txt': 'text/plain' };
 
 /** A single local host; launch tickets carry only the identity established by Discord. */
-export async function openPlayWeb(runtime: PlayRuntime, options: { funnel: boolean; log(text: string): void; port?: number; signal?: AbortSignal; assets?: string }) {
+export async function openPlayWeb(runtime: PlayRuntime, options: { funnel: boolean; log(text: string): void; port?: number; signal?: AbortSignal; assets?: string; workspace?: WorkspaceStore }) {
   const tickets = new Map<string, Grant>(), sessions = new Map<string, Grant>();
+  const editor = options.workspace ? new WorkspaceEditor(options.workspace) : undefined;
   const root = options.assets ?? resolve(dirname(fileURLToPath(import.meta.resolve('@teapilot/discord-play'))), '../dist/web');
   await access(resolve(root, 'index.html'));
   let origin = `http://localhost:${options.port ?? 2048}`;
@@ -31,6 +34,7 @@ export async function openPlayWeb(runtime: PlayRuntime, options: { funnel: boole
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: http: data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
     try {
       const url = new URL(req.url ?? '/', origin);
+      if (editor && await editor.handle(req, res, origin)) return;
       if (req.method === 'POST' && url.pathname === '/launch') {
         if (req.headers.origin !== origin) { res.writeHead(403).end(); return; }
         let body = '';
@@ -57,7 +61,7 @@ export async function openPlayWeb(runtime: PlayRuntime, options: { funnel: boole
         if (!file) { res.writeHead(404).end(); return; }
         res.setHeader('Content-Type', types[extname(name)] ?? 'application/octet-stream'); res.end(file.data); return;
       }
-      const path = /^\/play\/[a-z0-9]+$/.test(url.pathname) ? 'index.html' : url.pathname.slice(1);
+      const path = /^\/(?:play\/[a-z0-9]+|edit\/[a-f0-9]{24})$/.test(url.pathname) ? 'index.html' : url.pathname.slice(1);
       if (!path || path.startsWith('/') || path.includes('..') || !/^[\w/.-]+$/.test(path)) { res.writeHead(404).end(); return; }
       const data = await readFile(resolve(root, path));
       res.setHeader('Content-Type', types[extname(path)] ?? 'application/octet-stream'); res.end(data);
@@ -133,7 +137,13 @@ export async function openPlayWeb(runtime: PlayRuntime, options: { funnel: boole
       const ticket = nonce(); tickets.set(ticket, { id, user, until: Date.now() + 5 * 60_000 });
       return `${origin}/play/${id}#${ticket}`;
     },
+    editLink(conversation: string, path: string, user: User): string | undefined { return editor?.launch(origin, conversation, path, user.id); },
+    bindFileReply(message: string, conversation: string, path: string, user: string): void { editor?.bindFileMessage(message, conversation, path, user); },
+    editFileMessage(message: string, user: string): string | null | undefined {
+      if (!editor?.hasFileMessage(message)) return undefined;
+      return editor.launchForFileMessage(origin, message, user) ?? null;
+    },
     get origin() { return origin; },
-    async close() { clearInterval(sweep); await stopFunnel?.(); tickets.clear(); sessions.clear(); for (const ws of sockets.clients) ws.terminate(); sockets.close(); server.closeAllConnections(); await new Promise<void>(done => server.close(() => done())); },
+    async close() { clearInterval(sweep); await stopFunnel?.(); tickets.clear(); sessions.clear(); editor?.close(); for (const ws of sockets.clients) ws.terminate(); sockets.close(); server.closeAllConnections(); await new Promise<void>(done => server.close(() => done())); },
   };
 }

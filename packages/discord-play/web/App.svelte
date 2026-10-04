@@ -1,5 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  let EditorPage = $state<any>();
+  const editMode = location.pathname.startsWith('/edit/');
+  onMount(() => { if (editMode) void import('./Editor.svelte').then(module => EditorPage = module.default); });
   import teacup from '../art/teacup.png';
   import { skin } from './skin';
   import Text from './Text.svelte';
@@ -48,6 +51,7 @@
   }
   function toggleTheme() { dark = !dark; try { localStorage.setItem('play-theme', dark ? 'dark' : 'light'); } catch {} }
   onMount(() => {
+    if (editMode) return;
     let stopped = false, retry: ReturnType<typeof setTimeout>, animation = 0, heardAt = 0;
     let previous = new Set<string>();
     const keys = new Set<string>();
@@ -136,6 +140,9 @@
   });
 </script>
 
+{#if editMode}
+  {#if EditorPage}<EditorPage />{:else}<div class="editor-loading">opening editor…</div>{/if}
+{:else}
 <main class:dark>
   <section class="paper" aria-label="game">
     <header><span>{view?.title ?? 'discord.play'}</span><button onclick={toggleTheme} aria-label="switch theme">{dark ? 'light' : 'dark'}</button></header>
@@ -195,3 +202,4 @@
     </dialog>
   {/if}
 </main>
+{/if}

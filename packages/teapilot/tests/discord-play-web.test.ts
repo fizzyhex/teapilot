@@ -8,6 +8,7 @@ import { PlayStore } from '../src/discord/play/store.js';
 import type { MessagePayload } from '../src/discord/play/render.js';
 import { openPlayWeb } from '../src/discord/play/web.js';
 import * as funnel from '../src/discord/play/funnel.js';
+import { WorkspaceStore } from '../src/workspace/store.js';
 
 const cleanups: Array<() => unknown> = [];
 afterEach(async () => { vi.restoreAllMocks(); for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -28,11 +29,13 @@ async function setup(publish = false) {
   const assets = join(dir, 'web'); await mkdir(assets);
   await writeFile(join(assets, 'index.html'), '<script src="/app.js"></script>');
   await writeFile(join(assets, 'app.js'), 'console.log("test")');
-  const web = await openPlayWeb(runtime, { funnel: publish, port: 0, log: vi.fn(), assets });
+  const workspace = WorkspaceStore.at(join(dir, 'state'));
+  const file = await workspace.saveAt('conversation', 'src/main.js', Buffer.from('\uFEFFconst x = 1;\r\n'), 'teapilot');
+  const web = await openPlayWeb(runtime, { funnel: publish, port: 0, log: vi.fn(), assets, workspace });
   cleanups.push(() => web.close());
   const launch = () => new URL(web.launch('channel', 'message', owner)!);
   const redeem = async (url = launch(), id = record.id) => fetch(`${web.origin}/launch`, { method: 'POST', headers: { Origin: web.origin }, body: JSON.stringify({ ticket: url.hash.slice(1), id }) });
-  return { runtime, record, web, edit, launch, redeem };
+  return { runtime, record, web, edit, launch, redeem, workspace, file };
 }
 function socket(origin: string, id: string, cookie: string) {
   const ws = new WebSocket(`${origin.replace('http:', 'ws:')}/live/${id}`, { origin, headers: { Cookie: cookie } });
@@ -127,6 +130,60 @@ it('serves browser assets and only the authorized game’s rendered images', asy
   const html = await (await fetch(`${web.origin}/play/${record.id}`)).text();
   const script = /src="([^"]+\.js)"/.exec(html)![1]!;
   expect((await fetch(`${web.origin}${script}`)).status).toBe(200);
+});
+
+it('edits one exact workspace file through a signed one-use launch and scoped revision session', async () => {
+  const { web, workspace, file } = await setup();
+  const link = new URL(web.editLink('conversation', file.name, owner)!);
+  expect(link.pathname).toMatch(/^\/edit\/[a-f0-9]{24}$/);
+  const launch = await fetch(`${web.origin}/edit/launch`, { method: 'POST', headers: { Origin: web.origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ ticket: link.hash.slice(1), id: link.pathname.split('/').at(-1) }) });
+  expect(launch.status).toBe(204);
+  expect(launch.headers.get('set-cookie')).toContain(`Path=/api/edit/${link.pathname.split('/').at(-1)}`);
+  expect((await fetch(`${web.origin}/edit/launch`, { method: 'POST', headers: { Origin: web.origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ ticket: link.hash.slice(1), id: link.pathname.split('/').at(-1) }) })).status).toBe(401);
+  const cookie = launch.headers.get('set-cookie')!.split(';')[0]!;
+  const endpoint = `${web.origin}/api/edit/${link.pathname.split('/').at(-1)}`;
+  const opened = await fetch(endpoint, { headers: { Cookie: cookie } });
+  expect(await opened.json()).toMatchObject({ name: 'src/main.js', content: 'const x = 1;\r\n' });
+  expect((await fetch(endpoint, { headers: { Cookie: cookie, 'Sec-Fetch-Site': 'cross-site' } })).status).toBe(403);
+  const before = await workspace.readEditable('conversation', file.name);
+  const saved = await fetch(endpoint, { method: 'PUT', headers: { Origin: web.origin, Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ content: 'const x = 2;\n', revision: before!.revision }) });
+  expect(saved.status).toBe(200);
+  expect((await workspace.read('conversation', file.name))!.data.toString('utf8')).toBe('\uFEFFconst x = 2;\r\n');
+  expect((await fetch(endpoint, { method: 'PUT', headers: { Origin: web.origin, Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ content: 'stale', revision: before!.revision }) })).status).toBe(409);
+  expect((await fetch(endpoint, { method: 'PUT', headers: { Origin: 'https://evil.test', Cookie: cookie, 'Content-Type': 'application/json' }, body: '{}' })).status).toBe(403);
+  expect((await fetch(endpoint, { headers: { Cookie: cookie.replace('workspace_edit=', 'play_') } })).status).toBe(401);
+});
+
+it('binds file replies to the exact workspace and user, mints a fresh private link on menu click, and rejects cleared files', async () => {
+  const { web, workspace, file } = await setup();
+  web.bindFileReply('reply-message', 'conversation', file.name, owner.id);
+  expect(web.editFileMessage('reply-message', 'other-user')).toBeNull();
+  const first = new URL(web.editFileMessage('reply-message', owner.id)!);
+  const second = new URL(web.editFileMessage('reply-message', owner.id)!);
+  expect(first.hash).not.toBe(second.hash);
+  expect((await fetch(`${web.origin}/edit/launch`, { method: 'POST', headers: { Origin: web.origin }, body: JSON.stringify({ ticket: first.hash.slice(1), id: first.pathname.split('/').at(-1) }) })).status).toBe(204);
+  const expired = new URL(web.editFileMessage('reply-message', owner.id)!);
+  const now = Date.now(), clock = vi.spyOn(Date, 'now').mockReturnValue(now + 6 * 60_000);
+  try {
+    expect((await fetch(`${web.origin}/edit/launch`, { method: 'POST', headers: { Origin: web.origin }, body: JSON.stringify({ ticket: expired.hash.slice(1), id: expired.pathname.split('/').at(-1) }) })).status).toBe(401);
+  } finally { clock.mockRestore(); }
+  await workspace.clearFiles('conversation');
+  expect(web.editFileMessage('reply-message', owner.id)).toBeNull();
+  const late = await fetch(`${web.origin}/edit/launch`, { method: 'POST', headers: { Origin: web.origin }, body: JSON.stringify({ ticket: second.hash.slice(1), id: second.pathname.split('/').at(-1) }) });
+  expect(late.status).toBe(404);
+});
+
+it('accepts escaped JSON larger than one MiB when decoded content itself is allowed', async () => {
+  const { web, workspace, file } = await setup();
+  const link = new URL(web.editLink('conversation', file.name, owner)!);
+  const launch = await fetch(`${web.origin}/edit/launch`, { method: 'POST', headers: { Origin: web.origin }, body: JSON.stringify({ ticket: link.hash.slice(1), id: link.pathname.split('/').at(-1) }) });
+  const cookie = launch.headers.get('set-cookie')!.split(';')[0]!;
+  const endpoint = `${web.origin}/api/edit/${link.pathname.split('/').at(-1)}`;
+  const opened = await (await fetch(endpoint, { headers: { Cookie: cookie } })).json() as { revision: string };
+  const content = '\u0001'.repeat(190_000);
+  const response = await fetch(endpoint, { method: 'PUT', headers: { Origin: web.origin, Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify({ content, revision: opened.revision }) });
+  expect(response.status).toBe(200);
+  expect((await workspace.readEditable('conversation', file.name))?.content).toBe(content);
 });
 
 it('acknowledges successive browser inputs while Discord is blocked, then mirrors only the latest view', async () => {

@@ -81,19 +81,22 @@ function sandboxShell(context: ConversationWorkspace, status: SandboxStatus, app
   const tool = createBashTool(folder, { exposeSessionEnvironment: false, operations });
   return { ...tool, execute: async (id, params, signal, update) => {
     refused = [];
-    const before = await store.snapshot(conversation);
-    let result: AgentToolResult<unknown> | undefined, failure: unknown;
-    try { result = await tool.execute(id, params as never, signal, update); } catch (error) { failure = error; }
-    const notes = [
-      ...refused.length ? [`Connecting to ${refused.join(', ')} was not approved; do not try it again this turn.`] : [],
-      changesLine(await store.reconcile(conversation, before)),
-    ].join('\n');
-    if (failure !== undefined) {
-      const message = failure instanceof Error ? failure.message : String(failure);
-      const longer = /timed out after/.test(message) ? `. Pass a longer timeout (up to ${runLimits.maxSeconds}) or do less per command.` : '';
-      throw new Error(`${message}${longer}\n${notes}`);
-    }
-    return { ...result!, content: [...result!.content, { type: 'text', text: notes }] };
+    const release = store.beginCommand(conversation);
+    try {
+      const before = await store.snapshot(conversation);
+      let result: AgentToolResult<unknown> | undefined, failure: unknown;
+      try { result = await tool.execute(id, params as never, signal, update); } catch (error) { failure = error; }
+      const notes = [
+        ...refused.length ? [`Connecting to ${refused.join(', ')} was not approved; do not try it again this turn.`] : [],
+        changesLine(await store.reconcile(conversation, before)),
+      ].join('\n');
+      if (failure !== undefined) {
+        const message = failure instanceof Error ? failure.message : String(failure);
+        const longer = /timed out after/.test(message) ? `. Pass a longer timeout (up to ${runLimits.maxSeconds}) or do less per command.` : '';
+        throw new Error(`${message}${longer}\n${notes}`);
+      }
+      return { ...result!, content: [...result!.content, { type: 'text', text: notes }] };
+    } finally { release(); }
   } };
 }
 

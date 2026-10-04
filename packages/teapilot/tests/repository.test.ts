@@ -7,6 +7,7 @@ import { ExecutionPolicy } from '../src/execution/policy.js';
 import { Evidence } from '../src/routing/escalation.js';
 import { completion, fixture, mockServer } from './helpers.js';
 import { runHost } from '../src/host.js';
+import { WorkspaceStore } from '../src/workspace/store.js';
 
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const fn of cleanup.splice(0).reverse()) await fn(); });
@@ -125,6 +126,31 @@ it('keeps the conversation workspace out of a repository: .workspace/ is only a 
   const run = async (name: string, args: unknown) => (await tools.find(tool => tool.name === name)!.execute('id', args)).content.map(part => part.type === 'text' ? part.text : '').join('');
   await run('write', { path: '.workspace/apps/game.js', content: 'export default 1;\n' });
   expect(await readFile(join(f.cwd, '.workspace', 'apps', 'game.js'), 'utf8')).toBe('export default 1;\n');
+});
+
+it('rejects browser edits from an agent write until its workspace reconciliation finishes', async () => {
+  const f = await setup();
+  f.config.policy.permissions = ['repository.read', 'repository.write'];
+  const store = WorkspaceStore.at(f.config.stateDir);
+  const conversation = 'agent-editor-lease';
+  const file = await store.saveAt(conversation, 'note.txt', Buffer.from('before'), 'alice');
+  let entered!: () => void, resume!: () => void;
+  const inReconcile = new Promise<void>(resolve => { entered = resolve; });
+  const reconciliation = new Promise<void>(resolve => { resume = resolve; });
+  const tools = sessionTools(new ExecutionPolicy(store.folder(conversation), f.config, noApproval, undefined, undefined, true), {
+    stateDir: f.config.stateDir,
+    beginMutation: () => store.beginCommand(conversation),
+    changed: async () => { entered(); await reconciliation; await store.reconcile(conversation); },
+  });
+  const opened = store.readEditable(conversation, file.name)!;
+  const writing = tools.find(tool => tool.name === 'write')!.execute('id', { path: file.name, content: 'agent version' });
+  await inReconcile;
+  expect(store.saveEditable(conversation, file.name, 'browser version', opened.revision, 'alice')).toBeUndefined();
+  resume();
+  await writing;
+  const latest = store.readEditable(conversation, file.name)!;
+  expect(latest.content).toBe('agent version');
+  expect(store.saveEditable(conversation, file.name, 'browser version', latest.revision, 'alice')).not.toBeUndefined();
 });
 
 it('gives repeated equivalent inspection one recovery opportunity and invalidates checks on edits', () => {

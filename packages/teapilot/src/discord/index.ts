@@ -135,6 +135,7 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
     consult: consultant({ config, root, access, queue, run, signal }),
   });
   let browser: Awaited<ReturnType<typeof import('./play/web.js').openPlayWeb>> | undefined;
+  let browserHost: typeof browser;
 
   /**
    * Where teapilot cannot post, each /reply, /prompt or /collab is its own one-shot conversation, since it answers
@@ -355,7 +356,7 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
     if (tree) {
       const browser = workspaceBrowser(files, key);
       const view = browser.folder(tree[1] ?? '');
-      if ('note' in view) await command.respond(view.note); else await command.browse(view.text, browser, view.dir);
+      if ('note' in view) await command.respond(view.note); else await command.browse(view.text, browser, view.dir, key);
       return;
     }
     if (command.text === '/convo grants') {
@@ -493,6 +494,8 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
     allowed,
     component: interaction => void (surface ? play.interact(interaction) : interaction.reply('teapilot is still starting; try again in a moment.')).catch(failed('App interaction')),
     openBrowser: (channelId, messageId, user) => browser?.launch(channelId, messageId, user),
+    openEditorForMessage: (messageId, user) => browserHost?.editFileMessage(messageId, user.id),
+    bindFileReply: (messageId, conversation, path, user) => browserHost?.bindFileReply(messageId, conversation, path, user.id),
     asides: { keep: answer => asides.keep(answer), find: id => asides.find(id), summarise: summariser({ config, root, access, queue, run, signal }) },
   }, log);
   surface = gateway.play;
@@ -500,7 +503,7 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
   presence.start();
   const recovered = await play.recover();
   if (options.browser && !signal.aborted) {
-    try { browser = await (await import('./play/web.js')).openPlayWeb(play, { ...options.browser, log, signal }); }
+    try { browser = browserHost = await (await import('./play/web.js')).openPlayWeb(play, { ...options.browser, log, signal, workspace: files }); }
     catch (error) { log(`browser play is unavailable: ${error instanceof Error ? error.message : error}`); }
   }
   if (recovered) log(`Loaded ${recovered} discord.play app(s); each one starts again at the next click.`);

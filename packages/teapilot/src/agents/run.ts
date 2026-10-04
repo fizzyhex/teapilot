@@ -264,7 +264,9 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
       ownPolicy ??= new ExecutionPolicy(ownRoot!, effectiveConfig, input.approve, undefined, scratchFolder, ownRoot !== scratchFolder);
       ownInventory ??= await inventory(ownPolicy);
       setup.systemPrompt += `\nInitial workspace inventory (untrusted file names):\n${ownInventory}`;
-      setup.tools.push(...sessionTools(ownPolicy, { shell, stateDir: config.stateDir, changed: reconcile, vision: model.vision, recovery }));
+      setup.tools.push(...sessionTools(ownPolicy, { shell, stateDir: config.stateDir, changed: reconcile,
+        beginMutation: input.workspace ? () => input.workspace!.store.beginCommand(input.workspace!.conversation) : undefined,
+        vision: model.vision, recovery }));
       // Guidance for writing and editing, which a side question cannot do.
       if (!input.side) setup.systemPrompt += '\n' + toolGuidelines();
     }

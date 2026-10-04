@@ -35,6 +35,7 @@ export interface WorkspaceBrowser {
   /** What typing `input` into the folder form does; an empty one is the top of the workspace. */
   folder(input: string): FolderView;
   file(input: string): Promise<FileView>;
+  filePath?(input: string): string | undefined;
 }
 /** A view that is open under one message: the folder it shows follows every open folder. */
 export interface BrowseSession { browser: WorkspaceBrowser; dir: string }
@@ -88,6 +89,7 @@ export function workspaceBrowser(store: WorkspaceStore, conversation: string): W
   };
 
   return {
+    filePath(input) { return resolveFile(normal(input))?.name; },
     folder(input) {
       const path = normal(input);
       const top = !path || /^workspace\/?$/i.test(path);

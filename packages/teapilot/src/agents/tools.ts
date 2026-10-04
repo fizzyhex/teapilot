@@ -165,6 +165,8 @@ export interface SessionToolOptions {
   stateDir: string;
   /** Hears of each write or edit in the conversation's workspace, so its list of files keeps up. */
   changed?: () => Promise<unknown>;
+  /** Holds the workspace mutation lease through the file write and its index reconciliation. */
+  beginMutation?: () => () => void;
   recovery?: RequestRecovery;
 }
 
@@ -212,12 +214,15 @@ export function sessionTools(policy: ExecutionPolicy, options: SessionToolOption
   const root = policy.root;
   const { changed } = options;
   const recovery = options.recovery ?? new RequestRecovery();
-  const noticed = (tool: AgentTool): AgentTool => changed && ['write', 'edit'].includes(tool.name) ? { ...tool, execute: async (id, params, ...rest) => {
-    const result = await tool.execute(id, params, ...rest);
-    // The policy has made the path absolute by now.
-    const path = String((params as { path?: unknown }).path ?? '');
-    if ((result.details as { outcome?: ToolOutcome })?.outcome?.changed !== false && policy.owns(path) && !policy.inScratch(path)) await changed().catch(() => undefined);
-    return result;
+  const noticed = (tool: AgentTool): AgentTool => ['write', 'edit'].includes(tool.name) && (changed || options.beginMutation) ? { ...tool, execute: async (id, params, ...rest) => {
+    const release = options.beginMutation?.();
+    try {
+      const result = await tool.execute(id, params, ...rest);
+      // The policy has made the path absolute by now.
+      const path = String((params as { path?: unknown }).path ?? '');
+      if (changed && (result.details as { outcome?: ToolOutcome })?.outcome?.changed !== false && policy.owns(path) && !policy.inScratch(path)) await changed().catch(() => undefined);
+      return result;
+    } finally { release?.(); }
   } } : tool;
   const shell = options.shell === 'host' ? hostShell(root) : options.shell;
   return [
