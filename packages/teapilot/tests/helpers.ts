@@ -17,6 +17,8 @@ export async function fixture(): Promise<{ config: Config; cwd: string; cleanup:
   config.policy.limits.attemptTimeoutMs = 10000;
   // Unit tests never start the real sandbox; tests/sandbox.integration.test.ts does.
   config.workspace = { sandbox: 'off', allowedDomains: [], deniedDomains: [] };
+  // Unrelated mock-provider tests keep their original tool/context budgets; skills.test.ts opts in explicitly.
+  config.skills = { enabled: false };
   return { config, cwd, cleanup: () => rm(cwd, { recursive: true, force: true }) };
 }
 export type Handler = (body: any, request: IncomingMessage, response: ServerResponse) => void | Promise<void>;

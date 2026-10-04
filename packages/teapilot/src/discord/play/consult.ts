@@ -4,6 +4,7 @@ import type { HostDependencies, HostRequest, HostResult } from '../../host.js';
 import type { AccessStore } from '../access-store.js';
 import type { TurnQueue } from '../bridge.js';
 import type { Consultant } from './runtime.js';
+import type { SkillPreferences } from '../../skills/settings.js';
 
 /**
  * Answers an app's consult() with one headless request made as the app's owner. It holds no more
@@ -13,6 +14,7 @@ export function consultant(options: {
   config: Config; root: string; access: AccessStore; queue: TurnQueue;
   run: (request: HostRequest, dependencies: Pick<HostDependencies, 'approve'>) => Promise<HostResult>;
   signal?: AbortSignal;
+  skills?: (userId: string, conversation?: string) => SkillPreferences;
 }): Consultant {
   return async (play, prompt) => {
     const authorization = await SessionGrants.create(options.root, options.config, 'chat');
@@ -24,6 +26,7 @@ export function consultant(options: {
     if (!authorization.allows('inference')) throw new Error(`The app's owner no longer has teapilot access.`);
     const request: HostRequest = {
       cwd: options.root, mode: 'chat', authorization, signal: options.signal, tier: 'fast',
+      skills: options.skills?.(play.owner.id, play.conversation),
       prompt: [
         `A Discord app you built, "${play.title}", asks for the text below. Reply with only the text the app should receive: it is handed to the app's code and may be shown to players.`,
         'No preamble, sign-off or code fences. When the request asks for a format such as JSON, reply with exactly that and nothing else.',

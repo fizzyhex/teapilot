@@ -23,6 +23,7 @@
     "global:pull": "git pull && npm install --allow-git=all --allow-remote=all && npm run global:build",
     "test:package": "npm run test:package -w teapilot",
     "test:ollama": "npm run test:ollama -w teapilot",
+    "test:skills": "node packages/teapilot/scripts/skills-smoke.mjs",
     "term": "node packages/teapilot/scripts/agent-terminal.mjs",
     "discord-sim": "node packages/teapilot/scripts/agent-discord.mjs"
   }

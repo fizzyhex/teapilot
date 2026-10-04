@@ -10,8 +10,9 @@ import type { EventSink } from './integration/events.js';
 import { keptNote, workspaceCommand, workspaceHelp, type WorkspaceControls } from './workspace/commands.js';
 import type { SessionWorkspace } from './workspace/terminal.js';
 import { isTierPreference, tierPreferences, type Tier, type TierPreference } from './config.js';
+import type { SkillPreferences } from './skills/settings.js';
 
-const sessionHelp = `Commands: /mode ${modes.join('|')}, /tier ${tierPreferences.join('|')}, /convo clear, ${workspaceHelp}, /new, /cd <path>, /permissions, /grant <permission>, /revoke <permission>, /btw <question>, /plan <idea>, /rfc <idea>, /exit, /quit`;
+const sessionHelp = `Commands: /mode ${modes.join('|')}, /tier ${tierPreferences.join('|')}, /skills list|enable|disable|update|offline|reset, /convo clear, ${workspaceHelp}, /new, /cd <path>, /permissions, /grant <permission>, /revoke <permission>, /btw <question>, /plan <idea>, /rfc <idea>, /exit, /quit`;
 
 const keptSteps = 6;
 
@@ -161,6 +162,7 @@ export async function runSession(options: {
   workspace?: SessionWorkspace;
   /** /workspace, /convo clear and /new for a session whose files are kept by its surface rather than `workspace`. */
   files?: WorkspaceControls;
+  skills?: { preferences(): SkillPreferences; command(args: string): Promise<string> };
 }): Promise<number> {
   const extension = options.extension;
   const help = sessionHelp + (extension?.help ? `, ${extension.help}` : '');
@@ -204,7 +206,7 @@ export async function runSession(options: {
         const workspace = mode !== 'code' ? options.workspace : undefined;
         const question = workspace ? await workspace.attach(aside, cwd, options.maxPromptChars - aside.length - 1500) : aside;
         // No scratchpad either: that is where the session's transcript is kept.
-        const result = await options.run({ ...options.request, ...extension?.request?.(), cwd, prompt: question, correction: undefined, tier, relatedTier, history,
+        const result = await options.run({ ...options.request, ...extension?.request?.(), skills: options.skills?.preferences() ?? options.request.skills, cwd, prompt: question, correction: undefined, tier, relatedTier, history,
           mode, conversational: !options.once, side: true, scratch: undefined, workload: grants ? undefined : workloadFor(mode), ...(workspace ? { workspace: workspace.context(cwd) } : {}) });
         spentUsd += result.spentUsd;
         lastModel = result.models?.at(-1) ?? lastModel;
@@ -252,6 +254,9 @@ export async function runSession(options: {
         options.log?.(`Session access: ${grants?.list().join(', ') || 'none'}`);
       } else if (command === '/tier' && !extra && isTierPreference(value)) {
         tier = value; options.log?.(`Tier preference: ${tier}`);
+      } else if (command === '/skills' && options.skills) {
+        try { options.log?.(await options.skills.command(prompt.slice(7).trim())); }
+        catch (error) { options.log?.(error instanceof Error ? error.message : String(error)); }
       } else if (command === '/convo') {
         if (value === 'clear' && !extra) {
           await clearConvo();
@@ -281,7 +286,7 @@ export async function runSession(options: {
     // without them the mode's workload is fixed for the turn.
     const stopped = history.at(-1)?.stopped;
     const notice = stopped ? stopNotice(stopped) : undefined;
-    const result = await options.run({ ...options.request, ...extension?.request?.(), sessionId, taskId, cwd, prompt, correction, notice, tier, relatedTier, history,
+    const result = await options.run({ ...options.request, ...extension?.request?.(), skills: options.skills?.preferences() ?? options.request.skills, sessionId, taskId, cwd, prompt, correction, notice, tier, relatedTier, history,
       readOnly: Boolean(proposal), taskObjective: proposal?.idea, planAction: proposal?.kind === 'plan' ? 'new' : undefined,
       mode, conversational: !options.once, workload: grants ? undefined : workloadFor(mode), ...(workspace ? { workspace: workspace.context(cwd) } : {}),
       ...(options.workspace ? { scratch: options.workspace.scratch() } : {}) });

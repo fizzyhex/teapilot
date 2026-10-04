@@ -39,6 +39,7 @@
     "prepack": "node scripts/pack.mjs --refuse",
     "test:package": "node scripts/package-smoke.mjs",
     "test:ollama": "node scripts/ollama-smoke.mjs",
+    "test:skills": "node scripts/skills-smoke.mjs",
     "term": "node scripts/agent-terminal.mjs",
     "pack": "npm run build && node scripts/pack.mjs"
   },
@@ -56,6 +57,7 @@
     "jevrouter": "git+https://github.com/BillionsBobby/JevRouter.git#f944acb6530621bced023352e2358a63218bf4d9",
     "pretty-send": "0.1.0",
     "quickjs-emscripten-core": "0.32.0",
+    "tar-stream": "^3.2.2",
     "teachat": "0.1.0",
     "ws": "8.21.3",
     "zod": "4.3.6"
@@ -63,6 +65,7 @@
   "devDependencies": {
     "@lydell/node-pty": "1.2.0-beta.15",
     "@types/node": "^22.19.0",
+    "@types/tar-stream": "^3.1.5",
     "@types/ws": "8.18.1",
     "@xterm/headless": "^6.0.0",
     "tsx": "^4.21.0",

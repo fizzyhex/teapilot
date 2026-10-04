@@ -26,10 +26,12 @@ import { PlayRuntime, type Clock, type PlaySurface } from './play/runtime.js';
 import { PlayStore } from './play/store.js';
 import type { connect, Gateway, GatewayCommand, GatewayCompletion, GatewayMessage, GatewayReply } from './gateway.js';
 import { interactionLifetimeMs, setupCommands, type PromptSetup } from './commands.js';
-import { quoteMessage } from './render.js';
+import { chunk, quoteMessage } from './render.js';
 import { StatusPresence } from './presence.js';
 import { configureDiscord, discordStatus, removeDiscord } from './setup.js';
 import { readDiscordSettings, type DiscordSettings } from './settings.js';
+import { SkillStore } from '../skills/store.js';
+import { skillCache } from '../skills/cache.js';
 
 export const discordActions = ['setup', 'start', 'status', 'remove'] as const;
 export interface DiscordCommand { directory: string; cwd: string; ui: SetupUI; signal: AbortSignal; funnel?: boolean }
@@ -80,6 +82,7 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
   // Operators come from setup; whitelisted users and temporary grants live in the state directory.
   const access = AccessStore.at(stateDir, settings.allowedUserIds, config.policy.permissions);
   const allowed = (id: string) => access.roleOf(id) !== undefined;
+  const skillStore = new SkillStore(stateDir, config.skills ?? { enabled: true }, skillCache(config.stateDir));
   const queue = new TurnQueue();
   const conversations = new Map<string, Conversation>();
   const histories = HistoryStore.at(stateDir);
@@ -132,7 +135,7 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
     store: PlayStore.at(stateDir), log, clock, pictures: pictures(files),
     onRunning: count => presence.games(count),
     surface: { post: (...args) => connected().post(...args), edit: (...args) => connected().edit(...args), request: (...args) => connected().request(...args) },
-    consult: consultant({ config, root, access, queue, run, signal }),
+    consult: consultant({ config, root, access, queue, run, signal, skills: (userId, conversation) => skillStore.effective({ userId, conversation, operator: access.roleOf(userId) === 'operator' }) }),
   });
   let browser: Awaited<ReturnType<typeof import('./play/web.js').openPlayWeb>> | undefined;
   let browserHost: typeof browser;
@@ -167,6 +170,7 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
     return enqueue(historyKey, async () => {
       histories.save(historyKey, []); clearScratch(historyKey);
       seats.remember(historyKey, undefined); forgetGrants(historyKey);
+      skillStore.forget(historyKey);
     });
   };
   const switchNote =
@@ -194,6 +198,13 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
       run: runTurn,
       onTurnEnd: options.onTurnEnd,
       extension: teachat && headlessTeachat(teachat, key),
+      skills: {
+        preferences: userId => skillStore.effective({ conversation: historyKey.startsWith('btw:') ? undefined : historyKey, userId, operator: !!userId && access.roleOf(userId) === 'operator' }),
+        command: async (args, userId) => {
+          if (!userId || !allowed(userId)) return 'you are not allowed to choose skills here.';
+          return skillStore.command(args, { conversation: historyKey, userId, operator: access.roleOf(userId) === 'operator' }, signal);
+        },
+      },
       // A one-shot posts apps through its interaction, and later one-shots in the same history manage them.
       play: { runtime: play, conversation: historyKey, ...(!oneShot ? { channelId } : transport.postApp ? { channelId, post: payload => transport.postApp!(payload) } : {}) },
     });
@@ -320,6 +331,7 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
       forgetGrants(soloKey); grantStore.save(soloKey, grantStore.load(collabKey));
       await files.copy(collabKey, soloKey);
       seats.remember(soloKey, undefined); seats.remember(soloKey, setup);
+      skillStore.fork(collabKey, soloKey);
       log(`${soloKey}: forked from ${collabKey}`);
     });
     // Their next prompt waits for the copy.
@@ -351,6 +363,14 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
     const seat = seats.seat(command.channelId, command.authorId);
     if (command.text.startsWith('/collab')) { await handleCollab(command, seat); return; }
     const key = seat ? historyKeyOf(command.channelId, command.authorId, seat) : target?.key || undefined;
+    if (/^\/skills(?:\s|$)/.test(command.text)) {
+      try {
+        const text = await skillStore.command(command.text.slice(7).trim(), { conversation: key, userId: command.authorId, operator: access.roleOf(command.authorId) === 'operator' }, signal);
+        // Discord messages are bounded; long catalogs are sent as private follow-ups.
+        for (const part of chunk(text)) await command.respond(part);
+      } catch (error) { await command.respond(error instanceof Error ? error.message : String(error)); }
+      return;
+    }
     // The tree is private to whoever asked, with buttons; it never needs the conversation, even a running one.
     const tree = key && /^\/workspace tree(?:\s+([\s\S]*))?$/i.exec(command.text.trim());
     if (tree) {
@@ -496,7 +516,7 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
     openBrowser: (channelId, messageId, user) => browser?.launch(channelId, messageId, user),
     openEditorForMessage: (messageId, user) => browserHost?.editFileMessage(messageId, user.id),
     bindFileReply: (messageId, conversation, path, user) => browserHost?.bindFileReply(messageId, conversation, path, user.id),
-    asides: { keep: answer => asides.keep(answer), find: id => asides.find(id), summarise: summariser({ config, root, access, queue, run, signal }) },
+    asides: { keep: answer => asides.keep(answer), find: id => asides.find(id), summarise: summariser({ config, root, access, queue, run, signal, skills: userId => skillStore.effective({ userId, operator: access.roleOf(userId) === 'operator' }) }) },
   }, log);
   surface = gateway.play;
   setStatus = gateway.setStatus;
@@ -518,6 +538,7 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
   await browser?.close();
   play.close();
   await gateway.close();
+  await skillCache(config.stateDir).close();
   await sandbox.close();
   await Promise.allSettled([...conversations.values()].map(conversation => conversation.done));
   await teachat?.close();

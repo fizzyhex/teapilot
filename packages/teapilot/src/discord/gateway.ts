@@ -638,13 +638,16 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
     if (interaction.isChatInputCommand()) {
       const self = client.user;
       const channel = interaction.channel;
-      const argument = interaction.options.getString('value') ?? interaction.options.getString('name') ?? interaction.options.getString(treeOption);
-      const text = commandText(interaction.commandName, interaction.options.getSubcommand(false), argument);
+      const argument = interaction.options.getString('value') ?? interaction.options.getString('name') ?? interaction.options.getString(treeOption) ?? interaction.options.getString('target');
+      const text = commandText(interaction.commandName, interaction.options.getSubcommand(false), argument, interaction.options.getString('scope'));
+      const deferredSkills = interaction.commandName === 'skills';
+      if (deferredSkills) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       let answered = false;
       const respond = async (note?: string) => {
         if (answered) { if (note) await interaction.followUp({ content: note, flags: MessageFlags.Ephemeral }); return; }
         answered = true;
-        if (note) await interaction.reply({ content: note, flags: MessageFlags.Ephemeral });
+        if (deferredSkills) { if (note) await interaction.editReply({ content: note }); else await interaction.deleteReply(); }
+        else if (note) await interaction.reply({ content: note, flags: MessageFlags.Ephemeral });
         else { await interaction.deferReply({ flags: MessageFlags.Ephemeral }); await interaction.deleteReply(); }
       };
       if (!self || !text) { await respond('Unknown teapilot command.').catch(noop); return; }

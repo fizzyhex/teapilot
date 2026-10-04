@@ -1,6 +1,7 @@
 import { reasoningLevels, tierPreferences, type ReasoningLevel, type TierPreference } from '../config.js';
 import { modes, permissions, type Mode } from '../execution/grants.js';
 import { reasoningTier } from '../routing/execution.js';
+import { skillScopes } from '../skills/store.js';
 
 type Choice = { name: string; value: string };
 /** 3 = string, 5 = boolean, 11 = attachment. */
@@ -50,6 +51,14 @@ const subcommand = (name: string, description: string, options?: Option[]) => ({
 
 /** These mirror the session commands the bridge already understands; /cd is fixed for Discord. */
 export const commandDefinitions: CommandDefinition[] = [
+  { name: 'skills', description: 'Choose repository skill sets and individual skills', options: [
+    ...['list', 'enable', 'disable', 'add', 'remove', 'update'].map(action => subcommand(action, `${action} skill sets or skills`, [
+      { type: 3, name: 'target', description: 'gh:owner/repo, optionally #revision or ::skill', required: ['enable', 'disable', 'add', 'remove'].includes(action) } as Option,
+      optional('scope', 'Where to keep this choice', skillScopes),
+    ])),
+    subcommand('offline', 'Use cached skill sets without network requests', [value('Offline mode', ['on', 'off']), optional('scope', 'Where to keep this choice', skillScopes)]),
+    subcommand('reset', 'Restore inherited skill choices', [optional('scope', 'Where to restore choices', skillScopes)]),
+  ], ...everywhere },
   choice('mode', 'Switch the session mode', modes),
   choice('tier', 'Set the model tier preference', tierPreferences),
   {
@@ -101,7 +110,7 @@ export const withoutUserInstall = (definitions: CommandDefinition[]): CommandDef
   definitions.map(({ integration_types: _types, contexts: _contexts, ...rest }) => rest as CommandDefinition);
 
 /** The session text equivalent to an invocation, or undefined for anything teapilot does not define. */
-export function commandText(name: string, subcommandName?: string | null, argument?: string | null): string | undefined {
+export function commandText(name: string, subcommandName?: string | null, argument?: string | null, scope?: string | null): string | undefined {
   const definition = commandDefinitions.find(candidate => candidate.name === name);
   if (!definition || !('description' in definition) || [replyCommand, promptCommand].includes(name)) return undefined;
   if (name === 'permissions') {
@@ -112,7 +121,7 @@ export function commandText(name: string, subcommandName?: string | null, argume
   if (subcommands.length) {
     const chosen = subcommands.find(option => option.name === subcommandName);
     if (!chosen) return undefined;
-    return [`/${name}`, chosen.name, ...(argument ? [argument] : [])].join(' ');
+    return [`/${name}`, chosen.name, ...(argument ? [argument] : []), ...(name === 'skills' && scope ? [scope] : [])].join(' ');
   }
   return definition.options ? (argument ? `/${name} ${argument}` : undefined) : `/${name}`;
 }

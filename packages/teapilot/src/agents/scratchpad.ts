@@ -21,7 +21,7 @@ export function scratchPrompt(scratch: Scratch, inWorkspace: boolean): string {
 }
 
 /** Tools whose results are bounded by their own source, kept by their own tool, or are the scratchpad being read. */
-const ownBounds = new Set(['web_read', 'file_send', 'request_escalation', 'request_capabilities', 'task_state', 'artifact_read']);
+const ownBounds = new Set(['web_read', 'file_send', 'request_escalation', 'request_capabilities', 'task_state', 'artifact_read', 'skill']);
 const shells = new Set(['bash']);
 
 /** pi's shell tools keep output they cut in a temp file of their own, and name it at the end of the result. */

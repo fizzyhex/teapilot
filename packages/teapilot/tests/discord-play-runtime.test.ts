@@ -555,7 +555,7 @@ it('asks the model through consult and caps it', async () => {
   const answered = () => log.mock.calls.filter(([line]) => String(line).includes('answered')).length;
   await runtime.interact(act(record.id, 'ask').interaction);
   await vi.waitFor(() => expect(edits.at(-1)?.content).toBe('0 answer to is 0 big?'));
-  expect(consult).toHaveBeenCalledWith({ title: 'Counter', owner, channelId: 'channel-1' }, 'is 0 big?');
+  expect(consult).toHaveBeenCalledWith({ title: 'Counter', owner, channelId: 'channel-1', conversation: 'dm:1' }, 'is 0 big?');
   for (let index = 2; index <= 20; index++) {
     await runtime.interact(act(record.id, 'ask').interaction);
     await vi.waitFor(() => expect(answered()).toBe(index));

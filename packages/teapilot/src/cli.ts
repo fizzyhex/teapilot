@@ -14,6 +14,9 @@ import { serve } from './integration/service.js';
 import { SearchSetupError } from './search.js';
 import { TerminalPresentation } from './presentation.js';
 import { isMode, SessionGrants } from './execution/grants.js';
+import { randomUUID } from 'node:crypto';
+import { SkillStore } from './skills/store.js';
+import { skillCache } from './skills/cache.js';
 
 const help = `teapilot!
 
@@ -25,6 +28,7 @@ teapilot --prompt "Summarise this idea"   (one-shot, no session)
 teapilot doctor [--live]
 teapilot search status|start|stop|remove
 teapilot runtime status|start|stop   (the model server TeaPilot installed, e.g. after a restart)
+teapilot skills list|enable|disable|add|remove|update|offline|reset [set[::skill]]
 teapilot discord setup|start|status|remove   (start: --no-funnel for local-only browser play)
 teapilot teachat   (browse the agents' chatroom)
 teapilot bridge host [port] [--ts] [--token]   (share this computer's teapilot over your tailnet)
@@ -49,7 +53,7 @@ async function main(): Promise<void> {
   if (values.help) { console.log(help); return; }
   const [major = 0, minor = 0] = process.versions.node.split('.').map(Number);
   if (major < 22 || (major === 22 && minor < 19)) throw new Error('TeaPilot requires Node >=22.19.0.');
-  const command = ['setup', 'doctor', 'ask', 'chat', 'code', 'serve', 'search', 'runtime', 'discord', 'bridge', 'teachat'].includes(positionals[0] ?? '') ? positionals.shift() : undefined;
+  const command = ['setup', 'doctor', 'ask', 'chat', 'code', 'serve', 'search', 'runtime', 'discord', 'bridge', 'teachat', 'skills'].includes(positionals[0] ?? '') ? positionals.shift() : undefined;
   if (command === 'serve') { if (!values.stdio) throw new Error('serve requires --stdio'); await serve(); return; }
   if (command === 'teachat') {
     if (positionals.length) throw new Error('Use teapilot teachat.');
@@ -74,6 +78,7 @@ async function main(): Promise<void> {
   const onInterrupt = () => { presentation.close(); controller.abort(); ui?.close(); };
   process.once('SIGINT', onInterrupt);
   process.once('SIGTERM', onInterrupt);
+  let skillStateDir: string | undefined;
   try {
     if (command === 'setup') {
       if (!interactive && !values['non-interactive']) throw new Error('Setup needs an interactive terminal, or --non-interactive with an existing endpoint.');
@@ -121,12 +126,18 @@ async function main(): Promise<void> {
       throw error;
     }
     const secrets = [config.router.apiKey, ...Object.values(config.secrets)].filter((value): value is string => Boolean(value));
+    skillStateDir = config.stateDir;
     const redact = (message: string) => secrets.reduce((text, secret) => text.split(secret).join('[REDACTED]'), message);
     const approve: Approve = async approval => {
       if (!ui || controller.signal.aborted || approval.signal?.aborted) return false;
       presentation.approval(redact(`${approval.summary}\n${approval.details ?? ''}`));
       return await ui.confirm('Approve this action?', approval.signal);
     };
+    const skillStore = new SkillStore(config.stateDir, config.skills ?? { enabled: true });
+    if (command === 'skills') {
+      console.log(redact(await skillStore.command(positionals.join(' '), { operator: true }, controller.signal)));
+      return;
+    }
     if (command === 'runtime') {
       const action = positionals.shift() ?? 'status';
       if (positionals.length) throw new Error('Use teapilot runtime status|start|stop.');
@@ -183,17 +194,23 @@ async function main(): Promise<void> {
       const [{ SrtSandbox }, { WorkspaceStore }, { TerminalWorkspace }] = await Promise.all([import('./workspace/sandbox.js'), import('./workspace/store.js'), import('./workspace/terminal.js')]);
       const sandbox = new SrtSandbox(config.stateDir, config.workspace, config.source?.directory);
       const workspace = new TerminalWorkspace(WorkspaceStore.at(config.stateDir), sandbox, approve);
+      const skillSession = `terminal:${randomUUID()}`;
+      const skillCaller = { operator: true, conversation: skillSession };
       try {
         process.exitCode = await runSession({ request: { ...request, authorization, mode }, maxPromptChars: config.policy.limits.maxPromptChars,
           input: state => ui ? ui.prompt('>', state.cwd ?? resolve(values.cwd), { ...state, routingMode: config.routingMode ?? 'hosted', idle: teachat?.composerIdle() }) : Promise.reject(Object.assign(new Error('closed'), { name: 'TerminalClosedError' })),
-          run: execute, once, approve, log: message => presentation.log(message), onEvent: dependencies.onEvent, extension: teachat, workspace });
-      } finally { await workspace.close().catch(() => undefined); await sandbox.close().catch(() => undefined); }
+           run: execute, once, approve, log: message => presentation.log(message), onEvent: dependencies.onEvent, extension: teachat, workspace,
+           skills: { preferences: () => skillStore.effective(skillCaller), command: args => skillStore.command(args, skillCaller, controller.signal) } });
+       } finally {
+         try { if (config.skills?.enabled !== false && !config.skills?.directory) skillStore.forget(skillSession); } catch (error) { presentation.log(error instanceof Error ? error.message : String(error)); }
+         await workspace.close().catch(() => undefined); await sandbox.close().catch(() => undefined);
+       }
       await teachat?.close(controller.signal);
     } else {
       const result = await execute(request);
       process.exitCode = result.success ? 0 : 2;
     }
-  } finally { presentation.close(); ui?.close(); process.removeListener('SIGINT', onInterrupt); process.removeListener('SIGTERM', onInterrupt); }
+  } finally { if (skillStateDir) await skillCache(skillStateDir).close(); presentation.close(); ui?.close(); process.removeListener('SIGINT', onInterrupt); process.removeListener('SIGTERM', onInterrupt); }
 }
 
 async function openTeachat(config: Awaited<ReturnType<typeof loadConfig>>, ui: NonNullable<ReturnType<typeof terminalUI>>, presentation: TerminalPresentation) {

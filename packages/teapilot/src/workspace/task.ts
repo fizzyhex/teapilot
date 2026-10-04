@@ -8,6 +8,7 @@ import { clip } from './sandbox.js';
 import { scratchLimits, type Kind, type Saved } from './scratch.js';
 import type { RequestRecovery } from '../agents/recovery.js';
 import { planReferenceSchema, type PlanReference } from './plan.js';
+import { skillIdLimit } from './skills.js';
 
 /** Bounds apply to stored working state as well as the view: history belongs in session transcripts. */
 export const taskLimits = { steps: 8, claims: 16, artifacts: 128, receipts: 64, projectionChars: 6000, retrievalChars: scratchLimits.retrievalChars, stateBytes: 512 * 1024 };
@@ -15,7 +16,7 @@ const id = z.string().regex(/^[\w-]{1,80}$/);
 const refs = z.array(id).max(4);
 export const stepSchema = z.object({ id, goal: z.string().min(1).max(240), status: z.enum(['ready', 'working', 'blocked', 'done']), acceptance: z.string().max(240).default(''), evidence: refs.default([]) }).strict();
 export const claimSchema = z.object({ id, text: z.string().min(1).max(400), basis: z.enum(['observed', 'inferred', 'reported']), evidence: refs.min(1) }).strict();
-const sourceSchema = z.object({ path: z.string().max(2048).optional(), url: z.string().max(2048).optional(), query: z.string().max(200).optional(), offset: z.number().int().nonnegative().optional(), limit: z.number().int().positive().optional() }).strict();
+const sourceSchema = z.object({ path: z.string().max(2048).optional(), url: z.string().max(2048).optional(), query: z.string().max(200).optional(), offset: z.number().int().nonnegative().optional(), limit: z.number().int().positive().optional(), skill: z.object({ id: z.string().min(1).max(skillIdLimit), file: z.string().min(1).max(240), set: z.string().max(skillIdLimit).optional(), revision: z.string().regex(/^[\da-f]{40}$/).optional() }).strict().optional() }).strict();
 const artifactSchema = z.object({ id, sha256: z.string().regex(/^[a-f0-9]{64}$/), path: z.string().max(2048), bytes: z.number().int().nonnegative().max(8 * 1024 * 1024), lines: z.number().int().nonnegative(), complete: z.boolean(), kind: z.enum(['logs', 'pages', 'outputs']), actor: id, producer: id, producerTool: z.string().max(80).optional(), request: z.string().max(100).optional(), origin: z.enum(['file', 'inventory', 'saved-output', 'transcript']).optional(), source: sourceSchema.optional(), sourceEpoch: z.number().int().nonnegative().optional(), at: z.number() }).strict();
 const receiptSchema = z.object({ id, request: z.string().max(100), actor: id, tool: z.string().max(80), call: z.string().max(2000).optional(), argsSha256: z.string(), summary: z.string().max(240), excerpt: z.string().max(400), origin: z.enum(['file', 'inventory', 'saved-output', 'transcript']).optional(), source: sourceSchema.optional(), sourceEpoch: z.number().int().nonnegative().optional(), stale: z.boolean().optional(), uncertainSource: z.boolean().optional(), status: z.enum(['pending', 'succeeded', 'failed', 'uncertain']), artifacts: z.array(id).max(8), at: z.number() }).strict();
 const toolBudgetSchema = z.object({ instructorCalls: z.number().int().nonnegative(), instructorGranted: z.number().int().nonnegative(), continuationBatches: z.number().int().nonnegative(), instructorBatchCalls: z.number().int().nonnegative(), juniorMaxCalls: z.number().int().positive(), maxContinuationBatches: z.number().int().nonnegative() }).strict();
@@ -40,7 +41,7 @@ export interface TaskActor { name: string; objective?: string; artifacts?: strin
 export const instructor: TaskActor = { name: 'instructor' };
 export interface TaskUpdate { revision: number; step?: z.input<typeof stepSchema>; claim?: z.input<typeof claimSchema>; remove_step?: string; remove_claim?: string }
 export interface EvidenceFilters { query?: string; tool?: string; request?: string }
-export interface EvidenceSource { path?: string; url?: string; query?: string; offset?: number; limit?: number }
+export interface EvidenceSource { path?: string; url?: string; query?: string; offset?: number; limit?: number; skill?: { id: string; file: string; set?: string; revision?: string } }
 export interface ExecutionState { changedFiles: string[]; unresolvedChecks: string[]; currentCheck: 'passed' | 'failed' | 'not-run-after-edit'; shellUncertain: boolean }
 const brief = (text: string, limit: number): string => {
   let allowance = limit, result = clip(text, allowance);

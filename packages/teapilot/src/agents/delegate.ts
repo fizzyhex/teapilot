@@ -163,7 +163,7 @@ export function delegateTool(parent: AttemptInput, scratch: string, root: string
       try {
         result = await run({
           config: { ...parent.config, policy: { ...parent.config.policy, limits: { ...parent.config.policy.limits, maxToolCalls: allocation } } },
-          tier: parent.tier, workload: parent.workload, cwd: parent.cwd, web: parent.web, mode: parent.mode,
+          tier: parent.tier, skillCatalog: parent.skillCatalog, workload: parent.workload, cwd: parent.cwd, web: parent.web, mode: parent.mode,
           budget: parent.budget, telemetry: parent.telemetry, approve: parent.approve, beforeMutation: parent.beforeMutation,
           authorization: parent.authorization, activePermissions: parent.activePermissions, requestCapabilities: parent.requestCapabilities,
           workspace: parent.workspace, webController: parent.webController, play: parent.play, searchUnavailable: parent.searchUnavailable, attempt: parent.attempt,

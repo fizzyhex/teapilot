@@ -16,6 +16,7 @@ import type { MessagePayload } from './play/render.js';
 import type { HostedMessage, PlayRuntime, StartOptions } from './play/runtime.js';
 import { approvePrompt, changePrompt, extractPlan, juniorsPrompt, planMessages, type PlanAction, type PlanControls, type PlanEmbed } from './plan.js';
 import { chunk, StatusCard, throttle, viewSourcePrefix, type CardReply } from './render.js';
+import type { SkillPreferences } from '../skills/settings.js';
 
 export type CardButton = 'stop' | 'details';
 /** A status card's buttons: Details always, Stop while `stop` is set. */
@@ -82,6 +83,7 @@ export interface ConversationOptions {
   /** How often a running turn's status card moves on by itself. */
   heartbeatMs?: number;
   extension?: SessionExtension;
+  skills?: { preferences(userId?: string): SkillPreferences; command(args: string, userId?: string): Promise<string> };
   /** Receives the conversation's turns after each change, so they survive a restart. */
   onHistory?: (history: ConversationTurn[]) => void;
   /** Receives completion after the answer and any status card have been sent. */
@@ -104,7 +106,7 @@ export interface ConversationOptions {
 /** Image types Discord shows in a gallery or thumbnail. */
 const shown = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 
-const discordHelp ='`/stop` - cancel the running turn\n`/convo clear` - clear the context window; the workspace keeps its files\n`/convo grants` - see and change what teapilot may do here\n`/workspace clear|name|tree` - delete, name or list the workspace\'s files\n`/new` - clear both\n`/btw` - ask a question without polluting the context window.\n`/plan` - get an implementation plan to discuss before anything is changed.\n`/rfc` - get a design proposal to discuss before anything is changed.';
+const discordHelp ='`/stop` - cancel the running turn\n`/skills` - choose repository sets or individual skills; save conversation, personal or global choices\n`/convo clear` - clear the context window; the workspace keeps its files\n`/convo grants` - see and change what teapilot may do here\n`/workspace clear|name|tree` - delete, name or list the workspace\'s files\n`/new` - clear both\n`/btw` - ask a question without polluting the context window.\n`/plan` - get an implementation plan to discuss before anything is changed.\n`/rfc` - get a design proposal to discuss before anything is changed.';
 
 /** One Discord conversation driving one teapilot session with its own history and grants. */
 export class Conversation {
@@ -128,6 +130,7 @@ export class Conversation {
   private plan?: PlanState;
   /** A plan button sent the next turn's prompt, so a plan in its answer refines `plan` rather than posting a new one. */
   private refining = false;
+  private readonly skillWarnings = new Set<string>();
   readonly done: Promise<void>;
 
   constructor(private readonly options: ConversationOptions) {
@@ -147,6 +150,10 @@ export class Conversation {
       return;
     }
     if (command === '/cd') { void this.say('The repository root is fixed for Discord sessions. Change it with teapilot discord setup.', true); return; }
+    if (command === '/skills' && this.options.skills) {
+      void this.options.skills.command(trimmed.slice(7).trim(), options.sender).then(text => this.say(text, true), error => this.say(error instanceof Error ? error.message : String(error), true));
+      return;
+    }
     if (command === '/help') void this.say(discordHelp, true);
     if (this.turn && !['/exit', '/quit'].includes(command ?? '')) void this.say('Queued as your next message.', true);
     if (this.waiting) { const waiting = this.waiting; this.waiting = undefined; this.speaker = options.sender; this.speakerName = options.senderName; this.yolo = options.yolo === true; this.quiet = options.quiet === true; waiting.resolve(text); }
@@ -313,7 +320,7 @@ export class Conversation {
       send: transport.sendFiles && (async (text, sent) => { await transport.sendFiles!(this.options.redact(text), sent); }) };
     // A side question (/btw) only reads: it keeps no scratchpad, the session's transcript, and starts no apps.
     const side = base.side === true;
-    const request: HostRequest = { ...base, planAction: this.refining ? 'revise' : base.prompt === approvePrompt ? 'approve' : base.planAction, readOnly: base.readOnly || this.refining, sessionId: this.options.key, access: admin, workspace, ...(files && !side ? { scratch: files.scratch(conversation) } : {}),
+    const request: HostRequest = { ...base, skills: this.options.skills?.preferences(this.speaker), planAction: this.refining ? 'revise' : base.prompt === approvePrompt ? 'approve' : base.planAction, readOnly: base.readOnly || this.refining, sessionId: this.options.key, access: admin, workspace, ...(files && !side ? { scratch: files.scratch(conversation) } : {}),
       play: play && !side ? { runtime: play.runtime, channelId: play.channelId, post: play.post, conversation, owner: this.speaker ? { id: this.speaker, name: this.speakerName } : undefined, files: workspace } : undefined };
     const refining = this.refining; this.refining = false;
     const turn = this.turn = new AbortController();
@@ -367,6 +374,11 @@ export class Conversation {
       });
     };
     this.sink = event => {
+      if (event.type === 'skill_discovery_warning' && typeof event.warning === 'string' && !this.skillWarnings.has(event.warning)) {
+        this.skillWarnings.add(event.warning);
+        if (this.skillWarnings.size > 32) this.skillWarnings.delete(this.skillWarnings.values().next().value!);
+        void this.say(`-# ${event.warning}`, true);
+      }
       if (event.type === 'route') casual = event.casual === true;
       if (!answerOnly && !this.quiet && !casual && !event.junior) {
         if (event.type === 'text' && typeof event.text === 'string') {

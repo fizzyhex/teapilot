@@ -214,7 +214,7 @@ export async function liveCheck(config: Config, tier: Tier, signal?: AbortSignal
         const expected = before.replace('a - b', 'a + b');
         await writeFile(join(scratch, 'fixture.js'), before);
         probeConfig.policy.permissions = probeConfig.policy.permissions.filter(permission => ['inference', 'repository.read', 'repository.write'].includes(permission));
-        const result = await runAttempt({ config: probeConfig, tier, workload: 'coder', cwd: scratch,
+        const result = await runAttempt({ config: probeConfig, skillCatalog: { root: '', skills: [], warnings: [] }, tier, workload: 'coder', cwd: scratch,
           prompt: 'Read fixture.js. Change only the subtraction operator to addition, preserving every other character including the comment and final newline. Write fixture.js, then reply DONE. Do not call any shell.',
           web: false, budget, telemetry, approve: async () => false, signal });
         signal?.throwIfAborted();

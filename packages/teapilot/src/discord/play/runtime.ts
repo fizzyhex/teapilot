@@ -47,7 +47,7 @@ export interface Pictures {
   render(conversation: string, spec: PictureSpec): Promise<{ name: string; data: Buffer }>;
 }
 /** Asks the model on the app's behalf; resolves with the answer text. */
-export type Consultant = (play: { title: string; owner: User; channelId: string }, prompt: string) => Promise<string>;
+export type Consultant = (play: { title: string; owner: User; channelId: string; conversation?: string }, prompt: string) => Promise<string>;
 export type Source = PlayRecord['source'];
 export interface StartOptions {
   title: string; channelId: string; conversation: string; owner: User; source: Source; participants?: Participants; emojis?: Record<string, string>;
@@ -481,7 +481,7 @@ export class PlayRuntime {
     record.consults.push(this.now());
     this.options.store.save(record);
     live.consulting = true;
-    void this.options.consult({ title: record.title, owner: record.owner, channelId: record.channelId }, effect.prompt)
+    void this.options.consult({ title: record.title, owner: record.owner, channelId: record.channelId, conversation: record.conversation }, effect.prompt)
       .then(text => ({ text: clip(text, 4000) }), error => ({ error: errorText(error) }))
       .then(result => {
         live.consulting = false;

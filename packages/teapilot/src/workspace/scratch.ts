@@ -26,7 +26,7 @@ export const scratchLimits = {
 };
 
 /** The line a saved copy leaves in a result; later turns keep it when they cut the result down. */
-export const savedLine = /^(?:Full (?:output|page text) saved to |Output beyond this excerpt was not kept).*$/gm;
+export const savedLine = /^(?:Full (?:output|page text) saved to |Output beyond this excerpt was not kept|skill reference: ).*$/gm;
 
 /** Every secret teapilot holds, for redacting what leaves it or is kept. */
 export function secretsOf(config: Config): string[] {

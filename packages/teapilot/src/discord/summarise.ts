@@ -5,6 +5,7 @@ import type { AccessStore } from './access-store.js';
 import type { SideAnswer } from './aside-store.js';
 import type { TurnQueue } from './bridge.js';
 import { unfence } from './play/consult.js';
+import type { SkillPreferences } from '../skills/settings.js';
 
 /** The note under every side answer, which says nothing once the answer is posted. */
 const asideNote = /^-# this is an aside\b.*$/gim;
@@ -17,6 +18,7 @@ export function summariser(options: {
   config: Config; root: string; access: AccessStore; queue: TurnQueue;
   run: (request: HostRequest, dependencies: Pick<HostDependencies, 'approve'>) => Promise<HostResult>;
   signal?: AbortSignal;
+  skills?: (userId: string) => SkillPreferences;
 }): (answer: SideAnswer) => Promise<string> {
   return async answer => {
     const authorization = await SessionGrants.create(options.root, options.config, 'chat');
@@ -28,6 +30,7 @@ export function summariser(options: {
     const text = answer.parts.map(part => part.text).join('\n').replace(asideNote, '').trim();
     const request: HostRequest = {
       cwd: options.root, mode: 'chat', authorization, signal: options.signal, tier: 'fast',
+      skills: options.skills?.(answer.userId),
       prompt: [
         'Shorten the answer below so it can be posted in a Discord channel, where everyone can read it. Keep what answers the question and drop the rest.',
         'Put each source inline, as a markdown link on the words it supports; do not add a separate list of sources.',

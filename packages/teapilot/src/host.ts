@@ -27,6 +27,10 @@ import { RequestRecovery } from './agents/recovery.js';
 import { RequestAllowance, planningCallLimit, resolveToolBudget } from './agents/allowance.js';
 import { TaskStore } from './workspace/task.js';
 import { PlanStore, compactPlan, planNotice, planText } from './workspace/plan.js';
+import { skillCache } from './skills/cache.js';
+import { SkillStore } from './skills/store.js';
+import type { SkillPreferences } from './skills/settings.js';
+import type { SkillCatalog } from './workspace/skills.js';
 
 export interface HostRequest { prompt: string; cwd: string; workload?: Workload; web?: boolean; correction?: string; signal?: AbortSignal; history?: ConversationTurn[]; context?: TextContext[]; mode?: Mode; conversational?: boolean; authorization?: SessionGrants; access?: AccessAdmin; play?: PlayContext; workspace?: ConversationWorkspace; tier?: TierPreference; relatedTier?: Tier; sessionId?: string; taskId?: string;
   /** A side question (/btw): it sees the conversation but only reads, and its turn is not kept. */
@@ -40,6 +44,7 @@ export interface HostRequest { prompt: string; cwd: string; workload?: Workload;
   /** Surface-provided objective without presentation templates; readOnly proposals cannot mutate project files or apps. */
   taskObjective?: string;
   readOnly?: boolean;
+  skills?: SkillPreferences;
   planAction?: 'new' | 'revise' | 'approve';
   /** Teachat roster (username → bio). The router call also asks which identity would get this request. */
   teachatIdentities?: Record<string, string> }
@@ -114,6 +119,7 @@ export async function runHost(config: Config, request: HostRequest, dependencies
   const web = new WebController(config, { event: (type, fields) => telemetry.event(type, fields) });
   const recovery = new RequestRecovery();
   let task: TaskStore | undefined;
+  let skillCatalog: SkillCatalog | undefined;
   let taskId = request.taskId ?? requestId;
   web.remember(currentPrompt);
   for (const turn of request.history ?? []) {
@@ -387,9 +393,15 @@ export async function runHost(config: Config, request: HostRequest, dependencies
         task.startRequest(requestId, { calls: request.readOnly ? Math.min(config.policy.limits.maxToolCalls, config.policy.limits.planningToolCalls ?? planningCallLimit) : config.policy.limits.maxToolCalls, modelCalls: config.policy.limits.maxTurns * multiplier, timeoutMs: config.policy.limits.attemptTimeoutMs * multiplier, delegations: config.policy.limits.maxJuniorTurns, readOnly: request.readOnly, ...resolveToolBudget(config, { readOnly: request.readOnly, casual, side: request.side }) });
         await telemetry.event('task_start', { task: task.snapshot().id, resumed: Boolean(request.taskId), revision: task.snapshot().revision });
       }
+      if (!skillCatalog && !casual && modelFor(config, tier).toolCalling && config.skills?.enabled !== false) {
+        const settings = config.skills ?? { enabled: true };
+        const preferences = request.skills ?? new SkillStore(config.stateDir, settings).effective({ operator: true });
+        skillCatalog = await skillCache(config.stateDir).catalog(settings, preferences, request.signal);
+        for (const warning of skillCatalog.warnings) dependencies.onProgress?.(warning);
+      }
       previous = await runAttempt({
         allowance: recovery.allowance ??= new RequestAllowance({ calls: request.readOnly ? Math.min(config.policy.limits.maxToolCalls, config.policy.limits.planningToolCalls ?? planningCallLimit) : config.policy.limits.maxToolCalls, modelCalls: config.policy.limits.maxTurns * (config.policy.escalation.maxEscalations + 1), timeoutMs: config.policy.limits.attemptTimeoutMs * (config.policy.escalation.maxEscalations + 1), delegations: config.policy.limits.maxJuniorTurns ?? 6 }, task, resolveToolBudget(config, { readOnly: request.readOnly, casual, side: request.side })),
-        config, workload, tier, cwd, web: request.authorization ? activePermissions.includes('web.search') : Boolean(request.web), budget, telemetry, recovery, task, taskId: task ? taskId : undefined, readOnly: request.readOnly,
+        config, skillCatalog, workload, tier, cwd, web: request.authorization ? activePermissions.includes('web.search') : Boolean(request.web), budget, telemetry, recovery, task, taskId: task ? taskId : undefined, readOnly: request.readOnly,
         mode: request.mode, conversational: request.conversational, side: request.side, casual, authorization: request.authorization, access: request.access, play: request.play, workspace: request.workspace,
         currentRequest: userRequest,
         expectsPlan: request.planAction === 'new' || request.planAction === 'revise',
