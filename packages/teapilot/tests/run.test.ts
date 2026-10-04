@@ -278,7 +278,7 @@ it('does not count identical writes and edits as changes or invalidate a success
   expect(JSON.stringify(result.steps)).toContain('no change: oldText and newText are identical');
 });
 
-it('adds a tip to the result that calls for it, once per context, and reports it', async () => {
+it('does not inject generic workflow tips for ordinary file writes', async () => {
   const bodies: any[] = [];
   const f = await setup((body, _req, res) => {
     bodies.push(body);
@@ -288,8 +288,6 @@ it('adds a tip to the result that calls for it, once per context, and reports it
   const result = await runAttempt({ ...f, tier: 'normal', workload: 'coder', web: false, approve: async () => true, prompt: 'Write three scripts' });
   expect(result.success, JSON.stringify(result)).toBe(true);
   const sent = JSON.stringify(bodies.at(-1).messages);
-  const count = (text: string) => sent.split(text).length - 1;
-  expect(count('[tip] the user prefers creative, minimalist decision making')).toBe(1);
-  expect(count('[tip] keep your workspace organised')).toBe(1);
-  expect((await events(f.config)).filter(event => event.type === 'tip').map(event => event.name)).toEqual(['pythonPref', 'stayOrganised']);
+  expect(sent).not.toContain('[tip]');
+  expect((await events(f.config)).filter(event => event.type === 'tip')).toEqual([]);
 });

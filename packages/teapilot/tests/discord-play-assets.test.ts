@@ -170,11 +170,12 @@ it('collects arbitrary-extension UTF-8 and empty text, validates limits and logi
 it('exposes the asset workflow in prompts/tool schemas without enabling async or other imports', async () => {
   const f = await setup();
   const api = f.api();
-  expect(api.systemPrompt).toContain('ctx.readText');
+  expect(api.systemPrompt).not.toContain('ctx.readText');
   expect(api.systemPrompt).toContain('no async, filesystem, network or other imports');
-  expect(api.systemPrompt).toContain('Refresh does not replace data already copied into state');
+  expect(api.tools.find(tool => tool.name === 'play_update')!.description).toContain('data already copied into state is not replaced');
   for (const name of ['play_start', 'play_test', 'play_update']) {
     expect(api.tools.find(tool => tool.name === name)!.parameters).toHaveProperty('properties.assets');
+    expect(JSON.stringify(api.tools.find(tool => tool.name === name)!.parameters)).toContain('ctx.readText(name)');
   }
   await expect(sandbox(code, { bad: 'x'.repeat(assetLimits.fileBytes + 1) })).rejects.toThrow('exceeds');
 });

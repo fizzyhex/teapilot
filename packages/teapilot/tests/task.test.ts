@@ -20,6 +20,7 @@ const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { vi.restoreAllMocks(); for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 async function setup() {
   const f = await fixture(); cleanups.push(f.cleanup);
+  f.config.taskState = { enabled: true };
   const scratch = join(f.config.stateDir, 'workspaces', 'session', '.scratch');
   await mkdir(scratch, { recursive: true });
   const task = TaskStore.open(f.config.stateDir, 'explicit-scope', 'original objective', scratch, text => text.replaceAll('private-token', '[REDACTED]'));

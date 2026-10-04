@@ -260,7 +260,7 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
       setup.tools.push(...input.junior ? apps.tools.filter(tool => !juniorPlayWithheld.includes(tool.name)) : apps.tools);
       setup.systemPrompt += '\n' + apps.systemPrompt + (input.junior ? '\n- As a junior you do not post apps: write the file, dry-run it with play_test, and name the file in your report so your instructor can post it.' : '');
     } else if (input.play && !input.readOnly && input.requestCapabilities && config.policy.permissions.includes('discord.play')) {
-      setup.systemPrompt += '\n- For interactive Discord apps (games, polls, quizzes, boards, timers with buttons), request `discord.play` with request_capabilities before planning or building; it is granted without a prompt. Its apps use sandboxed JavaScript, not a separate Discord bot.';
+      setup.systemPrompt += '\n- For interactive Discord apps (games, polls, quizzes, etc); request_capabilities can activate `discord.play`.';
     }
     // Without repository access the file tools, and the workspace's sandboxed shell, share its folder as their root.
     ownFiles = !repository && ownRoot !== undefined && model.toolCalling;
@@ -717,7 +717,7 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
         lastCalls = `[notice] ${Math.max(0, callsLeft)} tool calls left: call report now (stuck if unfinished), with what you found and the files it is saved in.`;
       }
       const sourceNote = origin === 'saved-output' ? '[source] saved execution output; this inspection does not establish the current workspace file or revision.'
-        : origin === 'transcript' ? '[source] execution history, not current workspace source. task_state can list bounded receipts without replaying this transcript.' : undefined;
+        : origin === 'transcript' ? '[source] execution history, not current workspace source.' + (task ? ' task_state can list bounded receipts without replaying this transcript.' : '') : undefined;
       const extra = [note, sourceNote, tip && tipText(tip), lastCalls, taskStorageWarning].filter((text): text is string => Boolean(text));
       taskStorageWarning = undefined;
       if (extra.length) return { content: [...content, ...extra.map(text => ({ type: 'text' as const, text }))], isError };

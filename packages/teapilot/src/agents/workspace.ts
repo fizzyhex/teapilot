@@ -184,16 +184,15 @@ function workspacePrompt(context: ConversationWorkspace, status: SandboxStatus |
       ? `You can see images, not hear audio: pictures people attach are shown to you with their message${rooted ? ', and read opens any other picture in the workspace' : ''}. Work from names, sizes and command output for everything else.`
       : 'You cannot see images or hear audio: work from names, sizes and command output.'),
     ...rooted ? [
-      '- read, write, edit, ls, find and grep take workspace file names. Create files, scripts included, with write; change part of one with edit rather than writing all of it again.',
-      '- before working, read and follow AGENTS.md if present, including nested instructions in folders you touch; consult README.md for context. README.md is for people; AGENTS.md is for agents. update them when your changes make them inaccurate or meaningfully incomplete, not after every task. replace stale text; keep durable, non-obvious guidance, not task logs or implementation details you can read in the code.',
+      '- read, write, edit, ls, find and grep take workspace file names.',
+      '- read and follow AGENTS.md, including nested instructions in folders you touch.',
     ] : [],
     ...rooted && status?.available ? [
-      `- ${status.shell} runs one command in the workspace, sandboxed: it writes only there, and the network is closed except for hosts people approve when a command first connects (such as a page the request links to). Installed: ${tools}. For more than one simple command, write a Python or Node script and run it.`,
+      `- ${status.shell} runs one command in the workspace, sandboxed: it writes only there, and the network is closed except for hosts people approve when a command first connects. Installed: ${tools}.`,
       '- Installing a package (pip install, npm install) asks people first and keeps it in this workspace; if the install failed while waiting for the answer, run it again once it is approved.',
       '- Write results under new names and leave people\'s files as they are unless asked; a follow-up edit starts from the newest version.',
       ...author ? [
-        `- the workspace is a git repo you fully own (see AGENTS.md), committing as ${author}. commit regularly as you go so you can roll back, and read git log to recall earlier work. keep yourself and the user up-to-date with the git log, and tell the user about your commits.`,
-        `- if your workspace is untidy, re-organise, or tell the user.`
+        `- the workspace is a git repo, committing as ${author}.`
       ] : [],
     ] : rooted ? [`- Commands cannot run here${status?.reason ? ` (${status.reason})` : ''}, so you cannot convert or inspect media files${vision ? ' (pictures people attach are still shown to you)' : ''} beyond their names; say so if asked.`] : [],
     `- ${deliver} by name; never paste a file's contents instead, and a file people gave you goes back under its own name.`,

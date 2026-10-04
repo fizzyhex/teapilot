@@ -383,7 +383,7 @@ export async function runHost(config: Config, request: HostRequest, dependencies
       // A retry on the same model carries on from what it last saw, with this tier's settings, rather than starting
       // over from a summary of it and reading everything again.
       const resume = previous?.resume && previousTier && profileFor(previousTier).model === profileFor(tier).model ? previous.resume : undefined;
-      if (!task && config.taskState?.enabled !== false && config.scratchpad?.enabled !== false && request.scratch && !request.side && !casual && modelFor(config, tier).toolCalling) {
+      if (!task && config.taskState?.enabled === true && config.scratchpad?.enabled !== false && request.scratch && !request.side && !casual && modelFor(config, tier).toolCalling) {
         // Only an explicit task identity resumes state. Conversation identity alone never merges objectives.
         const scope = JSON.stringify([cwd, request.sessionId ?? request.workspace?.conversation ?? '', taskId]);
         task = TaskStore.open(config.stateDir, scope, request.taskObjective ?? prompt, request.scratch, text => telemetry.redact(text), request.constraints);

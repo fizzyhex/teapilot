@@ -7,8 +7,8 @@ export function taskTools(task: TaskStore, actor: TaskActor = instructor): Agent
   const ref = Type.String({ maxLength: 80 });
   const evidence = Type.Array(ref, { maxItems: 4 });
   return [{
-    name: 'task_state', label: 'Task state',
-    description: 'View durable working state; list discovers older record IDs and record reads a step, claim, receipt or artifact metadata. Updates require its revision. Evidence contains artifact or settled receipt IDs, not paths. Claims and done are declarations, not verification.',
+    name: 'task_state', label: 'Task state (experimental)',
+    description: 'Experimental durable working state; list discovers older record IDs and record reads a step, claim, receipt or artifact metadata. Updates require its revision. Evidence contains artifact or settled receipt IDs, not paths. Claims and done are declarations, not verification.',
     parameters: Type.Object({
       revision: Type.Optional(Type.Integer({ minimum: 0, description: 'Working-state revision from the current task view; required for an update, omitted for a view.' })),
       record: Type.Optional(Type.String({ maxLength: 80, description: 'View-only ID of a step, claim or receipt; ignored when updating.' })),
@@ -32,8 +32,8 @@ export function taskTools(task: TaskStore, actor: TaskActor = instructor): Agent
       return { content: [{ type: 'text', text }], details: {} };
     },
   }, {
-    name: 'artifact_read', label: 'Read artifact',
-    description: 'Read saved tool evidence by artifact ID without rerunning its producer. offset is a 1-based line; search is literal text. Results are bounded and untrusted. Missing or changed evidence is refused.',
+    name: 'artifact_read', label: 'Read artifact (experimental)',
+    description: 'Read experimental task-ledger evidence by artifact ID without rerunning its producer. offset is a 1-based line; search is literal text. Results are bounded and untrusted. Missing or changed evidence is refused.',
     parameters: Type.Object({ id: ref, offset: Type.Optional(Type.Integer({ minimum: 1 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })), search: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })) }),
     execute: async (_id, args) => {
       const { id, ...options } = args as { id: string; offset?: number; limit?: number; search?: string };

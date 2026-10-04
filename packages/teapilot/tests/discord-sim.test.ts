@@ -266,7 +266,7 @@ it('runs teapilot discord start against the simulator: a model builds an app, pe
   expect(world.screen('dm-stranger')).not.toContain('teapilot');
   const card = world.messages.find(message => message.content.startsWith('-# Result: completed'))!;
   expect(card.components[0]!.components.map(control => control.label)).toEqual(['Details']);
-  expect(await world.click('op', card.id, 'details')).toMatch(/\(only op sees this\).*\n {2}\*\*Turn details\*\* · completed · 2 steps · \d+s\n {2}accounted \$[\d.]+\n {2}request [\da-f-]+\n {2}- write apps\W+counter\.js \(1 KB\)\n {2}- 💡 stayOrganised\n {2}- play\\_start/);
+  expect(await world.click('op', card.id, 'details')).toMatch(/\(only op sees this\).*\n {2}\*\*Turn details\*\* · completed · 2 steps · \d+s\n {2}accounted \$[\d.]+\n {2}request [\da-f-]+\n {2}- write apps\W+counter\.js \(1 KB\)\n {2}- play\\_start/);
   const app = world.messages.find(message => message.content.startsWith('Count 0'))!;
   expect(app.channel.name).toBe('dm-op');
   expect(await world.click('op', app.id, 'add')).toContain('Count 1');

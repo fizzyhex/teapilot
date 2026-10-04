@@ -354,7 +354,7 @@ it('lets only Discord conversations request discord.play, and hides the tools un
   const [discord, terminal] = bodies.map(body => body.tools.find((tool: any) => tool.function.name === 'request_capabilities'));
   expect(names(bodies[0]).some(name => name.startsWith('play_'))).toBe(false);
   expect(JSON.stringify(discord)).toContain('discord.play');
-  expect(JSON.stringify(bodies[0].messages)).toContain('request `discord.play`');
+  expect(JSON.stringify(bodies[0].messages)).toContain('request_capabilities can activate `discord.play`');
   expect(JSON.stringify(terminal)).not.toContain('discord.play');
   expect(JSON.stringify(bodies[1].messages)).not.toContain('discord.play');
 });
@@ -432,6 +432,13 @@ it('names an app\'s file by path in a repository, by file in a workspace, and hi
   expect(JSON.stringify(bodies[1].messages)).not.toContain('.workspace');
   expect(JSON.stringify(bodies[1].messages)).not.toContain('workspace folder');
   expect(JSON.stringify(bodies[0].messages)).toContain('workspace folder');
+  for (const body of bodies) {
+    const prompt = JSON.stringify(body.messages);
+    expect(prompt).not.toMatch(/rather than writing out a plan|Keep it as small|extensive playtesting|Tell people briefly|SDK is a convenience/);
+    expect(prompt).toContain('Runtime limits:');
+    expect(prompt).toContain('export default app');
+    expect(prompt).toContain('ctx.discord.request');
+  }
 });
 
 it('gives a junior the play tools to build and dry-run apps, but leaves posting to its instructor', async () => {

@@ -429,9 +429,9 @@ it('makes a workspace a git repository once, committing as the orchestrator or a
   for (const name of ['.scratch/sessions/main.jsonl', '.scratch/juniors/junior-alfa/sessions/turn.jsonl']) expect(matcher.ignores(name)).toBe(true);
   for (const name of ['.scratch/utilities/tool.py', '.scratch/plans/plan.md', '.scratch/juniors/junior-alfa/notes.md']) expect(matcher.ignores(name)).toBe(false);
   await writeFile(join(folder, '.gitignore'), '.scratch/\ncustom/\n');
-  expect(setup.systemPrompt).toContain('git repo you fully own (see AGENTS.md), committing as teapilot-orchestrator');
-  expect(setup.systemPrompt).toContain('before working, read and follow AGENTS.md');
-  expect(setup.systemPrompt).toContain('not after every task');
+  expect(setup.systemPrompt).toContain('git repo, committing as teapilot-orchestrator');
+  expect(setup.systemPrompt).toContain('read and follow AGENTS.md');
+  expect(setup.systemPrompt).not.toMatch(/not after every task|commit regularly|untidy|read git log/);
   await setup.shell!.execute('one', { command: 'git commit -am x' });
   const junior = await workspace(f.workspace, f.base.approve, true, undefined, false, 'tea-junior-alfa');
   await junior.shell!.execute('two', { command: 'git log' });
@@ -552,8 +552,10 @@ export default app({ init: () => 0, update: n => n + 1, view: n => ({ content: '
   const f = await agentSetup((body, _req, res) => { bodies.push(body); completion(res, steps[bodies.length - 1]!); });
   const result = await runAttempt({ ...f, ...f.base, prompt: 'make a game', activePermissions: ['inference', 'discord.play'], play: f.play, workspace: f.workspace });
   expect(result.success, JSON.stringify(result)).toBe(true);
-  expect(JSON.stringify(bodies[0].messages)).toContain('one workspace entry file, plus optional text assets');
-  expect(JSON.stringify(bodies[0].messages)).toContain('ctx.readText(name)');
+  expect(JSON.stringify(bodies[0].messages)).toContain('workspace entry file: play_start({ file, title })');
+  const startTool = bodies[0].tools.find((tool: any) => tool.function.name === 'play_start').function;
+  expect(startTool.description).toContain('optional declared text assets');
+  expect(JSON.stringify(startTool.parameters.properties.assets)).toContain('ctx.readText(name)');
   // Starting before writing is one wasted call, not a paused turn.
   expect(JSON.stringify(bodies[1].messages.at(-1))).toContain('No file named \\"apps/game.js\\" in the workspace: write the app to it first');
   expect(f.posts[0]!.content).toBe('🪑 0');

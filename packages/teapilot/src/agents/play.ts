@@ -358,18 +358,17 @@ export function play(context: PlayContext, config: Config, policy: ExecutionPoli
 // Keep the standing prompt small; tool schemas and results supply contextual corrections.
 function playPrompt(repository: boolean, writable: boolean, running: Array<{ id: string; title: string; file?: string }>, files: { images: boolean; code: boolean }): string {
   return [
-    '- `discord.play` is active: build an interactive Discord app with `play_start` when requested, rather than describing the app in text.',
-    `- Write one ${repository ? 'repository' : 'workspace'} entry file with ` + '`@teapilot/discord-play`' + `, then call play_start({ ${repository ? 'path' : 'file'}, title }). Keep it as small as the request allows; make sensible assumptions rather than writing out a plan.`,
+    '- `discord.play` is active.',
+    `- Apps use ` + '`@teapilot/discord-play`' + ` and run from a ${repository ? 'repository' : 'workspace'} entry file: play_start({ ${repository ? 'path' : 'file'}, title }).`,
     '- App shape: `export default app({ init(ctx), update(state, action, ctx), view(state, ctx) })`; use the SDK builders and tool descriptions for API details.',
+    '- Sandboxed apps are synchronous: no async, filesystem, network or other imports.',
     ...files.images ? ['- Use `picture(file, options)` for an attached image when the request needs it.'] : [],
     ...files.code ? ['- An attached app file runs as it is with play_start({ file, title }); never write it out again.'] : [],
-    '- Use targeted `play_test` checks when useful; report only what was checked, since simulation is not extensive playtesting.',
     `- Runtime limits: timers >= ${playLimits.minTimerMs} ms, ${playLimits.timers} pending, state <= ${playLimits.stateChars} characters.`,
-    '- Tell people briefly what the app does and how to use it; tool errors and the fixes they took stay out of the answer.',
     ...running.length ? [`- Running here: ${running.map(app => `${app.id} ${JSON.stringify(app.title)}${app.file ? ` (${app.file})` : ''}`).join(', ')}. play_update and play_inspect default to the newest.`] : [],
     // Available capabilities
     writable
-      ? '- Repository session: the SDK is a convenience, not a boundary. You may inspect, extend or bypass it, add dependencies, change the runtime, and run an app from a repository file with play_start({ path, trusted: true }) for raw Discord API work (ctx.discord.request); that needs repository.shell and an operator approval.'
-      : '- Workspace session: the SDK is a convenience, not a boundary. The workspace is yours to work in (write helper scripts, prepare data or images with the shell when it can run) and apps run sandboxed from workspace files; only raw Discord API access (ctx.discord.request) needs a repository session.',
+      ? '- Raw Discord API access (ctx.discord.request) uses play_start({ path, trusted: true }); it needs repository.shell and an operator approval.'
+      : '- Apps run sandboxed; raw Discord API access (ctx.discord.request) needs a repository session.',
   ].join('\n');
 }
