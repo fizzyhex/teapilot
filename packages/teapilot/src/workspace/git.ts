@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { SandboxStatus, WorkspaceSandbox } from './sandbox.js';
@@ -20,35 +20,10 @@ export function gitEnvironment(author: string): Record<string, string> {
 /** teapilot's internal captures are disposable; scratch utilities and plans can still be tracked. */
 const ignored = ['/.scratch/sessions/', '/.scratch/outputs/', '/.scratch/logs/', '/.scratch/juniors/*/sessions/', '/.scratch/juniors/*/outputs/', '/.scratch/juniors/*/logs/', '.tmp/', '.packages/', '.cache/', '.appdata/', '.gitconfig', 'node_modules/', '__pycache__/'];
 
-const legacyReadme = `# workspace
-
-this folder is a git repo and you (teapilot) own it. files people attach land here too.
-
-- commit after each meaningful step - small commits are easy to roll back
-- messages: a short imperative subject, plus a line of why when it isn't obvious
-- tag milestones people may want back (\`git tag first-draft\`)
-- \`git log --oneline\` and \`git diff\` show what was done before - check them when picking work back up
-- juniors commit under their own names (tea-junior-*) - read their commits before building on them
-`;
-
-const readme = `# workspace
-
-this folder holds this conversation's files and work. attachments are kept under \`.scratch/user-attachments/\`.
-`;
-
-const agents = `# workspace instructions
-
-this folder is a git repo you (teapilot) own. read README.md for workspace context.
-
-- commit after each meaningful step - small commits are easy to roll back
-- messages: a short imperative subject, plus a line of why when it isn't obvious
-- tag milestones people may want back (\`git tag first-draft\`)
-- \`git log --oneline\` and \`git diff\` show what was done before - check them when picking work back up
-- juniors commit under their own names (tea-junior-*) - read their commits before building on them
-- keep README.md for people: what the work is and how to use it. keep AGENTS.md for agents: durable conventions and non-obvious constraints
-- update these docs when your changes make them inaccurate or leave out something useful, not after every task. edit or remove stale text instead of appending
-- keep them short: read the code for implementation details. no task logs, exhaustive file maps, repeated rules or keyword lists
-`;
+// Loaded once; edits to the shipped templates apply after a restart.
+const legacyReadme = readFileSync(new URL('./template/legacy-README.txt', import.meta.url), 'utf8');
+const readme = readFileSync(new URL('./template/README.txt', import.meta.url), 'utf8');
+const agents = readFileSync(new URL('./template/AGENTS.txt', import.meta.url), 'utf8');
 
 export const hasRepository = (folder: string) => existsSync(join(folder, '.git'));
 

@@ -420,7 +420,7 @@ it('makes a workspace a git repository once, committing as the orchestrator or a
   expect(runs).toEqual([{ command: expect.stringMatching(/^git init/), author: 'teapilot' }]);
   // A README someone shared stays theirs; the session's transcripts are never committed.
   expect(await readFile(join(folder, 'README.md'), 'utf8')).toBe('mine');
-  expect(await readFile(join(folder, 'AGENTS.md'), 'utf8')).toContain('commit after each meaningful step');
+  expect(await readFile(join(folder, 'AGENTS.md'), 'utf8')).toBe(await readFile(new URL('../src/workspace/template/AGENTS.txt', import.meta.url), 'utf8'));
   const rules = (await readFile(join(folder, '.gitignore'), 'utf8')).split('\n');
   expect(rules).toContain('/.scratch/sessions/');
   expect(rules).toContain('/.scratch/juniors/*/sessions/');
@@ -448,13 +448,8 @@ it.each([false, true])('seeds concise workspace docs without resetting them (exi
   expect(await ensureRepository(folder, sandbox, status)).toBe(true);
   const readme = await readFile(join(folder, 'README.md'), 'utf8');
   const agents = await readFile(join(folder, 'AGENTS.md'), 'utf8');
-  expect(readme).toContain('.scratch/user-attachments/');
-  expect(readme).not.toMatch(/commit|instructions|keyword/);
-  expect(agents).toContain('commit after each meaningful step');
-  expect(agents).toContain('keep README.md for people');
-  expect(agents).toContain('keep AGENTS.md for agents');
-  expect(agents).toContain('edit or remove stale text instead of appending');
-  expect(agents).toContain('read the code for implementation details');
+  expect(readme).toBe(await readFile(new URL('../src/workspace/template/README.txt', import.meta.url), 'utf8'));
+  expect(agents).toBe(await readFile(new URL('../src/workspace/template/AGENTS.txt', import.meta.url), 'utf8'));
   expect(sandbox.commands).toHaveLength(existing ? 0 : 1);
   await writeFile(join(folder, 'README.md'), 'custom workspace overview\n');
   await writeFile(join(folder, 'AGENTS.md'), 'custom workspace instructions\n');
@@ -497,12 +492,11 @@ this folder is a git repo and you (teapilot) own it. files people attach land he
   const readme = await readFile(join(folder, 'README.md'), 'utf8');
   if (variant === 'customized') expect(readme).toBe(original);
   else {
-    expect(readme).toContain('.scratch/user-attachments/');
-    expect(readme).not.toContain('commit');
+    expect(readme).toBe(await readFile(new URL('../src/workspace/template/README.txt', import.meta.url), 'utf8'));
   }
   const agents = await readFile(join(folder, 'AGENTS.md'), 'utf8');
   if (variant === 'existing instructions') expect(agents).toBe('my rules\n');
-  else expect(agents).toContain('commit after each meaningful step');
+  else expect(agents).toBe(await readFile(new URL('../src/workspace/template/AGENTS.txt', import.meta.url), 'utf8'));
   expect(await ensureRepository(folder, sandbox, status)).toBe(true);
   expect(await readFile(join(folder, 'README.md'), 'utf8')).toBe(readme);
   expect(await readFile(join(folder, 'AGENTS.md'), 'utf8')).toBe(agents);

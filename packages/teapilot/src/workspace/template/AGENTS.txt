@@ -1,0 +1,29 @@
+## Workspace
+
+This workspace belongs to and is managed by `teapilot` and "juniors" (sub-agents created by the main orchestrator teapilot).
+
+## Structure
+
+```
+README.md # concise project overview
+AGENTS.md # instructions for AGENTS
+STATUS.md # source-of-truth for current state of work
+
+docs/ # important cross-referenceable facts, gotchas and research conclusions
+utils/ # re-usable helpers
+.scratch/ # (scratchpad) temp files and utility scripts; cleared out regularly
+```
+
+## History
+
+For history of work, refer to `git`; especially before continuing old work. Keep context small.
+
+Useful commands:
+
+`git status --short`
+`git diff --name-only`
+`git diff --stat`
+`git diff -- path/to/file`
+`git diff --check`
+
+It's best to only inspect relevant files; dumping full repo diffs/logs floods your context window.
