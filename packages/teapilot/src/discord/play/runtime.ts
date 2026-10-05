@@ -5,7 +5,7 @@ import type { Action, Effect, Embed, Participants, User, View } from '@teapilot/
 import { interactionLifetimeMs } from '../commands.js';
 import type { PictureSpec } from '../images.js';
 import { maxOutputChars, type CallInput, type ContextData, type PlayEngine } from './engine.js';
-import { describe, findControl, normalizeView, PlayError, renderEmbeds, renderModal, renderView, type MessagePayload, type ModalPayload } from './render.js';
+import { describe, findControl, ignoredKeys, normalizeView, PlayError, renderEmbeds, renderModal, renderView, type MessagePayload, type ModalPayload } from './render.js';
 import { sandbox } from './sandbox.js';
 import type { PlayRecord, PlayStore } from './store.js';
 import { trusted, type DiscordRequest } from './trusted.js';
@@ -267,7 +267,12 @@ export class PlayRuntime {
     lookAt(from.view);
     // With nothing to press and nothing on its way, an app is stuck before anyone can start it.
     const usable = (from.view.rows ?? []).flatMap(row => row.controls).some(control => !control.disabled && !(control.type === 'button' && control.url));
-    if (!usable && !from.timers.length && !from.effects.some(effect => effect.type === 'consult')) throw new PlayError('People could not do anything with this app: its view has no controls, and no timer or consult is on its way. Show the controls people need in every state, such as a start or join button.');
+    if (!usable && !from.timers.length && !from.effects.some(effect => effect.type === 'consult')) {
+      // Controls written somewhere nothing reads them are the usual cause, so name where they went.
+      const meta = (await engine.call('meta', { ctx: this.context(record) })).value as { keys?: string[] } | null;
+      const onApp = meta?.keys?.includes('controls') ? ' Controls go in view()\'s rows, not on app().' : '';
+      throw new PlayError(`People could not do anything with this app: its view has no controls, and no timer or consult is on its way. Show the controls people need in every state, such as a start or join button.${ignoredKeys(from.view)}${onApp}`);
+    }
     for (const control of (from.view.rows ?? []).flatMap(row => row.controls)) {
       if (control.disabled || (control.type === 'button' && control.url)) continue;
       const name = control.type === 'button' ? `[${control.label || control.emoji || control.id}]` : `select ${control.id}`;

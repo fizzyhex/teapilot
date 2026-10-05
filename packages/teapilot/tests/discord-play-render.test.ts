@@ -46,6 +46,16 @@ it('sends emoji-only buttons without a blank label', () => {
   expect(() => checkMessage(payload)).not.toThrow();
 });
 
+it('names the SDK shapes a view is mistaken for', () => {
+  // Keys nothing reads are named only when the view has nothing else to show.
+  const lost = { text: 'board', controls: [button('left', 'Left')] };
+  expect(() => renderView('a1', lost)).toThrow(/nothing to show\. It ignores `text`, `controls`: a view is \{ content\?, embeds\?, rows\? \}/);
+  expect(renderView('a1', { content: 'board', title: 'snake' }).content).toBe('board');
+  const objectButton = button({ id: 'left', label: 'Left' } as unknown as string, undefined as unknown as string);
+  expect(() => renderView('a1', { rows: [row(objectButton)] })).toThrow(/button\(\) takes positional arguments/);
+  expect(() => renderView('a1', { embeds: [embed('board' as never)] })).toThrow(/embed\(\) takes options, as in embed\(\{ description: text \}\)/);
+});
+
 it('refuses emoji Discord would refuse, such as a shortcode or a name', () => {
   for (const emoji of [':tea:', 'tea', '🍵🍵']) expect(() => renderView('a1', { rows: [row(button('c0', 'Go', { emoji }))] })).toThrow(/not one Unicode emoji/);
 });
