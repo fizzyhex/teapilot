@@ -259,7 +259,7 @@ export function continuation(record: CheckpointRecord, parked = false): string {
   for (const failure of host.failures.slice(-3)) lines.push(`- failed: ${failure.call}: ${failure.error ?? 'error'}`);
   if (host.last) lines.push(`- last operation: ${host.last.call} ${host.last.ok ? 'succeeded' : 'failed'}`);
   if (host.scratchpad) lines.push(`- scratchpad: ${host.scratchpad.folder}${host.scratchpad.recent.length ? ` (newest: ${host.scratchpad.recent.join(', ')})` : ''}`);
-  if (host.skills.length) lines.push(`- skills loaded before: ${host.skills.join(', ')} (load again if needed)`);
+  if (host.skills.length) lines.push(parked ? `- skills loaded before: ${host.skills.join(', ')} (load again if needed)` : `- skills carried over: ${host.skills.join(', ')}`);
   if (lines.at(-1) === 'objective state (host-recorded):') lines.push('- nothing recorded');
   lines.push('', record.handoff ? `previous agent's handoff (guidance, not fact):\n- status: ${record.handoff.status}\n- next: ${record.handoff.next}` : 'the previous agent left no handoff.');
   if (record.steer) lines.push('', `the user steered at this checkpoint: ${record.steer}`);

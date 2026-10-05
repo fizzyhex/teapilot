@@ -420,7 +420,7 @@ export async function runHost(config: Config, request: HostRequest, dependencies
       // A parked workflow is offered to this request's first orchestrator; the person's message decides whether it resumes.
       const parked = !previous && flow?.parked ? `${continuation(flow.parked, true)}\n\n[the person's new message follows. continue the parked workflow only if it asks you to.]\n\n` : '';
       if (parked && flow?.parked) { flow.save({ ...flow.parked, status: 'resumed' }); flow.parked = undefined; }
-      const attempt = (prompt: string, resume: Resume | undefined) => runAttempt({
+      const attempt = (prompt: string, resume: Resume | undefined, carrySkills?: string[]) => runAttempt({
         allowance: recovery.allowance ??= new RequestAllowance({ calls: request.readOnly ? Math.min(config.policy.limits.maxToolCalls, config.policy.limits.planningToolCalls ?? planningCallLimit) : config.policy.limits.maxToolCalls, modelCalls: config.policy.limits.maxTurns * (config.policy.escalation.maxEscalations + 1), timeoutMs: config.policy.limits.attemptTimeoutMs * (config.policy.escalation.maxEscalations + 1), delegations: config.policy.limits.maxJuniorTurns ?? 6 }, task, budgetLimits),
         workflow: flow, config, skillCatalog, workload, tier, cwd, web: request.authorization ? activePermissions.includes('web.search') : Boolean(request.web), budget, telemetry, recovery, task, taskId: task ? taskId : undefined, readOnly: request.readOnly,
         mode: request.mode, conversational: request.conversational, side: request.side, casual, authorization: request.authorization, access: request.access, play: request.play, workspace: request.workspace,
@@ -446,7 +446,7 @@ export async function runHost(config: Config, request: HostRequest, dependencies
           await telemetry.event('approval', { kind: approval.kind, approved });
           return approved;
         },
-        signal: request.signal, resume, images, prompt,
+        signal: request.signal, resume, images, prompt, carrySkills,
       });
       previous = await attempt(resume ? resumeNotice(config, previousTier!, tier, previous!.reason)
         : parked + basePrompt + (previous ? `\nPrevious attempt stopped: ${previous.reason}. ${previous.changedFiles?.length || previous.shellRan ? 'Existing edits are still in the repository; inspect them before proceeding. Do not restart blindly.' : 'It changed no files; continue the task from the context below.'}\nRecent execution context:\n${previous.handoff ?? previous.text.slice(-6000)}` : ''), resume);
@@ -479,7 +479,7 @@ export async function runHost(config: Config, request: HostRequest, dependencies
         attempts++;
         models.push(modelFor(config, tier).id);
         dependencies.onEvent?.({ type: 'attempt_start', attempt: attempts, model: modelFor(config, tier).id, tier, checkpoint: record.generation });
-        previous = await attempt(continuation(record), undefined);
+        previous = await attempt(continuation(record), undefined, record.host.skills);
       }
       if (accessFailure) return await finish(false, 'approval_denied', incomplete(previous, accessFailure));
       await telemetry.event('attempt_end', { decisionId: decision?.decision_id, capability: selected, success: previous.success, reason: previous.reason, stopped: previous.stopped, turns: previous.turns, toolCalls: previous.toolCalls, check: previous.check, ...(previous.success ? {} : { ending: previous.ending }) });

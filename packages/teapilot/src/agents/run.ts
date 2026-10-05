@@ -11,6 +11,7 @@ import { ExecutionPolicy, within, type Approve, type BeforeMutation } from '../e
 import { StreamRedactor, type EventSink, type ConversationTurn } from '../integration/events.js';
 import type { SpendGovernor } from '../inference/budget.js';
 import { guardedStream, piModel, type InferenceState } from '../inference/providers.js';
+import { emptyUsage } from '../integration/inference.js';
 import { Evidence, isCheckCommand, type EscalationReason } from '../routing/escalation.js';
 import type { Telemetry } from '../telemetry/outcome.js';
 import { accessTools, type AccessAdmin } from './access.js';
@@ -96,6 +97,8 @@ export interface AttemptInput {
   skillCatalog?: SkillCatalog;
   /** The request's host-owned workflow (agents/checkpoint.ts): with it, the orchestrator checkpoints instead of running out. */
   workflow?: Workflow;
+  /** Skills the previous checkpoint generation loaded: this one starts with them loaded. */
+  carrySkills?: string[];
 }
 /** What an attempt last showed the model of its request (after any compaction, without earlier turns), and the summary before it. */
 export interface Resume { messages: Message[]; summary?: Compaction }
@@ -888,7 +891,24 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
   input.signal?.addEventListener('abort', cancel, { once: true });
   try {
     input.signal?.throwIfAborted();
-    await agent.prompt(input.prompt, pictures.length ? pictures : undefined);
+    // Carried skills follow the prompt as the host's own skill call, so they arrive loaded rather than suggested.
+    const carried = flow && skills.tools[0] ? (input.carrySkills ?? []).filter(id => catalog.skills.some(skill => skill.id === id)) : [];
+    const calls: Array<{ type: 'toolCall'; id: string; name: string; arguments: { id: string } }> = [], results: Message[] = [];
+    for (const [index, id] of carried.entries()) {
+      try {
+        const loaded = await skills.tools[0]!.execute(`carried_skill_${index}`, { id }, input.signal);
+        calls.push({ type: 'toolCall', id: `carried_skill_${index}`, name: 'skill', arguments: { id } });
+        results.push({ role: 'toolResult', toolCallId: `carried_skill_${index}`, toolName: 'skill', content: loaded.content, details: loaded.details, isError: false, timestamp: Date.now() } as Message);
+      } catch { /* changed or unreadable since: the catalog still offers it */ }
+    }
+    if (calls.length) {
+      const pi = piModel(model, profile);
+      await agent.prompt([
+        { role: 'user', content: [{ type: 'text', text: input.prompt }, ...pictures], timestamp: Date.now() },
+        { role: 'assistant', content: calls, api: pi.api, provider: pi.provider, model: pi.id, timestamp: Date.now(), usage: emptyUsage(), stopReason: 'toolUse' },
+        ...results,
+      ]);
+    } else await agent.prompt(input.prompt, pictures.length ? pictures : undefined);
   } finally {
     terminated = true;
     if (!input.junior) allowance.finishQueuedBatch();

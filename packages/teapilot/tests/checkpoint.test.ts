@@ -212,6 +212,27 @@ describe('checkpoints through the host', () => {
     expect((await events(f.config)).filter(event => event.type === 'tool' && event.name === 'read')).toHaveLength(8);
   });
 
+  it('starts the next orchestrator with the skills the last one loaded', async () => {
+    const bodies: any[] = [];
+    const f = await setup((body, req, res) => {
+      if (req.url === '/jev') return jev(res, 'coder.normal');
+      if (req.url?.endsWith('/models')) { res.end('{}'); return; }
+      bodies.push(body);
+      if (generation(body)) return completion(res, { text: 'done.' });
+      if (!sent(body).includes('fixture instructions')) return completion(res, { tool: { name: 'skill', arguments: { id: 'example' } } });
+      if (toolNames(body).includes('checkpoint')) return completion(res, { tool: { name: 'checkpoint', arguments: { status: 's', next: 'n' } } });
+      read(res, body);
+    });
+    const directory = join(f.cwd, 'skills'); await mkdir(join(directory, 'example'), { recursive: true });
+    await writeFile(join(directory, 'example', 'SKILL.md'), '---\nname: example\ndescription: Read fixture evidence carefully.\n---\nfixture instructions\n');
+    f.config.skills = { enabled: true, offline: true, directory };
+    const result = await runHost(f.config, { cwd: f.cwd, prompt: 'Inspect code', scratch: f.scratch }, { approve: async () => true, onCheckpoint: async () => ({ action: 'continue' }) });
+    expect(result.success, JSON.stringify(result)).toBe(true);
+    const fresh = sent(bodies.find(body => generation(body)));
+    expect(fresh).toContain('skills carried over: example');
+    expect(fresh).toContain('fixture instructions');
+  });
+
   it('passes a steer to the next orchestrator', async () => {
     const bodies: any[] = [];
     const f = await setup((body, req, res) => {
