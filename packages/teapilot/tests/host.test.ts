@@ -132,7 +132,7 @@ describe('real JevRouter SDK + pi loop with mock HTTP providers', () => {
       approve: async () => true, localProbe: async () => true,
       onCheckpoint: async checkpoint => ({ requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action: 'finish_partial' }),
     });
-    expect(result).toMatchObject({ success: false, status: 'partial', checkpoint: { reason: 'instructor_calls', durability: 'request-local' } });
+    expect(result).toMatchObject({ success: false, status: 'partial', checkpointAvailable: false, checkpoint: { reason: 'instructor_calls', durability: 'saved', savedId: expect.any(String) } });
     expect(result.text).toContain('work is partial, not complete');
     expect(result.checkpoint?.snapshot.results.length).toBeGreaterThan(0);
     expect(result.checkpoint?.snapshot.results[0]).toMatchObject({ ref: expect.stringMatching(/^(receipt|toolcall|saved-output):/), summary: expect.stringContaining('read succeeded') });

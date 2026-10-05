@@ -4,6 +4,7 @@ import { isAside, proposalRequest } from '../chat.js';
 import { loadConfig, type Config } from '../config.js';
 import { repositoryOffered, repositoryPermissions, SessionGrants } from '../execution/grants.js';
 import { runHost, type HostRequest } from '../host.js';
+import { CheckpointStore, checkpointCommand } from '../workspace/checkpoint.js';
 import { headlessTeachat, openHeadlessTeachat } from '../teachat/session.js';
 import type { SetupUI } from '../setup/terminal.js';
 import { route, routeReply } from './access.js';
@@ -24,7 +25,7 @@ import { consultant } from './play/consult.js';
 import { summariser } from './summarise.js';
 import { PlayRuntime, type Clock, type PlaySurface } from './play/runtime.js';
 import { PlayStore } from './play/store.js';
-import type { connect, Gateway, GatewayCommand, GatewayCompletion, GatewayMessage, GatewayReply } from './gateway.js';
+import type { connect, Gateway, GatewayCommand, GatewayCompletion, GatewayHandlers, GatewayMessage, GatewayReply } from './gateway.js';
 import { interactionLifetimeMs, setupCommands, type PromptSetup } from './commands.js';
 import { chunk, quoteMessage } from './render.js';
 import { StatusPresence } from './presence.js';
@@ -191,6 +192,7 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
       key, transport, queue, redact, log, access, files, sandbox,
       once: oneShot,
       request: { prompt: '', cwd: root, mode: setup.mode ?? settings.startMode, tier: setup.tier, authorization, signal: timeLimited ? AbortSignal.any([signal, AbortSignal.timeout(interactionLifetimeMs)]) : signal,
+        checkpointScope: historyKey, checkpointChannel: channelId,
         // A conversation picks up where it was before a restart, or where the last one-shot in its history left off.
         history: histories.load(historyKey) },
       onHistory: history => { if (!history.length) clearScratch(historyKey); try { histories.save(historyKey, history); } catch (error) { log(`${historyKey}: history not saved: ${error instanceof Error ? error.message : String(error)}`); } },
@@ -356,6 +358,18 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
     return { state: () => grants.offered(), press: (permission, userId) => (live() ?? idle).press(permission, userId) };
   };
 
+  const reopenCheckpoint: NonNullable<GatewayHandlers['savedCheckpoint']> = async input => {
+    if (!allowed(input.user.id)) return 'you are not allowed to reopen checkpoints.';
+    const store = new CheckpointStore(config.stateDir);
+    const saved = store.read(input.id);
+    store.authorize(saved, { root, scope: saved.scope, channel: input.channelId, owner: input.user.id, operator: access.roleOf(input.user.id) === 'operator' });
+    if (!store.available(saved)) return 'this checkpoint is still live or already handled.';
+    if (input.action === 'redirect' && (!input.amendment?.trim() || input.amendment.length > 1000)) return 'supply a direction of 1–1000 characters.';
+    const conversation = await open(saved.scope, input.transport, { channelId: input.channelId, historyKey: saved.scope });
+    conversation.push(`/checkpoint ${input.action} ${saved.id}${input.action === 'redirect' ? ` ${input.amendment}` : ''}`, { sender: input.user.id, senderName: input.user.name });
+    return input.action === 'finish' ? 'finishing the saved checkpoint; no new execution authorized.' : 'new execution authorized from this checkpoint; queued with current permissions and fresh limits.';
+  };
+
   const handleCommand = async (command: GatewayCommand): Promise<void> => {
     if (command.authorIsBot || !allowed(command.authorId)) { await command.respond('You are not allowed to use teapilot here.'); return; }
     const target = route(command, settings, allowed);
@@ -363,6 +377,18 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
     const seat = seats.seat(command.channelId, command.authorId);
     if (command.text.startsWith('/collab')) { await handleCollab(command, seat); return; }
     const key = seat ? historyKeyOf(command.channelId, command.authorId, seat) : target?.key || undefined;
+    if (/^\/checkpoint(?:\s|$)/.test(command.text)) {
+      try {
+        const action = checkpointCommand(command.text)!;
+        if (action.action === 'list') {
+          if (!key) { await command.respond('no saved checkpoints in this conversation.'); return; }
+          const result = await queue.run(() => runHost(config, { prompt: '', cwd: root, checkpointAction: action, checkpointScope: key, checkpointOwner: command.authorId, checkpointOperator: access.roleOf(command.authorId) === 'operator', checkpointChannel: command.channelId }, { approve: async () => false }));
+          for (const part of chunk(result.text)) await command.respond(part);
+        } else if (command.transport) await command.respond(await reopenCheckpoint({ id: action.id, action: action.action, amendment: action.amendment, user: { id: command.authorId, name: command.authorId }, channelId: command.channelId, transport: command.transport() }));
+        else await command.respond('use the saved checkpoint’s buttons to reopen it.');
+      } catch (error) { await command.respond(error instanceof Error ? error.message : String(error)); }
+      return;
+    }
     if (/^\/skills(?:\s|$)/.test(command.text)) {
       try {
         const text = await skillStore.command(command.text.slice(7).trim(), { conversation: key, userId: command.authorId, operator: access.roleOf(command.authorId) === 'operator' }, signal);
@@ -507,6 +533,7 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
   };
   const failed = (what: string) => (error: unknown) => log(`${what} failed: ${error instanceof Error ? error.message : String(error)}`);
   const gateway = await connect(settings, {
+    savedCheckpoint: reopenCheckpoint,
     message: message => void handle(message).catch(failed('Message handling')),
     command: command => void handleCommand(command).catch(failed('Command handling')),
     complete: completion => void handleComplete(completion).catch(failed('Completion')),

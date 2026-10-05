@@ -51,6 +51,9 @@ const subcommand = (name: string, description: string, options?: Option[]) => ({
 
 /** These mirror the session commands the bridge already understands; /cd is fixed for Discord. */
 export const commandDefinitions: CommandDefinition[] = [
+  { name: 'checkpoint', description: 'Reopen saved work, or finish without running anything', options: [
+    { type: 3, name: 'value', description: 'list, resume <id>, redirect <id> <direction>, or finish <id>', required: false },
+  ], ...everywhere },
   { name: 'skills', description: 'Choose repository skill sets and individual skills', options: [
     ...['list', 'enable', 'disable', 'add', 'remove', 'update'].map(action => subcommand(action, `${action} skill sets or skills`, [
       { type: 3, name: 'target', description: 'gh:owner/repo, optionally #revision or ::skill', required: ['enable', 'disable', 'add', 'remove'].includes(action) } as Option,
@@ -113,6 +116,7 @@ export const withoutUserInstall = (definitions: CommandDefinition[]): CommandDef
 export function commandText(name: string, subcommandName?: string | null, argument?: string | null, scope?: string | null): string | undefined {
   const definition = commandDefinitions.find(candidate => candidate.name === name);
   if (!definition || !('description' in definition) || [replyCommand, promptCommand].includes(name)) return undefined;
+  if (name === 'checkpoint') return `/checkpoint ${argument || 'list'}`;
   if (name === 'permissions') {
     if (subcommandName === 'list') return '/permissions';
     return (subcommandName === 'grant' || subcommandName === 'revoke') && argument ? `/${subcommandName} ${argument}` : undefined;

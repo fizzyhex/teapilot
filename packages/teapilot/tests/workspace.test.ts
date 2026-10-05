@@ -692,6 +692,26 @@ it('copies @mentioned files into a terminal session\'s workspace and saves sent 
   expect(existsSync(folder)).toBe(false);
 });
 
+it('retains terminal checkpoint evidence on close and can reopen that workspace after restart', async () => {
+  const state = await directory('teapilot-checkpoint-workspace-');
+  const cwd = await directory('teapilot-checkpoint-cwd-');
+  await writeFile(join(cwd, 'evidence.txt'), 'keep this partial evidence');
+  const store = WorkspaceStore.at(state);
+  const original = new TerminalWorkspace(store, fakeSandbox(), async () => false);
+  await original.attach('@evidence.txt', cwd, 5000);
+  const id = original.context(cwd).conversation;
+  const folder = store.folder(id);
+  original.retain(); await original.close();
+  const restarted = new TerminalWorkspace(store, fakeSandbox(), async () => false);
+  restarted.reopen(id);
+  expect(restarted.context(cwd).conversation).toBe(id);
+  expect(store.read(id, '.scratch/user-attachments/evidence.txt')?.data.toString()).toBe('keep this partial evidence');
+  await restarted.close();
+  expect(existsSync(folder)).toBe(true);
+  await restarted.reset();
+  expect(existsSync(folder)).toBe(false);
+});
+
 it('keeps distinct @mentioned files with the same basename and deduplicates repeated paths', async () => {
   const store = WorkspaceStore.at(await directory('teapilot-workspace-'));
   const cwd = await directory('teapilot-cwd-');

@@ -35,6 +35,8 @@ export interface DiscordTransport {
   askContinuationBudget?(text: string, signal: AbortSignal, timeoutMs?: number): Promise<'approved' | 'denied' | 'auto-approved'>;
   /** A request-local execution checkpoint. This is deliberately distinct from feed Resume. */
   checkpoint?(text: string, checkpoint: Checkpoint, signal: AbortSignal, decide: (action: 'continue' | 'redirect' | 'finish_partial', userId: string, amendment?: string) => CheckpointDecision | undefined, stop: (userId: string) => CardReply): Promise<CheckpointDecision | undefined>;
+  /** Durable controls carry a saved id, not callbacks owned by the expired request. */
+  savedCheckpoint?(text: string, id: string): Promise<void>;
   typing(): void;
   /** Posts files as attachments, with a line of text. */
   sendFiles?(text: string, files: Array<{ name: string; data: Buffer }>): Promise<string>;
@@ -325,6 +327,10 @@ export class Conversation {
     const side = base.side === true;
     const request: HostRequest = { ...base, skills: this.options.skills?.preferences(this.speaker), planAction: this.refining ? 'revise' : base.prompt === approvePrompt ? 'approve' : base.planAction, readOnly: base.readOnly || this.refining, sessionId: this.options.key, access: admin, workspace, ...(files && !side ? { scratch: files.scratch(conversation) } : {}),
       play: play && !side ? { runtime: play.runtime, channelId: play.channelId, post: play.post, conversation, owner: this.speaker ? { id: this.speaker, name: this.speakerName } : undefined, files: workspace } : undefined };
+    request.checkpointScope = base.checkpointScope ?? conversation;
+    request.checkpointOwner = this.speaker;
+    request.checkpointOperator = this.operator(this.speaker);
+    request.checkpointChannel = base.checkpointChannel ?? play?.channelId;
     const refining = this.refining; this.refining = false;
     const turn = this.turn = new AbortController();
     const signal = AbortSignal.any([turn.signal, ...(this.options.request.signal ? [this.options.request.signal] : [])]);
@@ -416,7 +422,7 @@ export class Conversation {
               return { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action };
             };
             if (!this.options.transport.checkpoint) {
-              await this.say('checkpoint reached, but this transport cannot collect a decision. stopping here; this request cannot resume after restart.', true);
+              await this.say('checkpoint reached. releasing this request; the saved checkpoint can be reopened with /checkpoint.', true);
               return undefined;
             }
             const live = this.live;
@@ -425,7 +431,7 @@ export class Conversation {
             const facts = checkpoint.summary.map(line => `• ${this.options.redact(line).slice(0, 300)}`).join('\n');
             const offer = checkpoint.continuation ? `\n\nnext window: ${checkpoint.continuation.instructorCalls} instructor calls, ${Math.ceil(checkpoint.continuation.activeMs / 60_000)}m active${checkpoint.continuation.freshContext ? ', fresh context' : ''}` : '\n\nno continuation window remains inside this request’s authorization.';
             const proposal = checkpoint.modelHandoff ? `\n\nmodel proposal (unverified): ${this.options.redact(checkpoint.modelHandoff).slice(0, 500)}` : '';
-            const text = `⏸️ checkpoint · request-local; not resumable after restart\n${facts || 'No verified summary available.'}${offer}${proposal}\n\nuse Change direction to steer this paused task; ordinary messages start the next turn.`.slice(0, 1600);
+            const text = `⏸️ checkpoint${checkpoint.savedId ? ' · saved; expiry releases this request, not your progress' : ' · request-local'}\n${facts || 'No verified summary available.'}${offer}${proposal}\n\nuse Change direction to steer this paused task; ordinary messages start the next turn.`.slice(0, 1600);
             try { return await this.options.transport.checkpoint(text, checkpoint, AbortSignal.any([signal, checkpointSignal]), decide, userId => controls(true).press('stop', userId)); }
             finally {
               if (live && previous) {
@@ -482,6 +488,9 @@ export class Conversation {
       await update.flush();
       const summary = card.summary(result);
       if (!await show(summary, false)) await this.say(summary);
+    }
+    if (result.checkpointAvailable && result.checkpoint?.savedId && transport.savedCheckpoint) {
+      await transport.savedCheckpoint('⏸️ checkpoint saved · this request has ended.\nresume or change direction explicitly authorizes a new execution with current permissions and fresh limits. finish keeps partial work without running anything.', result.checkpoint.savedId).catch(error => this.options.log(`${this.options.key}: saved checkpoint controls failed: ${String(error)}`));
     }
     this.options.log(`${this.options.key}: ${result.status}; $${result.spentUsd.toFixed(6)}`);
     this.options.onTurnEnd?.({ status: result.status, requestId: result.requestId });

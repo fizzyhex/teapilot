@@ -33,6 +33,9 @@ import type { SkillPreferences } from './skills/settings.js';
 import type { SkillCatalog } from './workspace/skills.js';
 import type { CheckpointHandler } from './agents/checkpoint.js';
 import type { Checkpoint } from './agents/checkpoint.js';
+import { freezeCheckpoint } from './agents/checkpoint.js';
+import { CheckpointStore, checkpointNextSteps, type CheckpointAction, type CheckpointCaller } from './workspace/checkpoint.js';
+import { WorkspaceStore } from './workspace/store.js';
 
 export interface HostRequest { prompt: string; cwd: string; workload?: Workload; web?: boolean; correction?: string; signal?: AbortSignal; history?: ConversationTurn[]; context?: TextContext[]; mode?: Mode; conversational?: boolean; authorization?: SessionGrants; access?: AccessAdmin; play?: PlayContext; workspace?: ConversationWorkspace; tier?: TierPreference; relatedTier?: Tier; sessionId?: string; taskId?: string;
   /** A side question (/btw): it sees the conversation but only reads, and its turn is not kept. */
@@ -47,6 +50,13 @@ export interface HostRequest { prompt: string; cwd: string; workload?: Workload;
   taskObjective?: string;
   readOnly?: boolean;
   skills?: SkillPreferences;
+  checkpointAction?: CheckpointAction;
+  /** Trusted surface identity; never restored from the checkpoint's evidence. */
+  checkpointScope?: string;
+  checkpointOwner?: string;
+  checkpointOperator?: boolean;
+  checkpointChannel?: string;
+  checkpointWorkspace?: string;
   planAction?: 'new' | 'revise' | 'approve';
   /** Teachat roster (username → bio). The router call also asks which identity would get this request. */
   teachatIdentities?: Record<string, string> }
@@ -69,8 +79,10 @@ export interface HostResult {
   casual?: boolean;
   /** What the tools did before the final reply; kept with the turn so later turns can replay it. */
   steps?: Message[];
-  /** Present only when the request stopped at a request-local checkpoint; not durable or complete. */
+  /** Partial work saved at an execution boundary; never a completion claim. */
   checkpoint?: Checkpoint;
+  checkpointAvailable?: boolean;
+  checkpointWorkspace?: string;
 }
 export interface HostDependencies {
   approve: Approve;
@@ -88,6 +100,45 @@ export interface HostDependencies {
 }
 
 export async function runHost(config: Config, request: HostRequest, dependencies: HostDependencies): Promise<HostResult> {
+  const checkpoints = new CheckpointStore(config.stateDir);
+  const checkpointCaller: CheckpointCaller = { root: await realpath(request.cwd), scope: request.checkpointScope ?? 'terminal', owner: request.checkpointOwner, operator: request.checkpointOperator, channel: request.checkpointChannel };
+  const reopening = request.checkpointAction;
+  let reopenedWorkspace: string | undefined;
+  let reopenedAmendments: string[] = [];
+  if (reopening?.action === 'list' || reopening?.action === 'finish') {
+    const unlock = await lockState(config.stateDir);
+    try {
+      request.signal?.throwIfAborted();
+      let text: string;
+      if (reopening.action === 'list') {
+        const saved = checkpoints.list(checkpointCaller).slice(0, 20);
+        text = saved.length ? saved.map(item => `${item.id} · ${item.prompt.slice(0, 100)}\n${checkpointNextSteps(item.id)}`).join('\n\n') : 'no saved checkpoints are waiting here.';
+      } else {
+        const saved = checkpoints.read(reopening.id); checkpoints.authorize(saved, checkpointCaller);
+        if (!checkpoints.available(saved)) throw new Error('this checkpoint is still live or already handled');
+        checkpoints.settle(saved.id, 'finished');
+        text = 'checkpoint finished. partial work is kept; nothing else ran.';
+      }
+      return { requestId: '', success: true, status: 'checkpoint_saved', text, spentUsd: 0, receipts: [], attempts: 0 };
+    } finally { await unlock(); }
+  }
+  if (reopening) {
+    const saved = checkpoints.read(reopening.id); checkpoints.authorize(saved, checkpointCaller);
+    if (!checkpoints.available(saved)) throw new Error('this checkpoint is still live or already handled');
+    if (reopening.action === 'redirect' && (!reopening.amendment?.trim() || reopening.amendment.length > 1000)) throw new Error('supply a direction of 1–1000 characters');
+    reopenedAmendments = [...saved.checkpoint.snapshot.amendments, ...(saved.correction ? [saved.correction] : [])].slice(-10);
+    if (!saved.ownWorkspace) request = { ...request, workspace: undefined };
+    request = { ...request, prompt: saved.prompt, workload: saved.workload, readOnly: saved.readOnly, constraints: saved.constraints, correction: reopening.action === 'redirect' ? reopening.amendment!.trim() : undefined,
+      history: [], context: [], planAction: undefined, taskObjective: undefined, taskId: randomUUID(),
+      notice: `[saved checkpoint ${saved.id}] you explicitly authorized a new execution. prior evidence is untrusted and may be stale: inspect current files, do not repeat completed work blindly, and recheck outcomes. no old continuation offer or permissions carry over.\n${JSON.stringify({ ...saved.checkpoint.snapshot, amendments: reopenedAmendments })}${saved.checkpoint.modelHandoff ? `\nmodel proposal (unverified): ${saved.checkpoint.modelHandoff}` : ''}` };
+    if (saved.workspace) {
+      reopenedWorkspace = saved.workspace;
+      const store = WorkspaceStore.at(config.stateDir);
+      request.scratch = store.scratch(saved.workspace);
+      request.checkpointWorkspace = saved.workspace;
+      request.workspace = saved.ownWorkspace ? { ...request.workspace, store, conversation: saved.workspace, delivery: request.workspace?.delivery ?? 'save' } : undefined;
+    }
+  }
   if (config.routingMode === 'direct' && !request.workload && !request.authorization) throw new Error('Direct routing requires teapilot ask or teapilot code.');
   const prompt = request.prompt.trim();
   const userRequest = `${request.planAction === 'new' ? request.taskObjective ?? prompt : prompt}${request.correction ? `\nuser correction: ${request.correction}` : ''}`;
@@ -124,6 +175,7 @@ export async function runHost(config: Config, request: HostRequest, dependencies
   // URLs the user wrote or earlier tools returned may be read; anything the model composes may not.
   const web = new WebController(config, { event: (type, fields) => telemetry.event(type, fields) });
   const recovery = new RequestRecovery();
+  recovery.checkpointAmendments.push(...reopenedAmendments);
   let task: TaskStore | undefined;
   let skillCatalog: SkillCatalog | undefined;
   let taskId = request.taskId ?? requestId;
@@ -220,6 +272,7 @@ export async function runHost(config: Config, request: HostRequest, dependencies
     return formatInterruption(interruption);
   };
   let previous: AttemptResult | undefined;
+  let savedCheckpointId: string | undefined;
   let previousTier: Tier | undefined;
   const sanitizeStructured = (value: unknown): unknown => typeof value === 'string' ? telemetry.redact(value).slice(0, 4000)
     : Array.isArray(value) ? value.map(sanitizeStructured)
@@ -229,6 +282,23 @@ export async function runHost(config: Config, request: HostRequest, dependencies
     // All abort exits use the same acknowledgement, including stops between attempts.
     if (status === 'cancelled') text = incomplete({ ...previous, success: false, text: previous?.text ?? '', turns: 0, toolCalls: 0, stopped: 'cancelled', check });
     dependencies.onActivity?.({ kind: 'waiting', label: 'Finalising request...' });
+    let reusableCheckpoint: Checkpoint | undefined;
+    if (reopening && !success && attempts === 0) {
+      const saved = checkpoints.read(reopening.id);
+      if (saved.status === 'resumed' && saved.executionId === requestId) {
+        checkpoints.settle(saved.id, 'available');
+        reusableCheckpoint = saved.checkpoint;
+        text += `\n\n${checkpointNextSteps(saved.id)}`;
+      }
+    }
+    if (previous?.checkpoint && savedCheckpointId) {
+      const saved = checkpoints.read(savedCheckpointId);
+      if (saved.status === 'resumed' && saved.executionId === requestId) saved.status = 'available';
+      const checkpoint = { ...previous.checkpoint, durability: 'saved' as const, savedId: saved.id };
+      checkpoints.write({ ...saved, checkpoint });
+      previous = { ...previous, checkpoint };
+      if (checkpoints.available(saved)) text += `\n\n${checkpointNextSteps(saved.id)}`;
+    }
     const result = { requestId, success, status, ...(previous?.checkpoint ? { checkpoint: sanitizeStructured(previous.checkpoint) as Checkpoint } : {}), ...(previous?.steps?.length ? { steps: redactSteps(previous.steps, telemetry.redact.bind(telemetry)) } : {}), text: telemetry.redact((searchUnverified && success ? 'Web search was unavailable. This answer is unverified against current sources.\n\n' : '') + text), capability: selected, tier: selected?.split('.')[1] as Tier | undefined, spentUsd: budget.spent().request, receipts, attempts, check, models, ...(teachatIdentity && { teachatIdentity }), ...(casual && { casual }),
       ...(!success && interruption ? { interruption: { ...interruption,
         edits: interruption.edits.map(edit => ({ ...edit, path: telemetry.redact(edit.path) })),
@@ -248,9 +318,16 @@ export async function runHost(config: Config, request: HostRequest, dependencies
     const steps = historyText ? undefined : result.steps;
     await telemetry.event('request_end', { success, status, capability: selected, spentUsd: result.spentUsd, attempts });
     task?.finish(status);
-    return { ...result, steps, ...(historyText ? { historyText } : {}), ...(task ? { taskId } : {}) };
+    return { ...result, steps, ...(reusableCheckpoint ? { checkpoint: reusableCheckpoint, checkpointAvailable: true } : {}), ...(reopenedWorkspace ? { checkpointWorkspace: reopenedWorkspace } : {}), ...(savedCheckpointId ? { checkpointAvailable: checkpoints.available(checkpoints.read(savedCheckpointId)) } : {}), ...(historyText ? { historyText } : {}), ...(task ? { taskId } : {}) };
   };
   try {
+    if (reopening) {
+      request.signal?.throwIfAborted();
+      const saved = checkpoints.read(reopening.id); checkpoints.authorize(saved, checkpointCaller);
+      if (!checkpoints.available(saved)) throw new Error('this checkpoint is still live or already handled');
+      checkpoints.settle(saved.id, 'resumed', requestId);
+      await telemetry.event('checkpoint_reopened', { checkpointId: saved.id, previousRequestId: saved.checkpoint.requestId, action: reopening.action });
+    }
     await budget.load();
     if (request.planAction === 'approve') currentPlan = plans?.approve();
     await mkdir(config.stateDir, { recursive: true });
@@ -435,7 +512,25 @@ export async function runHost(config: Config, request: HostRequest, dependencies
           return approved;
         },
         signal: request.signal, resume, images,
-        onCheckpoint: dependencies.onCheckpoint,
+        onCheckpoint: async (checkpoint, signal) => {
+          const saved = checkpoints.save(checkpoint, { root: cwd, scope: checkpointCaller.scope, owner: checkpointCaller.owner, channel: checkpointCaller.channel,
+            prompt: telemetry.redact(prompt), correction: request.correction && telemetry.redact(request.correction), workload, readOnly: request.readOnly, constraints: request.constraints?.map(value => telemetry.redact(value)), workspace: request.checkpointWorkspace ?? request.workspace?.conversation, ownWorkspace: Boolean(request.workspace) });
+          savedCheckpointId = saved.id;
+          const release = () => { if (checkpoints.read(saved.id).status === 'pending') checkpoints.settle(saved.id, 'available'); };
+          signal.addEventListener('abort', release, { once: true });
+          let decision;
+          try { decision = await dependencies.onCheckpoint?.(freezeCheckpoint({ ...checkpoint, durability: 'saved', savedId: saved.id }), signal); }
+          finally {
+            // Expiry releases execution, never authorizes another run. A crash leaves pending recoverable after expiry.
+            signal.removeEventListener('abort', release);
+            release();
+          }
+          if (!signal.aborted && Date.now() < checkpoint.expiresAt && decision?.requestId === checkpoint.requestId && decision.checkpointId === checkpoint.checkpointId) {
+            if (decision.action === 'finish_partial') checkpoints.settle(saved.id, 'finished');
+            else if (checkpoint.continuation?.offerId === decision.offerId && (decision.action !== 'redirect' || decision.amendment.trim())) checkpoints.settle(saved.id, 'resumed', requestId);
+          }
+          return decision;
+        },
         prompt: resume ? resumeNotice(config, previousTier!, tier, previous!.reason)
           : basePrompt + (previous ? `\nPrevious attempt stopped: ${previous.reason}. ${previous.changedFiles?.length || previous.shellRan ? 'Existing edits are still in the repository; inspect them before proceeding. Do not restart blindly.' : 'It changed no files; continue the task from the context below.'}\nRecent execution context:\n${previous.handoff ?? previous.text.slice(-6000)}` : ''),
       });
@@ -507,6 +602,10 @@ export async function runHost(config: Config, request: HostRequest, dependencies
     }
     return await finish(false, 'limit', 'Escalation limit reached.');
   } catch (error) {
+    if (reopening && attempts === 0) {
+      const saved = checkpoints.read(reopening.id);
+      if (saved.status === 'resumed' && saved.executionId === requestId) checkpoints.settle(saved.id, 'available');
+    }
     if (request.signal?.aborted) return await finish(false, 'cancelled', 'Request cancelled.');
     await telemetry.event('request_error', { name: error instanceof Error ? error.name : 'Error' });
     throw error;

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
-import type { ActionRowBuilder, APIModalInteractionResponseCallbackData, Attachment, BaseMessageOptions, ButtonBuilder, ButtonInteraction, ChatInputCommandInteraction, ClientOptions, Message, MessageActionRowComponentBuilder, MessageContextMenuCommandInteraction, RequestMethod, RouteLike, SendableChannels, StringSelectMenuInteraction } from 'discord.js';
+import type { ActionRowBuilder, APIModalInteractionResponseCallbackData, Attachment, BaseMessageOptions, ButtonBuilder, ButtonInteraction, ChatInputCommandInteraction, ClientOptions, Message, MessageActionRowComponentBuilder, MessageContextMenuCommandInteraction, ModalSubmitInteraction, RequestMethod, RouteLike, SendableChannels, StringSelectMenuInteraction } from 'discord.js';
 import type { IncomingMessage } from './access.js';
 import type { SideAnswer } from './aside-store.js';
 import type { CardButton, CardControls, DiscordTransport } from './bridge.js';
@@ -45,6 +45,7 @@ export interface GatewayMessage extends IncomingMessage {
 }
 /** A slash command from an allowlisted-or-not user; `text` is the equivalent session command. */
 export interface GatewayCommand extends IncomingMessage {
+  transport?(): DiscordTransport;
   text: string;
   /** Answer only the invoker: with text it shows a private note, without it the invocation is dismissed quietly. */
   respond(text?: string): Promise<void>;
@@ -100,6 +101,7 @@ export interface GatewayChoice {
   transport(): DiscordTransport;
 }
 export interface GatewayHandlers {
+  savedCheckpoint?(input: { id: string; action: 'resume' | 'redirect' | 'finish'; amendment?: string; user: { id: string; name: string }; channelId: string; transport: DiscordTransport }): Promise<string>;
   openBrowser?(channelId: string, messageId: string, user: { id: string; name: string }): string | undefined;
   openEditorForMessage?(messageId: string, user: { id: string; name: string }): string | null | undefined;
   bindFileReply?(messageId: string, conversation: string, path: string, user: { id: string; name: string }): void;
@@ -143,6 +145,8 @@ const planPrefix = 'teapilot-plan:';
 /** Custom id prefix of the change request form: `teapilot-plan-modal:<message id>`. */
 const planModalPrefix = 'teapilot-plan-modal:';
 const checkpointPrefix = 'teapilot-checkpoint:';
+const savedCheckpointPrefix = 'teapilot-saved-checkpoint:';
+const savedCheckpointModalPrefix = 'teapilot-saved-checkpoint-modal:';
 const checkpointModalPrefix = 'teapilot-checkpoint-modal:';
 /** Custom id prefix of a side answer's share menu: `teapilot-btw:<nonce>`. */
 const sidePrefix = 'teapilot-btw:';
@@ -238,6 +242,10 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
     return emoji ? button.setEmoji(emoji) : button;
   }))] : [];
   const settle = (text: string, verdict: string) => `${text.slice(0, MESSAGE_LIMIT - verdict.length - 2)}\n\n${verdict}`;
+  const savedCheckpointPayload = (text: string, id: string): Payload => ({ content: text, allowedMentions: { parse: [] }, components: [new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`${savedCheckpointPrefix}${id}:resume`).setLabel('Resume').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`${savedCheckpointPrefix}${id}:redirect`).setLabel('Change direction').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`${savedCheckpointPrefix}${id}:finish`).setLabel('Finish').setStyle(ButtonStyle.Secondary))] });
   const checkpointOffer = (text: string, checkpoint: Checkpoint, signal: AbortSignal,
     decide: (action: 'continue' | 'redirect' | 'finish_partial', userId: string, amendment?: string) => CheckpointDecision | undefined,
     stop: (userId: string) => { text: string },
@@ -352,6 +360,7 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
           async payload => { const message = await channel.send(payload as BaseMessageOptions); sent.set(message.id, message); return { id: message.id }; },
           async (id, payload) => { const message = sent.get(id) ?? await channel.messages.fetch(id); return message.edit(payload as BaseMessageOptions); });
       },
+      async savedCheckpoint(text, id) { await channel.send(savedCheckpointPayload(text, id) as BaseMessageOptions); },
       async plan(messages, controls, ids = []) {
         const posted: string[] = [];
         for (const [index, embeds] of messages.entries()) {
@@ -373,7 +382,7 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
   };
 
   /** Posts and edits through `interaction`'s webhook; a click's own message is edited through its reply. */
-  const webhookLink = (interaction: ChatInputCommandInteraction | MessageContextMenuCommandInteraction | ButtonInteraction, hidden: boolean): FeedLink<FeedMessage> => {
+  const webhookLink = (interaction: ChatInputCommandInteraction | MessageContextMenuCommandInteraction | ButtonInteraction | ModalSubmitInteraction, hidden: boolean): FeedLink<FeedMessage> => {
     const expires = interaction.createdTimestamp + interactionLifetimeMs;
     // A click has no deferred message of its own: its reply is the message it was pressed on, so everything is a follow-up.
     let first = !interaction.isButton();
@@ -398,7 +407,7 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
    * Where the bot cannot post, answer through the interaction webhook, which needs no channel permission.
    * Discord keeps that webhook valid for 15 minutes, and there is no typing indicator or thread.
    */
-  const interactionTransport = (interaction: ChatInputCommandInteraction | MessageContextMenuCommandInteraction | ButtonInteraction,
+  const interactionTransport = (interaction: ChatInputCommandInteraction | MessageContextMenuCommandInteraction | ButtonInteraction | ModalSubmitInteraction,
     { hidden = false, buttons = () => [] }: { hidden?: boolean; buttons?: () => Array<ActionRowBuilder<MessageActionRowComponentBuilder>> } = {}): DiscordTransport => {
     let controls: CardControls | undefined;
     const feed: InteractionFeed<FeedMessage> = new InteractionFeed(webhookLink(interaction, hidden), {
@@ -426,6 +435,7 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
           async payload => ({ id: await feed.post(payload as FeedMessage) }),
           (id, payload) => feed.revise(id, payload as FeedMessage));
       },
+      async savedCheckpoint(text, id) { await feed.post(savedCheckpointPayload(text, id) as FeedMessage); },
       // The runtime stops editing through this interaction once it expires, and uses the app's clicks after that.
       async postApp(payload) {
         if (!feed.live) throw new Error('Discord has stopped the updates of this reply; press Resume on its status card first.');
@@ -670,6 +680,26 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
   });
 
   client.on(Events.InteractionCreate, async interaction => {
+    if (interaction.isButton() && interaction.customId.startsWith(savedCheckpointPrefix) || interaction.isModalSubmit() && interaction.customId.startsWith(savedCheckpointModalPrefix)) {
+      const modal = interaction.isModalSubmit();
+      const tail = interaction.customId.slice(modal ? savedCheckpointModalPrefix.length : savedCheckpointPrefix.length);
+      const [id, button] = tail.split(':');
+      const action = modal ? 'redirect' : button;
+      if (!handlers.savedCheckpoint || !handlers.allowed?.(interaction.user.id) || !interaction.channelId || !id || !['resume', 'redirect', 'finish'].includes(action ?? '')) {
+        await interaction.reply({ content: 'this checkpoint is unavailable or you are not authorised.', flags: MessageFlags.Ephemeral, ...quiet }).catch(noop); return;
+      }
+      if (!modal && action === 'redirect' && interaction.isButton()) {
+        await interaction.showModal({ custom_id: `${savedCheckpointModalPrefix}${id}`, title: 'change direction · new execution', components: [{ type: 1, components: [{ type: 4, custom_id: 'amendment', label: 'what should change?', style: 2, required: true, max_length: 1000 }] }] } as unknown as APIModalInteractionResponseCallbackData).catch(noop); return;
+      }
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(noop);
+      const channel = interaction.channel;
+      const hidden = interaction.message?.flags.has(MessageFlags.Ephemeral) === true;
+      const note = await handlers.savedCheckpoint({ id, action: action as 'resume' | 'redirect' | 'finish', amendment: interaction.isModalSubmit() ? interaction.fields.getTextInputValue('amendment') : undefined,
+        user: { id: interaction.user.id, name: interaction.user.username }, channelId: interaction.channelId,
+        transport: !hidden && channel?.isSendable() ? transport(channel) : interactionTransport(interaction, { hidden: true }) }).catch(error => `couldn’t reopen checkpoint: ${failure(error)}`);
+      await interaction.editReply({ content: note, ...quiet }).catch(noop);
+      return;
+    }
     if (interaction.isMessageContextMenuCommand() && interaction.commandName === browserMenu) {
       const user = { id: interaction.user.id, name: interaction.user.username };
       const editorUrl = handlers.openEditorForMessage?.(interaction.targetMessage.id, user);
@@ -696,7 +726,7 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       const channel = interaction.channel;
       const argument = interaction.options.getString('value') ?? interaction.options.getString('name') ?? interaction.options.getString(treeOption) ?? interaction.options.getString('target');
       const text = commandText(interaction.commandName, interaction.options.getSubcommand(false), argument, interaction.options.getString('scope'));
-      const deferredSkills = interaction.commandName === 'skills';
+      const deferredSkills = ['skills', 'checkpoint'].includes(interaction.commandName);
       if (deferredSkills) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       let answered = false;
       const respond = async (note?: string) => {
@@ -710,6 +740,7 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       const thread = channel?.isThread() ? channel : undefined;
       const { oneShot } = await placement(interaction);
       handlers.command({
+        transport: () => channel?.isSendable() ? transport(channel) : interactionTransport(interaction, { hidden: true }),
         authorId: interaction.user.id,
         authorIsBot: interaction.user.bot,
         guildId: interaction.guildId ?? undefined,

@@ -19,6 +19,9 @@ export interface SessionWorkspace extends WorkspaceControls {
   reset(): Promise<void>;
   /** The session ended: its workspace goes too, since files sent back are already beside the user. */
   close(): Promise<void>;
+  /** Saved checkpoints keep their evidence until the user explicitly clears it. */
+  retain?(): void;
+  reopen?(conversation: string): void;
 }
 
 /** @path and @"path with spaces", as the composer completes them. */
@@ -27,6 +30,7 @@ const mentions = /(?:^|\s)@(?:"([^"\n]+)"|([^\s"@]+))/g;
 /** A terminal session's workspace: @mentioned files come in, and files the agent sends are saved into the current folder. */
 export class TerminalWorkspace implements SessionWorkspace {
   private conversation = `terminal:${randomUUID()}`;
+  private retained = false;
   private readonly controls: WorkspaceControls;
   constructor(private readonly store: WorkspaceStore, private readonly sandbox: WorkspaceSandbox | undefined, private readonly approve: Approve, private readonly user = 'user') {
     this.controls = storeControls(store, () => this.conversation);
@@ -84,7 +88,10 @@ export class TerminalWorkspace implements SessionWorkspace {
   async reset(): Promise<void> {
     await this.store.remove(this.conversation);
     this.conversation = `terminal:${randomUUID()}`;
+    this.retained = false;
   }
 
-  async close(): Promise<void> { await this.store.remove(this.conversation); }
+  retain(): void { this.retained = true; }
+  reopen(conversation: string): void { this.conversation = conversation; this.retained = true; }
+  async close(): Promise<void> { if (!this.retained) await this.store.remove(this.conversation); }
 }

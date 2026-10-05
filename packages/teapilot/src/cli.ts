@@ -18,6 +18,7 @@ import { randomUUID } from 'node:crypto';
 import { SkillStore } from './skills/store.js';
 import type { Checkpoint, CheckpointDecision } from './agents/checkpoint.js';
 import { skillCache } from './skills/cache.js';
+import { checkpointCommand } from './workspace/checkpoint.js';
 
 const help = `teapilot!
 
@@ -25,6 +26,7 @@ teapilot setup
 teapilot ask ["Explain dependency injection"]
 teapilot chat ["Help me think through an idea"]
 teapilot code --cwd <repository> ["Fix the failing tests"]
+teapilot checkpoint list|resume <id>|redirect <id> <direction>|finish <id> --cwd <repository>
 teapilot --prompt "Summarise this idea"   (one-shot, no session)
 teapilot doctor [--live]
 teapilot search status|start|stop|remove
@@ -54,7 +56,7 @@ async function main(): Promise<void> {
   if (values.help) { console.log(help); return; }
   const [major = 0, minor = 0] = process.versions.node.split('.').map(Number);
   if (major < 22 || (major === 22 && minor < 19)) throw new Error('TeaPilot requires Node >=22.19.0.');
-  const command = ['setup', 'doctor', 'ask', 'chat', 'code', 'serve', 'search', 'runtime', 'discord', 'bridge', 'teachat', 'skills'].includes(positionals[0] ?? '') ? positionals.shift() : undefined;
+  const command = ['setup', 'doctor', 'ask', 'chat', 'code', 'serve', 'search', 'runtime', 'discord', 'bridge', 'teachat', 'skills', 'checkpoint'].includes(positionals[0] ?? '') ? positionals.shift() : undefined;
   if (command === 'serve') { if (!values.stdio) throw new Error('serve requires --stdio'); await serve(); return; }
   if (command === 'teachat') {
     if (positionals.length) throw new Error('Use teapilot teachat.');
@@ -154,15 +156,16 @@ async function main(): Promise<void> {
     // ask, chat and code share one session interface; only their starting mode differs.
     const mode = isMode(command) ? command : undefined;
     let workload: Workload | undefined;
-    if (config.routingMode === 'direct' && !mode) {
+    if (config.routingMode === 'direct' && !mode && command !== 'checkpoint') {
       if (!ui) throw new Error('Direct routing requires teapilot ask or teapilot code.');
       workload = await ui.choose('What would you like to do?', ['Ask a question (no repository tools)', 'Work on code in the selected repository']) === 0 ? 'ask' : 'coder';
     }
-    const prompt = values.prompt ?? (positionals.length ? positionals.join(' ') : ui && !mode ? await ui.prompt('teapilot', resolve(values.cwd)) : '');
-    if (!prompt.trim() && !interactive) throw new Error('Supply a prompt; use teapilot setup for first use or --help for examples.');
+    const checkpointAction = command === 'checkpoint' ? checkpointCommand(`/checkpoint ${positionals.join(' ')}`) : undefined;
+    const prompt = checkpointAction ? '' : values.prompt ?? (positionals.length ? positionals.join(' ') : ui && !mode ? await ui.prompt('teapilot', resolve(values.cwd)) : '');
+    if (!prompt.trim() && !interactive && !checkpointAction) throw new Error('Supply a prompt; use teapilot setup for first use or --help for examples.');
     if (values.tier !== undefined && !isTierPreference(values.tier)) throw new Error(`--tier must be ${tierPreferences.join(', ')}.`);
     const tier = values.tier;
-    const request: HostRequest = { prompt, workload, cwd: resolve(values.cwd), web: values.web, correction: values.correction, tier, signal: controller.signal };
+    const request: HostRequest = { prompt, workload, cwd: resolve(values.cwd), web: values.web, correction: values.correction, tier, signal: controller.signal, checkpointAction };
     const dependencies = { approve, onActivity: presentation.setActivity, onProgress: (message: string) => presentation.log(redact(message)), onEvent: (event: import('./integration/events.js').HostEvent) => presentation.event(event),
       onCheckpoint: async (checkpoint: Readonly<Checkpoint>, signal: AbortSignal): Promise<CheckpointDecision | undefined> => {
         if (!ui || values.json || signal.aborted || controller.signal.aborted || Date.now() >= checkpoint.expiresAt) return undefined;
@@ -213,8 +216,20 @@ async function main(): Promise<void> {
        }
       await teachat?.close(controller.signal);
     } else {
-      const result = await execute(request);
-      process.exitCode = result.success ? 0 : 2;
+      if (checkpointAction && checkpointAction.action !== 'list' && checkpointAction.action !== 'finish') {
+        const [{ SrtSandbox }, { WorkspaceStore }, { TerminalWorkspace }] = await Promise.all([import('./workspace/sandbox.js'), import('./workspace/store.js'), import('./workspace/terminal.js')]);
+        const sandbox = new SrtSandbox(config.stateDir, config.workspace, config.source?.directory);
+        const workspace = new TerminalWorkspace(WorkspaceStore.at(config.stateDir), sandbox, approve);
+        try {
+          const result = await execute({ ...request, workspace: workspace.context(request.cwd) });
+          if (result.checkpointWorkspace) workspace.reopen(result.checkpointWorkspace);
+          if (result.checkpointAvailable) workspace.retain();
+          process.exitCode = result.success ? 0 : 2;
+        } finally { await workspace.close(); await sandbox.close(); }
+      } else {
+        const result = await execute(request);
+        process.exitCode = result.success ? 0 : 2;
+      }
     }
   } finally { if (skillStateDir) await skillCache(skillStateDir).close(); presentation.close(); ui?.close(); process.removeListener('SIGINT', onInterrupt); process.removeListener('SIGTERM', onInterrupt); }
 }

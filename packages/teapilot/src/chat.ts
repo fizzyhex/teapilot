@@ -11,6 +11,7 @@ import { keptNote, workspaceCommand, workspaceHelp, type WorkspaceControls } fro
 import type { SessionWorkspace } from './workspace/terminal.js';
 import { isTierPreference, tierPreferences, type Tier, type TierPreference } from './config.js';
 import type { SkillPreferences } from './skills/settings.js';
+import { checkpointCommand } from './workspace/checkpoint.js';
 
 const sessionHelp = `Commands: /mode ${modes.join('|')}, /tier ${tierPreferences.join('|')}, /skills list|enable|disable|update|offline|reset, /convo clear, ${workspaceHelp}, /new, /cd <path>, /permissions, /grant <permission>, /revoke <permission>, /btw <question>, /plan <idea>, /rfc <idea>, /exit, /quit`;
 
@@ -165,7 +166,7 @@ export async function runSession(options: {
   skills?: { preferences(): SkillPreferences; command(args: string): Promise<string> };
 }): Promise<number> {
   const extension = options.extension;
-  const help = sessionHelp + (extension?.help ? `, ${extension.help}` : '');
+  const help = sessionHelp + ', /checkpoint list|resume <id>|redirect <id> <direction>|finish <id>' + (extension?.help ? `, ${extension.help}` : '');
   let history: ConversationTurn[] = options.request.history ?? [];
   let mode: Mode = options.request.mode ?? 'chat';
   const grants = options.request.authorization;
@@ -230,6 +231,30 @@ export async function runSession(options: {
       prompt = proposalPrompt(proposal.kind, proposal.idea);
     }
     if (prompt.startsWith('/')) {
+      if (/^\/checkpoint(?:\s|$)/.test(prompt)) {
+        try {
+          const result = await options.run({ ...options.request, ...extension?.request?.(), cwd, prompt: '', mode, tier, sessionId, taskId, correction: undefined, history: [], checkpointAction: checkpointCommand(prompt),
+            ...(options.workspace ? { workspace: options.workspace.context(cwd), checkpointWorkspace: options.workspace.context(cwd).conversation } : {}) });
+          spentUsd += result.spentUsd;
+          taskId = result.taskId ?? taskId;
+          lastModel = result.models?.at(-1) ?? lastModel;
+          if (result.tier && result.tier !== 'fast') relatedTier = result.tier;
+          if (result.checkpointWorkspace) options.workspace?.reopen?.(result.checkpointWorkspace);
+          if (result.checkpointAvailable) options.workspace?.retain?.();
+          if (result.requestId) {
+            const turn: ConversationTurn = { user: prompt, assistant: result.success ? result.historyText ?? result.text : result.reply ?? '', taskId, steps: result.steps,
+              ...(!result.success ? { stopped: { status: result.status, failedCalls: result.failedCalls } } : {}) };
+            const turns = [...history, turn];
+            history = prepareConversation('', [], turns.map((turn, index) => index < turns.length - keptSteps ? { user: turn.user, assistant: turn.assistant, taskId: turn.taskId } : turn), options.maxPromptChars).history;
+            options.onHistory?.(history);
+            await extension?.turnEnd?.(turn, result);
+          }
+          if (!result.success) exitCode = 2;
+        } catch (error) { options.log?.(error instanceof Error ? error.message : String(error)); }
+        prompt = '';
+        if (options.once) break;
+        continue;
+      }
       const [command, value, extra] = prompt.split(/\s+/);
       if (command === '/cd') {
         const target = prompt.slice(3).trim().replace(/^(["'])(.*)\1$/, '$2');
@@ -289,7 +314,8 @@ export async function runSession(options: {
     const result = await options.run({ ...options.request, ...extension?.request?.(), skills: options.skills?.preferences() ?? options.request.skills, sessionId, taskId, cwd, prompt, correction, notice, tier, relatedTier, history,
       readOnly: Boolean(proposal), taskObjective: proposal?.idea, planAction: proposal?.kind === 'plan' ? 'new' : undefined,
       mode, conversational: !options.once, workload: grants ? undefined : workloadFor(mode), ...(workspace ? { workspace: workspace.context(cwd) } : {}),
-      ...(options.workspace ? { scratch: options.workspace.scratch() } : {}) });
+       ...(options.workspace ? { scratch: options.workspace.scratch(), checkpointWorkspace: options.workspace.context(cwd).conversation } : {}) });
+    if (result.checkpointAvailable) options.workspace?.retain?.();
     spentUsd += result.spentUsd;
     taskId = result.taskId ?? taskId;
     lastModel = result.models?.at(-1) ?? lastModel;

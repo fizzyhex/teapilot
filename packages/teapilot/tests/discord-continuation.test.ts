@@ -112,6 +112,38 @@ const press = async (client: any, id: string, message: any) => {
 const uiCheckpoint: Checkpoint = { version: 1, requestId: 'r', checkpointId: 9, sequence: 1, reason: 'request_calls', durability: 'request-local', expiresAt: Date.now() + 30_000,
   snapshot: { amendments: [], artifacts: [], checks: [], results: [], workers: [], resources: {}, pendingUncertain: [] }, summary: ['check failed'], continuation: { offerId: 'lease', instructorCalls: 2, activeMs: 10_000, freshContext: false } };
 
+it('routes durable checkpoint buttons and forms by saved id even after gateway restart', async () => {
+  const first = await setup();
+  const id = '11111111-1111-4111-8111-111111111111';
+  await first.transport.savedCheckpoint!('saved checkpoint', id);
+  const card = first.sent[0];
+  card.flags = { has: () => false };
+  expect(card.payload.components[0].components.map((button: any) => button.data.label)).toEqual(['Resume', 'Change direction', 'Finish']);
+  checkMessage({ ...card.payload, components: card.payload.components.map((row: any) => row.toJSON()) });
+  await first.gateway.close();
+  const savedCheckpoint = vi.fn(async () => 'new execution authorized');
+  const state = await setup({ savedCheckpoint, allowed: (user: string) => user === operator });
+  const savedClick = (label: string): any => ({ ...interaction(buttonId(card, label), card), channelId: 'channel', channel: state.channel,
+    deferReply: vi.fn(async () => undefined), editReply: vi.fn(async () => undefined), showModal: vi.fn(async () => undefined) });
+  const resume = savedClick('Resume');
+  state.client.emit('interactionCreate', resume);
+  await vi.waitFor(() => expect(savedCheckpoint).toHaveBeenCalledWith(expect.objectContaining({ id, action: 'resume', channelId: 'channel', user: { id: operator, name: operator } })));
+  expect(resume.deferReply).toHaveBeenCalledWith({ flags: 64 });
+  const change = savedClick('Change direction');
+  state.client.emit('interactionCreate', change);
+  await vi.waitFor(() => expect(change.showModal).toHaveBeenCalledOnce());
+  const modalId = change.showModal.mock.calls[0][0].custom_id;
+  const submit = { ...savedClick('Change direction'), customId: modalId, isButton: () => false, isModalSubmit: () => true,
+    fields: { getTextInputValue: () => 'keep it small' } };
+  state.client.emit('interactionCreate', submit);
+  await vi.waitFor(() => expect(savedCheckpoint).toHaveBeenLastCalledWith(expect.objectContaining({ id, action: 'redirect', amendment: 'keep it small' })));
+  const stranger = { ...savedClick('Resume'), user: { id: 'stranger', username: 'stranger' } };
+  state.client.emit('interactionCreate', stranger);
+  await vi.waitFor(() => expect(stranger.reply).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('not authorised') })));
+  expect(savedCheckpoint).toHaveBeenCalledTimes(2);
+  await state.gateway.close();
+});
+
 it('routes a private one-shot /prompt through the webhook checkpoint modal path', async () => {
   let reply: any;
   const { gateway, client, handlers } = await setup({ reply: (value: any) => { reply = value; } });

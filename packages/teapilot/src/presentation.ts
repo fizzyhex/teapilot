@@ -343,7 +343,7 @@ export class TerminalPresentation implements ActivityUI {
   /** Render host-authored checkpoint facts separately from an unverified model proposal. */
   checkpoint(checkpoint: Readonly<Checkpoint>, redact: (text: string) => string): void {
     this.pause();
-    this.write(`\n${paint('1;33', 'Checkpoint', this.colour && !this.json)} · request-local; not resumable after restart\n`);
+    this.write(`\n${paint('1;33', 'Checkpoint', this.colour && !this.json)} · ${checkpoint.savedId ? 'saved; expiry releases this request, not your progress' : 'request-local'}\n`);
     for (const fact of checkpoint.summary) this.write(`  • ${redact(fact)}\n`);
     if (checkpoint.continuation) this.write(`  next window: ${checkpoint.continuation.instructorCalls} instructor calls, ${Math.ceil(checkpoint.continuation.activeMs / 60_000)}m active${checkpoint.continuation.freshContext ? ', fresh context' : ''}\n`);
     else this.write('  no continuation window remains inside this request authorization\n');

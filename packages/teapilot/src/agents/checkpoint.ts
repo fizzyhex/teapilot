@@ -19,7 +19,9 @@ export interface Checkpoint {
   checkpointId: number;
   sequence: number;
   reason: CheckpointReason;
-  durability: 'request-local';
+  durability: 'request-local' | 'saved';
+  /** Durable host reference, independent of the live continuation offer. */
+  savedId?: string;
   expiresAt: number;
   snapshot: CheckpointSnapshot;
   summary: string[];

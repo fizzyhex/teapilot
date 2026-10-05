@@ -313,6 +313,11 @@ export class World {
         });
       },
       checkpoint: (text, checkpoint, signal, decide, stop) => this.offerCheckpoint(channel, text, checkpoint, signal, decide, stop),
+      savedCheckpoint: async (text, id) => { this.post(channel, bot.name, { content: text, components: [{ type: 1, components: [
+        { type: 2, style: 3, label: 'Resume', custom_id: `teapilot-saved-checkpoint:${id}:resume` },
+        { type: 2, style: 1, label: 'Change direction', custom_id: `teapilot-saved-checkpoint:${id}:redirect` },
+        { type: 2, style: 2, label: 'Finish', custom_id: `teapilot-saved-checkpoint:${id}:finish` },
+      ] }] }); },
     };
   }
 
@@ -414,6 +419,17 @@ export class World {
     if (control.type !== 2) throw new SimError(`${id} is a select; use select.`);
     if (typeof control.url === 'string') return `${person.name} opened ${control.url}; links never reach teapilot.`;
     const custom = String(control.custom_id);
+    if (custom.startsWith('teapilot-saved-checkpoint:')) {
+      const [, savedId, action] = custom.split(':');
+      if (!this.handlers?.allowed?.(person.id)) return 'you are not authorised.';
+      if (action === 'redirect') {
+        const payload: ModalPayload = { custom_id: `teapilot-saved-checkpoint-modal:${savedId}`, title: 'change direction · new execution', components: [{ type: 1, components: [{ type: 4, custom_id: 'amendment', label: 'what should change?', style: 2, required: true, max_length: 1000 }] }] } as ModalPayload;
+        this.check(`the form on ${message.id}`, () => checkModal(payload));
+        this.forms.set(person.name, { message, payload });
+        return `${person.name} sees a form:\n${this.renderForm(payload)}`;
+      }
+      return this.savedCheckpoint(person, message, savedId!, action as 'resume' | 'finish');
+    }
     if (custom.startsWith('teapilot-checkpoint:')) return this.pressCheckpoint(person, message, custom);
     if (custom.startsWith('teapilot:')) return this.answerApproval(person, message, custom.endsWith(':approve'));
     if (custom.startsWith('teapilot-plan:')) return this.pressPlan(person, message, custom.slice('teapilot-plan:'.length) as PlanAction);
@@ -422,6 +438,12 @@ export class World {
     if (custom.startsWith('teapilot-card:')) return this.pressCard(person, message, custom.slice('teapilot-card:'.length) as CardButton);
     if (custom.startsWith(viewSourcePrefix)) return this.pressViewSource(person, message, custom);
     return this.interact(person, message, 'button', custom, `clicked [${this.label(control)}]`);
+  }
+
+  private async savedCheckpoint(person: Person, message: Message, id: string, action: 'resume' | 'redirect' | 'finish', amendment?: string): Promise<string> {
+    if (!this.handlers?.savedCheckpoint || !this.handlers.allowed?.(person.id)) return 'you are not authorised.';
+    try { return await this.handlers.savedCheckpoint({ id, action, amendment, user: { id: person.id, name: person.name }, channelId: message.channel.id, transport: this.transport(message.channel) }); }
+    catch (error) { return `couldn’t reopen checkpoint: ${error instanceof Error ? error.message : String(error)}`; }
   }
 
   private pressCheckpoint(person: Person, message: Message, custom: string): string {
@@ -587,6 +609,7 @@ ${this.render(this.post(form.message.channel, bot.name, { content: note }, perso
       this.finishCheckpoint(nonce, value, '**direction changed**');
       return `${person.name} changed direction on ${form.message.id}.`;
     }
+    if (form.payload.custom_id.startsWith('teapilot-saved-checkpoint-modal:')) return this.savedCheckpoint(person, form.message, form.payload.custom_id.slice('teapilot-saved-checkpoint-modal:'.length), 'redirect', fields.amendment ?? '');
     return this.interact(person, form.message, 'modal', form.payload.custom_id, `submitted "${form.payload.title}"`, undefined, Object.fromEntries(ids.map(key => [key, fields[key] ?? ''])));
   }
 
@@ -624,6 +647,7 @@ ${this.render(this.post(form.message.channel, bot.name, { content: note }, perso
       const timer = setTimeout(() => { seen.push('(no response after 15 s)'); done(); }, 15_000);
       const finish = () => { clearTimeout(timer); done(); };
       handlers.command({
+        transport: () => this.transport(channel),
         authorId: person.id, authorIsBot: false, guildId: channel.kind === 'dm' ? undefined : guildId, channelId: channel.id, parentId: thread?.parent,
         ownThread: Boolean(thread), mentionsBot: false, text, oneShot,
         respond: async content => { if (answered) { if (content) note(content); return; } first(); if (content) note(content); finish(); },
