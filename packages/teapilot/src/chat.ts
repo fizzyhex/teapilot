@@ -51,7 +51,7 @@ const planTemplate = `${proposalHead}
 
 [!] Only enough research to confirm feasibility is required.
 
-If focused research needs a separate context, use \`delegate_task\` for up to 2 bounded assignments with \`agent_type\` \`research\`, a concise \`description\`, complete \`prompt\` and any \`artifacts\` (file paths or artifact IDs):
+If focused research needs a separate context, use \`delegate_task\` for up to 2 bounded assignments with \`agent_type\` \`research\`, a short \`label\`, complete \`prompt\` and any \`artifacts\` (file paths or artifact IDs):
   -> inspect the relevant \`workspace\` context; understanding any existing implementation & constraints.
   -> if more info is required; direct an agent to perform focused web research with \`web_search\`.
 

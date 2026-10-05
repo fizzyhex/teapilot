@@ -182,7 +182,7 @@ it('gives juniors the same frozen catalog after upstream changes and persists so
     } else if (++instructorTurns === 1) {
       f.revision(revision2); f.archive(await archive([{ name: 'repo/skills/example/SKILL.md', body: skill('updated upstream instructions') }]));
       await f.cache.refresh(defaultSkillSets()[0]!, true);
-      completion(response, { tool: { name: 'delegate_task', arguments: { description: 'Inspect frozen skill', prompt: 'Read the example skill.', agent_type: 'research', artifacts: [] } } });
+      completion(response, { tool: { name: 'delegate_task', arguments: { label: 'Inspect frozen skill', prompt: 'Read the example skill.', agent_type: 'research', artifacts: [] } } });
     } else completion(response, { text: 'done' });
   }); cleanups.push(server.close);
   Object.assign(f.config.models.capable, { provider: 'ollama', baseUrl: server.url });

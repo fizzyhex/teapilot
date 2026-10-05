@@ -47,7 +47,7 @@ it('hands a task to a junior in a clean context and sees only its report', async
         : { tool: { name: 'report', arguments: { status: 'done', summary: 'Wrote a.txt and read it back.' } } });
     } else {
       bodies.instructor.push(body);
-      completion(res, bodies.instructor.length === 1 ? { tool: { name: 'delegate_task', arguments: { description: 'Create hello file', prompt: 'Create a.txt containing hello.', agent_type: 'write', artifacts: [manifestPath] } } } : { text: 'All done.' });
+      completion(res, bodies.instructor.length === 1 ? { tool: { name: 'delegate_task', arguments: { label: 'Create hello file', prompt: 'Create a.txt containing hello.', agent_type: 'write', artifacts: [manifestPath] } } } : { text: 'All done.' });
     }
   });
   const seen: any[] = [];
@@ -98,8 +98,8 @@ it('continues the same junior with its history, and passes its questions back', 
         : { tool: { name: 'report', arguments: { status: 'needs_input', summary: 'Two are fixed.', question: 'Should the third keep its old behaviour?' } } });
     } else {
       bodies.instructor.push(body);
-      completion(res, bodies.instructor.length === 1 ? { tool: { name: 'delegate_task', arguments: { description: 'Find parser bugs', prompt: 'Find the bugs in parser.ts.', agent_type: 'write', artifacts: ['src/parser.ts'] } } }
-        : bodies.instructor.length === 2 ? { tool: { name: 'delegate_task', arguments: { junior: 'junior-alfa', description: 'Fix identified bugs', prompt: 'Fix them.', agent_type: 'write', artifacts: ['src/fix-notes.txt'] } } }
+      completion(res, bodies.instructor.length === 1 ? { tool: { name: 'delegate_task', arguments: { label: 'Find parser bugs', prompt: 'Find the bugs in parser.ts.', agent_type: 'write', artifacts: ['src/parser.ts'] } } }
+        : bodies.instructor.length === 2 ? { tool: { name: 'delegate_task', arguments: { junior: 'junior-alfa', label: 'Fix identified bugs', prompt: 'Fix them.', agent_type: 'write', artifacts: ['src/fix-notes.txt'] } } }
         : { text: 'Asking the person.' });
     }
   });
@@ -122,7 +122,7 @@ it('withdraws delegation once the attempt has sent its limit', async () => {
   const f = await setup((body, _req, res) => {
     if (junior(body)) return completion(res, { tool: { name: 'report', arguments: { status: 'done', summary: 'ok' } } });
     bodies.push(body);
-    completion(res, bodies.length === 1 ? { tool: { name: 'delegate_task', arguments: { description: 'Research one item', prompt: 'One.', agent_type: 'research', artifacts: [] } } } : { text: 'Finished myself.' });
+    completion(res, bodies.length === 1 ? { tool: { name: 'delegate_task', arguments: { label: 'Research one item', prompt: 'One.', agent_type: 'research', artifacts: [] } } } : { text: 'Finished myself.' });
   });
   f.config.policy.limits.maxJuniorTurns = 1;
   const result = await run(f, { scratch: f.scratch });
@@ -151,7 +151,7 @@ it('stops the instructor\'s clock while a junior works', async () => {
       return completion(res, { tool: { name: 'report', arguments: { status: 'done', summary: 'ok' } } });
     }
     instructorCalls++;
-    completion(res, instructorCalls <= 3 ? { tool: { name: 'delegate_task', arguments: { description: `Research part ${instructorCalls}`, prompt: `Part ${instructorCalls}.`, agent_type: 'research', artifacts: [] } } } : { text: 'All parts done.' });
+    completion(res, instructorCalls <= 3 ? { tool: { name: 'delegate_task', arguments: { label: `Research part ${instructorCalls}`, prompt: `Part ${instructorCalls}.`, agent_type: 'research', artifacts: [] } } } : { text: 'All parts done.' });
   });
   // Three juniors of 250ms each outlast the instructor's own 500ms, which only counts its own time.
   f.config.policy.limits.attemptTimeoutMs = 500;
@@ -164,7 +164,7 @@ it('cancels the junior with the request', async () => {
   const controller = new AbortController();
   const f = await setup((body, _req, res) => {
     if (junior(body)) { controller.abort(); return completion(res, { text: 'late' }); }
-    completion(res, { tool: { name: 'delegate_task', arguments: { description: 'Research long task', prompt: 'Long task.', agent_type: 'research', artifacts: [] } } });
+    completion(res, { tool: { name: 'delegate_task', arguments: { label: 'Research long task', prompt: 'Long task.', agent_type: 'research', artifacts: [] } } });
   });
   const result = await run(f, { scratch: f.scratch, signal: controller.signal });
   expect(result.stopped).toBe('cancelled');
@@ -192,7 +192,7 @@ it('works in its instructor\'s folder when neither has the repository', async ()
   const f = await setup((body, _req, res) => {
     if (junior(body)) return completion(res, ++juniorCalls === 1 ? { tool: { name: 'write', arguments: { path: 'notes.txt', content: 'from the junior' } } }
       : { tool: { name: 'report', arguments: { status: 'done', summary: 'Wrote notes.txt.' } } });
-    completion(res, ++instructorCalls === 1 ? { tool: { name: 'delegate_task', arguments: { description: 'Write notes file', prompt: 'Write notes.txt.', agent_type: 'write', artifacts: [] } } }
+    completion(res, ++instructorCalls === 1 ? { tool: { name: 'delegate_task', arguments: { label: 'Write notes file', prompt: 'Write notes.txt.', agent_type: 'write', artifacts: [] } } }
       : instructorCalls === 2 ? { tool: { name: 'read', arguments: { path: 'notes.txt' } } } : { text: 'Read it.' });
   });
   const result = await run(f, { scratch: f.scratch, workload: 'ask' });
@@ -210,7 +210,7 @@ it('keeps report for a junior whose other tools are withdrawn', async () => {
       return completion(res, names(body).length > 1 ? { tool: { name: 'bash', arguments: { command: 'npm test' } } }
         : { tool: { name: 'report', arguments: { status: 'stuck', summary: 'I could not run the tests.' } } });
     }
-    completion(res, ++instructorCalls === 1 ? { tool: { name: 'delegate_task', arguments: { description: 'Run project tests', prompt: 'Run the tests.', agent_type: 'write', artifacts: [] } } } : { text: 'The junior could not run them.' });
+    completion(res, ++instructorCalls === 1 ? { tool: { name: 'delegate_task', arguments: { label: 'Run project tests', prompt: 'Run the tests.', agent_type: 'write', artifacts: [] } } } : { text: 'The junior could not run them.' });
   });
   await run(f, { scratch: f.scratch, workload: 'ask' });
   expect(names(bodies.at(-1))).toEqual(['report']);
@@ -228,7 +228,7 @@ it('tells a junior to report before the tool limit stops it', async () => {
         ? { tool: { name: 'report', arguments: { status: 'stuck', summary: 'Parsed half the table; rows are in notes.txt.' } } }
         : { tool: { name: 'write', arguments: { path: 'notes.txt', content: `row ${juniorCalls}` } } });
     }
-    completion(res, ++instructorCalls === 1 ? { tool: { name: 'delegate_task', arguments: { description: 'Parse source table', prompt: 'Parse the table.', agent_type: 'write', artifacts: [] } } } : { text: 'Noted.' });
+    completion(res, ++instructorCalls === 1 ? { tool: { name: 'delegate_task', arguments: { label: 'Parse source table', prompt: 'Parse the table.', agent_type: 'write', artifacts: [] } } } : { text: 'Noted.' });
   });
   f.config.policy.limits.maxToolCalls = 10;
   await run(f, { scratch: f.scratch });
@@ -251,23 +251,23 @@ it('requires the complete schema on every call and retains a junior assignment a
     return { success: true, text: '', turns: 1, toolCalls: Math.min(4, child.config.policy.limits.maxToolCalls) };
   }, allowance);
   const text = (result: any) => result.content[0].text;
-  expect(delegated.tool.parameters).toMatchObject({ required: expect.arrayContaining(['description', 'prompt', 'agent_type', 'artifacts']) });
+  expect(delegated.tool.parameters).toMatchObject({ required: expect.arrayContaining(['label', 'prompt', 'agent_type', 'artifacts']) });
   const schema = delegated.tool.parameters as any;
-  expect(schema.properties).toHaveProperty('description');
+  expect(schema.properties).toHaveProperty('label');
   expect(schema.properties).toHaveProperty('prompt');
   expect(schema.properties).toHaveProperty('agent_type');
   expect(schema.properties).toHaveProperty('artifacts');
   expect(schema.properties).not.toHaveProperty('type');
   expect(schema.properties).not.toHaveProperty('message');
   expect(schema.properties).not.toHaveProperty('evidence');
-  const initial = { description: 'Inspect source files', prompt: 'inspect sources', agent_type: 'research', artifacts: [] };
+  const initial = { label: 'Inspect source files', prompt: 'inspect sources', agent_type: 'research', artifacts: [] };
   await delegated.tool.execute('b', initial);
-  await delegated.tool.execute('c', { junior: 'junior-alfa', description: 'Clarify source findings', prompt: 'clarify findings', agent_type: 'research', artifacts: [] });
+  await delegated.tool.execute('c', { junior: 'junior-alfa', label: 'Clarify source findings', prompt: 'clarify findings', agent_type: 'research', artifacts: [] });
   expect(children.map(child => child.config.policy.limits.maxToolCalls)).toEqual([20, 16]);
   expect(children.every(child => !child.readOnly && child.junior.agent_type === 'research')).toBe(true);
   expect(children[0].junior).toMatchObject({ description: 'Inspect source files', assignment: 'inspect sources' });
   expect(children[1].junior).toMatchObject({ description: 'Clarify source findings', assignment: 'inspect sources' });
-  expect(text(await delegated.tool.execute('d', { junior: 'junior-alfa', description: 'Change source files', prompt: 'make changes', agent_type: 'write', artifacts: [] })).toLowerCase()).toContain('category: write');
+  expect(text(await delegated.tool.execute('d', { junior: 'junior-alfa', label: 'Change source files', prompt: 'make changes', agent_type: 'write', artifacts: [] })).toLowerCase()).toContain('category: write');
   expect(children[2].junior).toMatchObject({ agent_type: 'write', assignment: 'inspect sources' });
   expect(children.map(child => child.config.policy.limits.maxToolCalls)).toEqual([20, 16, 12]);
   expect(children).toHaveLength(3);
@@ -289,13 +289,13 @@ it('inherits parent read-only safety for every agent_type and accepts legacy sav
   const parent = { ...f, task: restored, tier: 'normal' as const, workload: 'coder' as const, web: false, readOnly: true, activePermissions: [...f.config.policy.permissions], prompt: 'parent', approve: async () => true };
   const delegated = delegateTool(parent, f.scratch, f.cwd, { pause() {}, resume() {} }, async child => { children.push(child); return { success: true, text: 'findings', turns: 1, toolCalls: 0 }; }, allowance);
   const text = (result: any) => result.content[0].text;
-  await delegated.tool.execute('a', { junior: 'junior-old', description: 'Continue old assignment', prompt: 'continue', agent_type: 'test', artifacts: [] });
+  await delegated.tool.execute('a', { junior: 'junior-old', label: 'Continue old assignment', prompt: 'continue', agent_type: 'test', artifacts: [] });
   for (const agent_type of ['research', 'write', 'test'] as const) {
-    const result = await delegated.tool.execute(`ro-${agent_type}`, { description: 'Inspect application safely', prompt: 'inspect app', agent_type, artifacts: [] });
+    const result = await delegated.tool.execute(`ro-${agent_type}`, { label: 'Inspect application safely', prompt: 'inspect app', agent_type, artifacts: [] });
     expect(children.at(-1).readOnly).toBe(true);
     expect(children.at(-1).activePermissions).toBe(parent.activePermissions);
   }
-  await delegated.tool.execute('c', { junior: 'junior-reader', description: 'Clarify door mechanics', prompt: 'clarify opening', agent_type: 'research', artifacts: [] });
+  await delegated.tool.execute('c', { junior: 'junior-reader', label: 'Clarify door mechanics', prompt: 'clarify opening', agent_type: 'research', artifacts: [] });
   expect(children.at(-1).junior).toMatchObject({ agent_type: 'research', assignment: 'door mechanics only', artifacts: ['src/door.ts'] });
   expect(children[0].config.policy.limits.maxToolCalls).toBe(20);
 });
@@ -312,7 +312,7 @@ it('allocates a uniform cumulative cap, capped by policy and shared request room
       return { success: true, text: 'findings', turns: 1, toolCalls: 0 };
     }, allowance);
     children.length = 0;
-    const result = await delegated.tool.execute('a', { description: 'Complete assigned checks', prompt: 'complete the assigned task', agent_type: 'research', artifacts: [] });
+    const result = await delegated.tool.execute('a', { label: 'Complete assigned checks', prompt: 'complete the assigned task', agent_type: 'research', artifacts: [] });
     if (expected === undefined) {
       expect(children).toHaveLength(0);
       expect(result.content[0]).toMatchObject({ text: expect.stringContaining('too little room') });
@@ -329,10 +329,10 @@ it('publishes bounded required arguments without imposing a description word-cou
   const parent = { ...f, tier: 'normal' as const, workload: 'coder' as const, web: false, prompt: 'parent', approve: async () => true };
   const delegated = delegateTool(parent, f.scratch, f.cwd, { pause() {}, resume() {} }, async () => ({ success: true, text: '', turns: 1, toolCalls: 0 }), allowance);
   const schema = delegated.tool.parameters as any;
-  expect(schema.required).toEqual(expect.arrayContaining(['description', 'prompt', 'agent_type', 'artifacts']));
-  expect(schema.properties.description.minLength).toBeGreaterThanOrEqual(1);
-  expect(schema.properties.description.maxLength).toBeGreaterThan(5);
-  expect(schema.properties.description.description).toMatch(/3-5 word/i);
+  expect(schema.required).toEqual(expect.arrayContaining(['label', 'prompt', 'agent_type', 'artifacts']));
+  expect(schema.properties.label.minLength).toBeGreaterThanOrEqual(1);
+  expect(schema.properties.label.maxLength).toBeGreaterThan(5);
+  expect(schema.properties.label.description).toMatch(/3-5 word/i);
   expect(schema.properties.prompt.minLength).toBeGreaterThanOrEqual(1);
   expect(schema.properties.prompt.maxLength).toBeGreaterThanOrEqual(24_000);
   expect(schema.properties.agent_type).toBeDefined();
@@ -353,11 +353,11 @@ it('rejects missing, empty, and oversized delegation arguments before starting a
   let children = 0;
   const delegated = delegateTool({ ...f, tier: 'normal', workload: 'coder', web: false, prompt: 'parent', approve: async () => true }, f.scratch, f.cwd,
     { pause() {}, resume() {} }, async () => { children++; return { success: true, text: '', turns: 1, toolCalls: 0 }; }, allowance);
-  const valid = { description: 'Inspect files', prompt: 'Inspect files and report findings.', agent_type: 'research', artifacts: [] };
+  const valid = { label: 'Inspect files', prompt: 'Inspect files and report findings.', agent_type: 'research', artifacts: [] };
   const invalid = [
     {},
-    { ...valid, description: '' },
-    { ...valid, description: 'x'.repeat(201) },
+    { ...valid, label: '' },
+    { ...valid, label: 'x'.repeat(81) },
     { ...valid, prompt: '' },
     { ...valid, prompt: 'x'.repeat(24_001) },
     { ...valid, agent_type: 'review' },
@@ -372,7 +372,7 @@ it('rejects missing, empty, and oversized delegation arguments before starting a
     expect(first && 'text' in first ? first.text : undefined).toMatch(/bounded|valid agent_type/);
   }
   expect(children).toBe(0);
-  await delegated.tool.execute('short-label', { ...valid, description: 'Brief' });
+  await delegated.tool.execute('short-label', { ...valid, label: 'Brief' });
   expect(children).toBe(1);
 });
 
@@ -383,7 +383,7 @@ it('authorizes artifact references before spending request delegation allowance'
   const allowance = new RequestAllowance({ calls: 30, modelCalls: 30, timeoutMs: 10_000, delegations: 6 }, task);
   const delegated = delegateTool({ ...f, task, tier: 'normal', workload: 'coder', web: false, prompt: 'parent', approve: async () => true }, f.scratch, f.cwd,
     { pause() {}, resume() {} }, async () => ({ success: true, text: '', turns: 1, toolCalls: 0 }), allowance);
-  await expect(delegated.tool.execute('bad-artifact', { description: 'Use task artifact', prompt: 'Read the referenced source.', agent_type: 'research', artifacts: ['a-00000000-0000-4000-8000-000000000000'] }))
+  await expect(delegated.tool.execute('bad-artifact', { label: 'Use task artifact', prompt: 'Read the referenced source.', agent_type: 'research', artifacts: ['a-00000000-0000-4000-8000-000000000000'] }))
     .rejects.toThrow('unknown or inaccessible delegation evidence');
   expect(task.snapshot().request?.delegations).toBe(0);
 });
@@ -415,9 +415,9 @@ it('authorizes, retrieves, accumulates, and restores more than four artifact IDs
   };
   const parent = { ...f, task, tier: 'normal' as const, workload: 'coder' as const, web: false, prompt: 'parent context stays private', approve: async () => true };
   let delegated = delegateTool(parent, f.scratch, f.cwd, { pause() {}, resume() {} }, executeChild, allowance);
-  const assignment = { description: 'Inspect supplied references', prompt: 'Read the supplied evidence.', agent_type: 'research', artifacts: firstSix };
+  const assignment = { label: 'Inspect supplied references', prompt: 'Read the supplied evidence.', agent_type: 'research', artifacts: firstSix };
   await delegated.tool.execute('first', assignment);
-  await delegated.tool.execute('second', { junior: 'junior-alfa', description: 'Inspect additional reference', prompt: 'Include the new evidence.', agent_type: 'research', artifacts: [seventh] });
+  await delegated.tool.execute('second', { junior: 'junior-alfa', label: 'Inspect additional reference', prompt: 'Include the new evidence.', agent_type: 'research', artifacts: [seventh] });
   expect(retrieved[0]).toHaveLength(6);
   expect(retrieved[0]!.every((content, index) => content.includes(`reference content ${index}`))).toBe(true);
   expect(retrieved[1]).toHaveLength(7);
@@ -426,7 +426,7 @@ it('authorizes, retrieves, accumulates, and restores more than four artifact IDs
   const restored = TaskStore.open(f.config.stateDir, scope, 'ignored after restart', f.scratch);
   const restartedAllowance = new RequestAllowance({ calls: 100, modelCalls: 100, timeoutMs: 60_000, delegations: 6 }, restored);
   delegated = delegateTool({ ...parent, task: restored }, f.scratch, f.cwd, { pause() {}, resume() {} }, executeChild, restartedAllowance);
-  await delegated.tool.execute('after-restart', { junior: 'junior-alfa', description: 'Recheck saved references', prompt: 'Continue with the original evidence.', agent_type: 'test', artifacts: [] });
+  await delegated.tool.execute('after-restart', { junior: 'junior-alfa', label: 'Recheck saved references', prompt: 'Continue with the original evidence.', agent_type: 'test', artifacts: [] });
   expect(retrieved[2]).toHaveLength(7);
   expect(retrieved[2]![0]).toContain('reference content 0');
   expect(retrieved[2]![6]).toContain('reference content 6');

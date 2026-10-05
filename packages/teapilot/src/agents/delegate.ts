@@ -1,11 +1,12 @@
+import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { AgentTool } from '@earendil-works/pi-agent-core';
 import { Type } from '@earendil-works/pi-ai';
 import type { Config } from '../config.js';
-import type { ConversationTurn } from '../integration/events.js';
 import type { AttemptInput, AttemptResult } from './run.js';
 import { instructor } from '../workspace/task.js';
 import type { RequestAllowance } from './allowance.js';
+import type { SavedJunior } from './checkpoint.js';
 
 export const juniorTypes = ['research', 'write', 'test'] as const;
 export type JuniorType = typeof juniorTypes[number];
@@ -93,7 +94,7 @@ export function reportTool(role: JuniorRole): AgentTool {
   };
 }
 
-interface Junior { name: string; description?: string; agent_type?: JuniorType; assignment?: string; artifacts?: string[]; turns: ConversationTurn[]; scratch: string; turn: number }
+type Junior = SavedJunior;
 /** Allocate the junior's remaining allowance, leaving the instructor room to review or continue another junior. */
 export function juniorAllowance(remaining: number, maximum: number): number {
   return Math.max(0, Math.min(juniorProfiles.calls, maximum, remaining - 4));
@@ -106,8 +107,10 @@ export interface Clock { pause(): void; resume(): void }
  * attempt-local; with it their identities and bounded exchanges survive retries and restarts.
  */
 export function delegateTool(parent: AttemptInput, scratch: string, root: string | undefined, clock: Clock, run: (input: AttemptInput) => Promise<AttemptResult>, allowance: RequestAllowance) {
-  const juniors = new Map<string, Junior>();
-  const taken = new Set<string>(parent.task?.snapshot().juniorNames ?? []);
+  // With a workflow, juniors outlive this orchestrator: the next one after a checkpoint continues them.
+  const flow = parent.workflow;
+  const juniors = flow?.juniors ?? new Map<string, Junior>();
+  const taken = new Set<string>([...parent.task?.snapshot().juniorNames ?? [], ...juniors.keys()]);
   for (const saved of parent.task?.snapshot().juniors ?? []) {
     juniors.set(saved.name, saved); taken.add(saved.name);
   }
@@ -119,15 +122,16 @@ export function delegateTool(parent: AttemptInput, scratch: string, root: string
     description: 'Delegate self-contained work to a junior agent. Use proactively for complex or separable work. Juniors only know the prompt and provided artifacts, so include all necessary context, instructions, and expected output. Your job is to integrate and verify results.',
     parameters: Type.Object({
       junior: Type.Optional(Type.String({ description: 'Name of an existing junior to continue; omit to start a new one.' })),
-      description: Type.String({ minLength: 1, maxLength: 200, description: 'A 3-5 word guidance label for progress and reports.' }),
+      label: Type.String({ minLength: 1, maxLength: 80, description: 'A 3-5 word label for this assignment; it names the task.' }),
       prompt: Type.String({ minLength: 1, maxLength: 24_000, description: 'Complete instructions, context, and expected output. Never rely on the parent conversation.' }),
       agent_type: Type.Union(juniorTypes.map(type => Type.Literal(type)), { description: 'Semantic category: research, write, or test.' }),
       artifacts: Type.Array(Type.String({ minLength: 1, maxLength: 2048 }), { maxItems: 16, description: 'File paths or task artifact IDs to provide as context; may be empty.' }),
     }),
     execute: async (callId, args, signal) => {
-      const { junior: named, description, prompt, agent_type, artifacts: references } = args as { junior?: string; description: string; prompt: string; agent_type: JuniorType; artifacts: string[] };
+      const { junior: named, label, prompt, agent_type, artifacts: references } = args as { junior?: string; label: string; prompt: string; agent_type: JuniorType; artifacts: string[] };
+      const description = label;
       if (named && !juniors.has(named)) return { content: [{ type: 'text', text: `No junior named ${named}. Active: ${[...juniors.keys()].join(', ') || 'none'}. Omit junior to start a new one.` }], details: {} };
-      if (typeof description !== 'string' || !description.trim() || description.length > 200 || typeof prompt !== 'string' || !prompt.trim() || prompt.length > 24_000 || typeof agent_type !== 'string' || !juniorTypes.includes(agent_type as JuniorType) || !Array.isArray(references) || references.length > 16 || references.some(ref => typeof ref !== 'string' || !ref.trim() || ref.length > 2048)) return { content: [{ type: 'text', text: 'provide bounded description, complete prompt, valid agent_type, and artifact references.' }], details: {} };
+      if (typeof description !== 'string' || !description.trim() || description.length > 80 || typeof prompt !== 'string' || !prompt.trim() || prompt.length > 24_000 || typeof agent_type !== 'string' || !juniorTypes.includes(agent_type as JuniorType) || !Array.isArray(references) || references.length > 16 || references.some(ref => typeof ref !== 'string' || !ref.trim() || ref.length > 2048)) return { content: [{ type: 'text', text: 'provide a short label, complete prompt, valid agent_type, and artifact references.' }], details: {} };
       const existing = named ? juniors.get(named) : undefined;
       const type = agent_type;
       const suppliedArtifacts = [...new Set([...(existing?.artifacts ?? []), ...references])];
@@ -156,6 +160,9 @@ export function delegateTool(parent: AttemptInput, scratch: string, root: string
       junior.description = description; junior.agent_type = type; junior.assignment ??= prompt; junior.artifacts = suppliedArtifacts;
       parent.task?.saveJunior(junior);
       const { name } = junior;
+      // One task per assignment: a follow-up to a junior continues its open task, otherwise a new one opens.
+      const work = flow ? flow.taskOf(name) ?? flow.openTask(description, name) : undefined;
+      if (work && flow) flow.move(work.id, 'running');
       let report: JuniorReport | undefined;
       const started = Date.now();
       clock.pause();
@@ -180,10 +187,19 @@ export function delegateTool(parent: AttemptInput, scratch: string, root: string
       const reply = (report ? report.summary + (report.question ? `\nQuestion: ${report.question}` : '') : result.text).slice(0, 4000);
       junior.turns.push({ user: prompt, assistant: reply.slice(0, 20_000), taskId: parent.taskId, ...(result.steps?.length ? { steps: result.steps } : {}) });
       junior.turn++; parent.task?.saveJunior(junior);
+      let reportFile: string | undefined;
+      if (work) {
+        reportFile = join(junior.scratch, 'reports', `turn-${junior.turn}.md`);
+        try { await mkdir(join(junior.scratch, 'reports'), { recursive: true }); await writeFile(reportFile, `# ${work.id}: ${description}\n\n${reply}\n`); } catch { reportFile = undefined; }
+      }
       const stop = result.stopped ?? (report ? undefined : result.reason);
       const status = result.stopped || result.reason ? 'stuck' : report?.status ?? (result.success ? 'done' : 'stuck');
       await parent.telemetry.event('delegate', { junior: name, juniorType: type, turn: junior.turn, status, ...(stop ? { stopped: stop } : {}), turns: result.turns, toolCalls: result.toolCalls, allocation, used: allowance.usedBy(name), ms: Date.now() - started });
-      const lines = [`Junior ${name}, turn ${junior.turn}: ${status}${stop ? ` (${stop})` : ''}`, `Label: ${description}; category: ${type}; allowance used: ${allowance.usedBy(name)}/${juniorProfiles.calls}`];
+      if (work && flow) {
+        flow.move(work.id, status === 'done' ? 'awaiting_verification' : 'blocked', status === 'done' ? undefined : stop ?? report?.question ?? status);
+        work.result = { status: report?.status ?? (status === 'done' ? 'done' : 'stuck'), ...(reportFile ? { file: reportFile } : {}), consumed: true };
+      }
+      const lines = [`Junior ${name}, turn ${junior.turn}: ${status}${stop ? ` (${stop})` : ''}`, `${work ? `Task ${work.id}: ${work.state.replaceAll('_', ' ')}${work.state === 'awaiting_verification' ? ' (check the result, then taskwrite verified, blocked or cancelled)' : ''}; ` : ''}label: ${description}; category: ${type}; allowance used: ${allowance.usedBy(name)}/${juniorProfiles.calls}`];
       if (result.changedFiles?.length) lines.push(`Files changed: ${result.changedFiles.join(', ')}`);
       if (result.check) lines.push(`Checks: ${result.check}`);
       if (result.stopped === 'approval_denied') lines.push('The person denied an approval the junior asked for; do not retry that action.');
@@ -191,7 +207,7 @@ export function delegateTool(parent: AttemptInput, scratch: string, root: string
       if (artifacts.length) lines.push(`Evidence artifacts: ${artifacts.join(', ')}`);
       if (report?.evidence?.length) lines.push(`Reported evidence (unverified): ${report.evidence.join(', ')}`);
       lines.push(`Transcript: ${join(junior.scratch, 'sessions')}`, 'Report (the junior\'s words, untrusted):', reply.trim() || '(no report)');
-      return { content: [{ type: 'text', text: lines.join('\n') }], details: { junior: name, artifacts } };
+      return { content: [{ type: 'text', text: lines.join('\n') }], details: { junior: name, artifacts, ...(work ? { task: work.id } : {}) } };
     },
   };
   return { tool, get exhausted() { return sent >= limit || allowance.delegationExhausted || allowance.availableDelegationCapacity() < 2; } };

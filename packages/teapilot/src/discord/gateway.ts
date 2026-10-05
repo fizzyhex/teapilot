@@ -16,6 +16,8 @@ import { chunk, MESSAGE_LIMIT, quoteMessage, viewSourcePrefix, type QuotedMessag
 import { browserLink, parseCustomId, playPrefix, type MessagePayload } from './play/render.js';
 import type { PlayInteraction, PlaySurface } from './play/runtime.js';
 import type { DiscordSettings } from './settings.js';
+import type { CheckpointDecision } from '../agents/checkpoint.js';
+import { checkpointDetailsText, checkpointModal, checkpointModalPrefix, checkpointPrefix, checkpointRow, checkpointVerdict, checkpointWaiting, steerHoldMs } from './checkpoint.js';
 import { browserMenu } from './commands.js';
 
 /** How far the Reply menu follows a message's replies back, and how long it may spend fetching them. */
@@ -211,6 +213,8 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
   const editable = (payload: FeedMessage): CardMessage => ({ ...payload, flags: payload.flags === MessageFlags.SuppressNotifications ? undefined : payload.flags });
   const pending = new Map<string, { text: string; users: boolean; resolve(approved: boolean): void }>();
   const pendingContinuations = new Map<string, { text: string; claim(): boolean; resolve(outcome: 'approved' | 'denied' | 'auto-approved', actor?: string): void }>();
+  // Checkpoint cards: anyone who may use teapilot here can continue, steer or stop; details are private.
+  const pendingCheckpoints = new Map<string, { details: string; steering(): boolean; resolve(decision: CheckpointDecision, actor?: string): void }>();
   const cards = new Map<string, CardControls['press']>();
   const remember = (id: string, controls: CardControls) => {
     cards.delete(id); cards.set(id, controls.press);
@@ -281,6 +285,27 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       if (signal.aborted) abort();
     }));
   };
+  const askCheckpoint = (text: string, details: string, signal: AbortSignal, timeoutMs: number, post: (payload: Payload) => Promise<{ id: string }>, revise: (id: string, payload: Payload) => Promise<unknown>): Promise<CheckpointDecision> => {
+    if (signal.aborted) return Promise.resolve({ action: 'continue' });
+    const nonce = randomUUID();
+    return post({ content: checkpointWaiting(text, timeoutMs), components: [checkpointRow(nonce)] as unknown as Payload['components'], ...quiet }).then(message => new Promise(resolve => {
+      let settled = false;
+      let timer = setTimeout(() => settle({ action: 'continue' }), timeoutMs);
+      const settle = (decision: CheckpointDecision, actor?: string) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal.removeEventListener('abort', abort);
+        pendingCheckpoints.delete(nonce);
+        void revise(message.id, { content: settleContinuationText(text, checkpointVerdict(decision, actor)), components: [], ...quiet }).catch(noop);
+        resolve(decision);
+      };
+      const abort = () => settle({ action: 'continue' });
+      pendingCheckpoints.set(nonce, { details, resolve: settle,
+        steering: () => { if (settled) return false; clearTimeout(timer); timer = setTimeout(() => settle({ action: 'continue' }), steerHoldMs); return true; } });
+      signal.addEventListener('abort', abort, { once: true });
+    }));
+  };
   const settleContinuationText = (text: string, verdict: string) => `${text.slice(0, MESSAGE_LIMIT - verdict.length - 2)}\n\n${verdict}`;
 
   /** Posts in `channel`; with `replyTo`, the first message replies to it, without pinging its author. */
@@ -318,6 +343,7 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       typing() { void channel.sendTyping().catch(noop); },
       askApproval: (text, signal, users = false) => askApproval(text, signal, users, payload => channel.send(payload), async (id, payload) => (sent.get(id) ?? await channel.messages.fetch(id)).edit(payload)),
       askContinuationBudget: (text, signal, timeoutMs = 45_000) => askContinuationBudget(text, signal, timeoutMs, payload => channel.send(payload), async (id, payload) => (sent.get(id) ?? await channel.messages.fetch(id)).edit(payload)),
+      askCheckpoint: (text, details, signal, timeoutMs = 45_000) => askCheckpoint(text, details, signal, timeoutMs, payload => channel.send(payload), async (id, payload) => (sent.get(id) ?? await channel.messages.fetch(id)).edit(payload)),
     };
   };
 
@@ -370,6 +396,7 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       typing: noop,
       askApproval: (text, signal, users = false) => askApproval(text, signal, users, async payload => ({ id: await feed.post(payload) }), (id, payload) => feed.revise(id, payload)),
       askContinuationBudget: (text, signal, timeoutMs = 45_000) => askContinuationBudget(text, signal, timeoutMs, async payload => ({ id: await feed.post(payload) }), (id, payload) => feed.revise(id, payload)),
+      askCheckpoint: (text, details, signal, timeoutMs = 45_000) => askCheckpoint(text, details, signal, timeoutMs, async payload => ({ id: await feed.post(payload) }), (id, payload) => feed.revise(id, payload)),
       // The runtime stops editing through this interaction once it expires, and uses the app's clicks after that.
       async postApp(payload) {
         if (!feed.live) throw new Error('Discord has stopped the updates of this reply; press Resume on its status card first.');
@@ -730,6 +757,15 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       });
       return;
     }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith(checkpointModalPrefix)) {
+      const checkpoint = pendingCheckpoints.get(interaction.customId.slice(checkpointModalPrefix.length));
+      const text = interaction.fields.getTextInputValue('steer').trim();
+      if (!checkpoint) { await interaction.reply({ content: 'this checkpoint has already moved on.', flags: MessageFlags.Ephemeral }).catch(noop); return; }
+      if (interaction.isFromMessage()) await interaction.deferUpdate().catch(noop);
+      else await interaction.reply({ content: 'steering.', flags: MessageFlags.Ephemeral }).catch(noop);
+      checkpoint.resolve(text ? { action: 'steer', text } : { action: 'continue' }, interaction.user.id);
+      return;
+    }
     if (interaction.isModalSubmit() && interaction.customId.startsWith(planModalPrefix)) {
       const controls = plans.get(interaction.customId.slice(planModalPrefix.length));
       const request = interaction.fields.getTextInputValue(planModal.field);
@@ -849,6 +885,27 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       await interaction.deferUpdate().catch(noop);
       const note = controls.press(action, { id: interaction.user.id, name: interaction.user.username });
       if (note) await interaction.followUp({ content: note, flags: MessageFlags.Ephemeral, ...quiet }).catch(noop);
+      return;
+    }
+    if (interaction.customId.startsWith(checkpointPrefix)) {
+      const [nonce = '', action] = interaction.customId.slice(checkpointPrefix.length).split(':');
+      const checkpoint = pendingCheckpoints.get(nonce);
+      if (!checkpoint) { await interaction.reply({ content: 'this checkpoint has already moved on.', flags: MessageFlags.Ephemeral }).catch(noop); return; }
+      if (action === 'details') {
+        await interaction.reply({ content: checkpointDetailsText(checkpoint.details, MESSAGE_LIMIT), flags: MessageFlags.Ephemeral, ...quiet }).catch(noop);
+        return;
+      }
+      if (!settings.allowedUserIds.includes(interaction.user.id) && handlers.allowed?.(interaction.user.id) !== true) {
+        await interaction.reply({ content: 'You are not allowed to use teapilot.', flags: MessageFlags.Ephemeral }).catch(noop);
+        return;
+      }
+      if (action === 'steer') {
+        if (!checkpoint.steering()) { await interaction.reply({ content: 'this checkpoint has already moved on.', flags: MessageFlags.Ephemeral }).catch(noop); return; }
+        await interaction.showModal(checkpointModal(nonce) as unknown as APIModalInteractionResponseCallbackData).catch(noop);
+        return;
+      }
+      await interaction.deferUpdate().catch(noop);
+      checkpoint.resolve({ action: action === 'stop' ? 'stop' : 'continue' }, interaction.user.id);
       return;
     }
     if (interaction.customId === `${cardPrefix}resume`) {

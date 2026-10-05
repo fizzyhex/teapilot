@@ -300,7 +300,7 @@ describe('real JevRouter SDK + pi loop with mock HTTP providers', () => {
       else { calls++; completion(res, { tool: { name: 'read', arguments: { path: 'input.txt' } } }); }
     });
     await writeFile(join(f.cwd, 'input.txt'), 'same content');
-    f.config.policy.limits.maxTurns = 2;
+    f.config.policy.limits.maxTurns = 2; f.config.policy.limits.maxCheckpoints = 0;
     f.config.policy.escalation.maxEscalations = 0;
     const result = await runHost(f.config, { cwd: f.cwd, prompt: 'Inspect files' }, { approve: async () => false });
     expect(result.status).toBe('turn_limit');
@@ -365,7 +365,7 @@ describe('real JevRouter SDK + pi loop with mock HTTP providers', () => {
       else { calls++; completion(res, { tool: { name: 'read', arguments: { path: 'input.txt' } } }); }
     });
     await writeFile(join(f.cwd, 'input.txt'), 'hello');
-    f.config.policy.limits.maxToolCalls = 1;
+    f.config.policy.limits.maxToolCalls = 1; f.config.policy.limits.maxCheckpoints = 0;
     const result = await runHost(f.config, { cwd: f.cwd, prompt: 'Inspect code' }, { approve: async () => false });
     expect(result.status).toBe('tool_limit');
     expect(calls).toBe(2);
@@ -440,7 +440,7 @@ describe('real JevRouter SDK + pi loop with mock HTTP providers', () => {
     cleanups.push(server.close);
     f.config.routingMode = 'direct';
     f.config.models.capable.baseUrl = server.url;
-    f.config.policy.limits.maxToolCalls = 2;
+    f.config.policy.limits.maxToolCalls = 2; f.config.policy.limits.maxCheckpoints = 0;
     const grants = await SessionGrants.create(f.cwd, f.config, 'chat');
     const result = await runHost(f.config, { cwd: f.cwd, prompt: 'Create granted.txt', mode: 'chat', authorization: grants }, {
       localProbe: async () => true,

@@ -447,7 +447,7 @@ it('gives a junior the play tools to build and dry-run apps, but leaves posting 
   const f = await setup((body, _req, res) => {
     if (JSON.stringify(body.messages?.[0] ?? '').includes('You are junior ')) { junior.push(body); return completion(res, juniorSteps[junior.length - 1]!); }
     instructor.push(body);
-    completion(res, instructor.length === 1 ? { tool: { name: 'delegate_task', arguments: { description: 'Build a counter application', prompt: 'Build a counter app in apps/counter.js.', agent_type: 'write', artifacts: [] } } } : { text: 'Done.' });
+    completion(res, instructor.length === 1 ? { tool: { name: 'delegate_task', arguments: { label: 'Build a counter application', prompt: 'Build a counter app in apps/counter.js.', agent_type: 'write', artifacts: [] } } } : { text: 'Done.' });
   });
   await runAttempt({ ...f, ...f.base, prompt: 'make me a counter', activePermissions: ['inference', 'discord.play'], scratch: join(f.cwd, '.scratch'), ...f.turn() });
   expect(names(junior[0])).toEqual(expect.arrayContaining(['play_test', 'play_inspect', 'report']));

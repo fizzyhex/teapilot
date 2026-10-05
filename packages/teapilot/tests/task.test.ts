@@ -710,7 +710,7 @@ it('shares a request-wide ceiling with juniors and retains child evidence withou
       return completion(res, childBodies.length === 1 ? { tool: { name: 'write', arguments: { path: 'notes.txt', content: 'child evidence' } } }
         : { tool: { name: 'report', arguments: { status: 'done', summary: 'wrote notes.txt' } } });
     }
-    completion(res, ++calls === 1 ? { tool: { name: 'delegate_task', arguments: { description: 'Narrow child objective', prompt: 'narrow child objective', agent_type: 'write', artifacts: [] } } } : { text: 'received report' });
+    completion(res, ++calls === 1 ? { tool: { name: 'delegate_task', arguments: { label: 'Narrow child objective', prompt: 'narrow child objective', agent_type: 'write', artifacts: [] } } } : { text: 'received report' });
   });
   f.task.startRequest('aggregate', { calls: 8, modelCalls: 10, timeoutMs: 10_000 });
   const result = await run(f);
@@ -725,7 +725,7 @@ it('shares a request-wide ceiling with juniors and retains child evidence withou
 it('does not pause the aggregate deadline while the instructor waits', async () => {
   const f = await attempt(async (body, _req, res) => {
     if (isJunior(body)) { await new Promise(resolve => setTimeout(resolve, 400)); return completion(res, { text: 'late' }); }
-    completion(res, { tool: { name: 'delegate_task', arguments: { description: 'Research slow child', prompt: 'slow child', agent_type: 'research', artifacts: [] } } });
+    completion(res, { tool: { name: 'delegate_task', arguments: { label: 'Research slow child', prompt: 'slow child', agent_type: 'research', artifacts: [] } } });
   });
   f.task.startRequest('short', { calls: 10, modelCalls: 10, timeoutMs: 180 });
   const result = await run(f);

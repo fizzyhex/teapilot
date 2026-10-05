@@ -455,7 +455,10 @@ export class TerminalPresentation implements ActivityUI {
     else if (event.type === 'message_end') { this.clear(); this.endMessage(); this.draw(); }
     else if (event.type === 'tool_execution_start') this.setActivity({ kind: 'waiting', label: `${typeof event.junior === 'string' ? `${event.junior}: ` : ''}Running ${String(event.tool)}...` });
     else if (event.type === 'tool_execution_end') this.write(`${paint(describeTool(event), '2', this.colour)}\n`);
-    else if (event.type === 'compaction' || event.type === 'compaction_failed') this.write(`${paint(describeCompaction(event), '2', this.colour)}\n`);
+    else if (event.type === 'checkpoint' && Array.isArray(event.lines)) {
+      this.endMessage(); this.clipKind = undefined; this.collapse();
+      this.write(`\n${paint(String(event.title), '1;36', this.colour)}\n${(event.lines as string[]).map(line => paint(`  ${line}`, '2', this.colour)).join('\n')}\n`);
+    } else if (event.type === 'compaction' || event.type === 'compaction_failed') this.write(`${paint(describeCompaction(event), '2', this.colour)}\n`);
     else if (event.type === 'tip') this.write(`${paint(describeTip(event), '2', this.colour)}\n`);
     else if (event.type === 'request_end' || event.type === 'request_error') this.pause();
   }

@@ -2,7 +2,8 @@
 import { parseArgs } from 'node:util';
 import { resolve } from 'node:path';
 import { configDirectory, isTierPreference, loadConfig, tierPreferences, type Workload } from './config.js';
-import { runHost, type HostRequest } from './host.js';
+import { runHost, type CheckpointView, type HostRequest } from './host.js';
+import type { CheckpointDecision } from './agents/checkpoint.js';
 import { casualLines, paceLines } from './casual.js';
 import { runSession } from './chat.js';
 import { doctor } from './diagnostics.js';
@@ -162,7 +163,18 @@ async function main(): Promise<void> {
     if (values.tier !== undefined && !isTierPreference(values.tier)) throw new Error(`--tier must be ${tierPreferences.join(', ')}.`);
     const tier = values.tier;
     const request: HostRequest = { prompt, workload, cwd: resolve(values.cwd), web: values.web, correction: values.correction, tier, signal: controller.signal };
-    const dependencies = { approve, onActivity: presentation.setActivity, onProgress: (message: string) => presentation.log(redact(message)), onEvent: (event: import('./integration/events.js').HostEvent) => presentation.event(event) };
+    // A checkpoint is a moment to steer or stop; without anyone at the terminal, work simply carries on.
+    const onCheckpoint = async (_view: CheckpointView, signal?: AbortSignal): Promise<CheckpointDecision> => {
+      if (!ui || values.json || controller.signal.aborted) return { action: 'continue' };
+      presentation.pause();
+      try {
+        const choice = await ui.choose('checkpoint: how should teapilot go on?', ['continue', 'steer (add a direction first)', 'stop and park it'], 0);
+        if (choice === 2) return { action: 'stop' };
+        const text = choice === 1 ? (await ui.input('steer', '', false, signal)).trim() : '';
+        return text ? { action: 'steer', text } : { action: 'continue' };
+      } finally { presentation.start(); }
+    };
+    const dependencies = { approve, onCheckpoint, onActivity: presentation.setActivity, onProgress: (message: string) => presentation.log(redact(message)), onEvent: (event: import('./integration/events.js').HostEvent) => presentation.event(event) };
     const execute = async (request: HostRequest) => {
       let result;
       presentation.start();

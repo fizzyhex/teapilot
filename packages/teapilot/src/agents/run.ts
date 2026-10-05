@@ -39,6 +39,7 @@ import type { SkillCatalog } from '../workspace/skills.js';
 import { skillCache } from '../skills/cache.js';
 import { SkillStore } from '../skills/store.js';
 import { skillQuery, skillReferencePrefix, skillSource, skillTools } from './skills.js';
+import { checkpointInspection, checkpointTool, taskwriteTool, type CheckpointRecord, type HandoffReason, type Workflow } from './checkpoint.js';
 
 export interface AttemptInput {
   config: Config; tier: Tier; workload: Workload; cwd: string; prompt: string; web: boolean;
@@ -93,6 +94,8 @@ export interface AttemptInput {
   taskId?: string;
   /** Frozen by the host for all attempts and juniors of this request. */
   skillCatalog?: SkillCatalog;
+  /** The request's host-owned workflow (agents/checkpoint.ts): with it, the orchestrator checkpoints instead of running out. */
+  workflow?: Workflow;
 }
 /** What an attempt last showed the model of its request (after any compaction, without earlier turns), and the summary before it. */
 export interface Resume { messages: Message[]; summary?: Compaction }
@@ -111,6 +114,10 @@ export interface AttemptResult {
   ending?: { stopReason?: string; error?: string; textChars: number; termination?: InferenceState['termination'] };
   /** For a retry on the same model to carry on from; absent when the model never replied. */
   resume?: Resume;
+  /** The checkpoint this orchestrator handed off with; a fresh one carries on from it. */
+  checkpoint?: CheckpointRecord;
+  /** A checkpoint was required but never submitted: the host writes one itself. */
+  checkpointMissed?: { reason: HandoffReason; attempts: number };
 }
 
 /** The tools a side question (/btw) keeps: they read, search, or send what exists. */
@@ -364,7 +371,45 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
   const delegation = model.toolCalling && !input.casual && !input.side && !input.junior && scratchFolder && config.delegation?.enabled !== false && profile.contextTokens >= delegationMinContext
     ? delegateTool({ ...input, config, recovery }, scratchFolder, ownRoot, clock, runAttempt, allowance) : undefined;
   if (delegation) controlTools.push(delegation.tool);
+  const flow = !input.junior && !input.casual && !input.side && !input.readOnly && model.toolCalling ? input.workflow : undefined;
+  if (flow && delegation) controlTools.push(taskwriteTool(flow));
+  // Checkpoints: as this orchestrator's window closes, it is asked to hand off (due, then urgent, then only
+  // checkpoint left). Three replies without one and the host hands off itself. Neither tool spends the window.
+  const checkpointing = Boolean(flow?.canCheckpoint);
+  const stages = ['none', 'due', 'urgent', 'final'] as const;
+  type Stage = typeof stages[number];
+  let stage: Stage = 'none', announced: Stage = 'none', dueReason: HandoffReason = 'tool_calls', misses = 0, missNotice = false, missedCheckpoint = false;
+  let checkpointed: CheckpointRecord | undefined;
+  const raise = (to: Stage, reason: HandoffReason) => {
+    if (!checkpointing || checkpointed || stages.indexOf(to) <= stages.indexOf(stage)) return;
+    stage = to; dueReason = reason;
+  };
+  const checkpointer = checkpointing ? checkpointTool(async handoff => {
+    checkpointed = await flow!.checkpoint({ reason: dueReason, forced: false, attempts: misses + 1, handoff });
+    await telemetry.event('checkpoint_saved', { generation: checkpointed.generation, reason: dueReason, forced: false, attempts: misses + 1 });
+    return checkpointed;
+  }) : undefined;
+  const assess = () => {
+    if (!checkpointing || checkpointed) return;
+    // Due with about a quarter of the window left, urgent with about a tenth: most of a window is for working.
+    const calls = allowance.callsRemainingFor(), window = Math.min(allowance.instructorGranted, config.policy.limits.maxToolCalls);
+    if (calls <= 0) raise('final', 'tool_calls');
+    else if (calls <= Math.max(1, Math.ceil(window * 0.1))) raise('urgent', 'tool_calls');
+    else if (calls <= Math.max(3, Math.ceil(window * 0.25))) raise('due', 'tool_calls');
+    const ms = remaining ?? deadline - Date.now(), dueMs = Math.min(180_000, config.policy.limits.attemptTimeoutMs * 0.15);
+    if (ms <= dueMs / 2) raise('urgent', 'time'); else if (ms <= dueMs) raise('due', 'time');
+    if (allowance.remaining().modelCalls <= 3) raise('urgent', 'model_calls');
+    // A second compaction loses more than a fresh agent with the host's facts would.
+    if (nearCompaction && lead !== opening.lead) raise('due', 'context');
+  };
+  const why = () => dueReason === 'tool_calls' ? `${Math.max(0, allowance.callsRemainingFor())} tool calls left in this window`
+    : dueReason === 'time' ? 'this window\'s time is nearly up' : dueReason === 'context' ? 'context is filling again after compaction' : 'model calls are nearly spent';
+  /** Urgent keeps looking and bookkeeping; final keeps the checkpoint alone. */
+  const checkpointTools = <T extends { name: string }>(tools: T[] | undefined): T[] => [...stage === 'final' ? [] : (tools ?? []).filter(tool => tool.name !== 'checkpoint' && (stage === 'due' || checkpointInspection(tool.name))), checkpointer as unknown as T];
+  /** A window limit reached while a checkpoint can still be made asks for one instead of ending the attempt. */
+  const windowClosed = () => { if (!checkpointing || checkpointed) return false; raise('final', 'tool_calls'); return true; };
   const setup = await compose();
+  await flow?.useRoot(effectiveConfig.policy.permissions.includes('repository.read') ? input.cwd : workspaceFolder && hasRepository(workspaceFolder) ? workspaceFolder : undefined);
   if (!model.toolCalling && setup.tools.length) throw new Error('Selected model cannot use the required tools');
   // Earlier turns get at most half of what the instructions, tools and request leave, so this turn's own
   // calls and results still fit. The admission check at the provider remains the exact limit.
@@ -526,20 +571,23 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
     toolExecution: 'sequential',
     // Before every request, the first included, so an attempt carrying on from another starts within the limit too.
     prepareRequest: async ({ context: given }) => {
-      if (!input.readOnly && allowance.remaining().calls <= 0) toolLimit = true;
+      if (!input.readOnly && allowance.remaining().calls <= 0 && !windowClosed()) toolLimit = true;
       const canRenew = !input.junior && !input.readOnly && !input.side && !input.casual && !evidence.answerNow && !toolLimit && !timeout && !evidence.reason && !capabilityDenied && !policy.denied;
-      const budgetState = canRenew ? await gateInstructor() : allowance.denied ? 'denied' : 'ready';
+      let budgetState = canRenew ? await gateInstructor() : allowance.denied ? 'denied' : 'ready';
+      if (budgetState === 'exhausted' && windowClosed()) budgetState = 'ready';
       if (approvalAbort.signal.aborted || input.signal?.aborted || timeout || terminated || allowance.remaining().ms <= 0) {
         agent.abort();
         return { context: { ...given, tools: [] } };
       }
       let context = await shape(given);
-      if (toolLimit || budgetState !== 'ready') {
+      // Tools are declared before this runs, so stages change in prepareNextTurnWithContext; this keeps them in place.
+      if (checkpointer && stage !== 'none') context = { ...context, tools: checkpointTools(context.tools) };
+      else if (toolLimit || budgetState !== 'ready') {
         const tools = input.junior ? context.tools?.filter(tool => tool.name === 'report') : [];
         const notice = toolLimit ? 'the hard request tool-call limit is reached' : budgetState === 'denied' ? 'additional instructor calls were not approved' : 'the instructor call grant is exhausted';
         context = { ...context, tools, messages: [...context.messages, { role: 'user', content: `[notice] ${notice}; ${input.junior ? 'report partial findings and gaps now' : 'answer from existing evidence and state any gaps'}.`, timestamp: Date.now() }] };
       }
-      if (evidence.answerNow && context.tools?.some(tool => !input.junior || tool.name !== 'report')) {
+      if (evidence.answerNow && stage === 'none' && context.tools?.some(tool => !input.junior || tool.name !== 'report')) {
         context = { ...context, tools: input.junior ? context.tools.filter(tool => tool.name === 'report') : [], messages: [...context.messages, { role: 'user', content: `[notice] ${evidence.answerWhy}; ${input.junior ? 'report partial findings and gaps now' : 'answer from existing evidence and state gaps'}.`, timestamp: Date.now() }] };
       }
       live = context.messages;
@@ -554,6 +602,15 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
         const messages: Message[] = planRepairNotice ? [{ role: 'user', content: '[notice] return the complete existing proposal inside <plan> tags; do not research or change its scope.', timestamp: Date.now() }] : [];
         planRepairNotice = false;
         return { context: { ...context, tools: [] }, messages };
+      }
+      assess();
+      if (checkpointer && stage !== 'none') {
+        const notice = announced === stage && !missNotice ? undefined : stage === 'due' ? `[checkpoint due] ${why()}. if the work is done, just answer. otherwise finish the current step, then call checkpoint with a brief status and next step; a fresh agent continues with renewed limits.`
+          : stage === 'urgent' ? `[checkpoint due] ${why()}. start no new work: inspect or settle tasks if needed, then call checkpoint now.`
+          : `[checkpoint required] ${why()}. only checkpoint is available. attempt ${misses + 1} of 3; after that the host hands off without your notes.`;
+        if (announced !== stage) void telemetry.event('checkpoint_due', { stage, reason: dueReason });
+        announced = stage; missNotice = false;
+        return { context: { ...context, tools: checkpointTools(context.tools) }, messages: notice ? [{ role: 'user', content: notice, timestamp: Date.now() }] : [] };
       }
       if (claimNotice) {
         claimNotice = false;
@@ -585,6 +642,8 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
       beforeToolCall: async ({ toolCall }) => {
       sourceSaved = undefined;
       if (capabilityDenied || policy.denied || evidence.reason || searchFailed || input.signal?.aborted || approvalAbort.signal.aborted || timeout || terminated) { settled.set(toolCall.id, 'stopped'); return { block: true, terminate: true, reason: 'Attempt stopped' }; }
+      // Control-plane calls: they never spend the window whose end makes them necessary.
+      if (flow && (toolCall.name === 'checkpoint' || toolCall.name === 'taskwrite')) return undefined;
       if (evidence.answerNow && (!input.junior || toolCall.name !== 'report')) return { block: true, reason: 'exploration finished; synthesize from existing evidence' };
       if (evidence.searchExhausted && toolCall.name === 'web_search') return { block: true, reason: 'Search refused: search is unavailable or repeated searches found no new evidence. Continue without it, clearly stating any gaps.' };
       if (evidence.readsExhausted && toolCall.name === 'web_read') return { block: true, reason: 'Reading refused: the page budget is spent or reads kept returning the same page. Continue without it, clearly stating any gaps.' };
@@ -602,23 +661,38 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
             budgetDenialSynthesis = true;
             return { block: true, reason: 'additional instructor calls were not approved; answer from existing evidence' };
           }
+          if (windowClosed()) return { block: true, reason: 'this window\'s tool calls are spent: call checkpoint' };
           toolLimit = true;
           return { block: true, terminate: true, reason: 'instructor tool grant exhausted' };
         }
       }
-      if (!allowance.canAdmitTool(toolCall.id, input.junior?.name, input.budgetReservation)) { settled.set(toolCall.id, 'stopped'); toolLimit = true; return { block: true, reason: 'reserved request capacity is unavailable; finish from existing evidence' }; }
+      if (!allowance.canAdmitTool(toolCall.id, input.junior?.name, input.budgetReservation)) {
+        settled.set(toolCall.id, 'stopped');
+        if (windowClosed()) return { block: true, reason: 'this window\'s tool calls are spent: call checkpoint' };
+        toolLimit = true; return { block: true, reason: 'reserved request capacity is unavailable; finish from existing evidence' };
+      }
       if (task) {
         const receipt = task.admit(actor, toolCall.name, toolCall.arguments, toolCall.id);
         if (!receipt) { settled.set(toolCall.id, 'stopped'); toolLimit = true; return { block: true, terminate: true, reason: 'request-wide tool allowance reached' }; }
         receipts.set(toolCall.id, receipt); producing = receipt;
         allowance.recordAdmitted(input.junior?.name);
-      } else if (!allowance.consumeTool(input.junior?.name)) { settled.set(toolCall.id, 'stopped'); toolLimit = true; return { block: true, terminate: true, reason: 'request-wide tool allowance reached' }; }
+      } else if (!allowance.consumeTool(input.junior?.name)) {
+        settled.set(toolCall.id, 'stopped');
+        if (windowClosed()) return { block: true, reason: 'this window\'s tool calls are spent: call checkpoint' };
+        toolLimit = true; return { block: true, terminate: true, reason: 'request-wide tool allowance reached' }; }
       allowance.commitToolAdmission(toolCall.id, input.junior?.name, input.budgetReservation);
       evidence.toolCalls++;
+      flow?.begin(toolCall.id, toolCall.name, toolCall.arguments);
       return undefined;
     },
     afterToolCall: async ({ toolCall, args, isError, result, context: sent }) => {
       settled.set(toolCall.id, 'ran');
+      if (flow && (toolCall.name === 'checkpoint' || toolCall.name === 'taskwrite')) return undefined;
+      if (flow) {
+        const text = result.content.filter(part => part.type === 'text').map(part => part.text).join('\n');
+        flow.settle(toolCall.id, toolCall.name, args, isError || Boolean((result.details as { outcome?: ToolOutcome } | undefined)?.outcome?.failed), text);
+        if (toolCall.name === 'skill' && !isError && typeof (args as { id?: unknown }).id === 'string') flow.skillLoaded((args as { id: string }).id);
+      }
       const outcome = (result.details as { outcome?: ToolOutcome } | undefined)?.outcome;
       isError ||= Boolean(outcome?.failed);
       if (!isError && ['play_start', 'play_update'].includes(toolCall.name) && result.content.some(part => part.type === 'text' && /^(Started|Updated) app /.test(part.text))) changed = true;
@@ -725,7 +799,13 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
     },
     finishTurn: ({ message }) => {
       if (!input.junior) allowance.finishQueuedBatch();
+      if (checkpointed) return { action: 'end' };
       if (capabilityDenied || policy.denied || evidence.reason || searchFailed || toolLimit || timeout || input.signal?.aborted) return { action: 'end' };
+      if (stage === 'final') {
+        if (++misses >= 3) { missedCheckpoint = true; return { action: 'end' }; }
+        missNotice = true;
+        return { action: 'continue' };
+      }
       if (budgetDenialSynthesis) {
         if (!budgetDenialSynthesisStarted) { budgetDenialSynthesisStarted = true; return { action: 'continue' }; }
         return { action: 'end' };
@@ -829,7 +909,13 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
   const turn = kept && replayed.includes(kept) ? replayed.slice(0, replayed.indexOf(kept) + 1) : replayed;
   const stop = kept ? undefined : inference.stop;
   // A final reply without calls is the answer itself; everything before it is what the tools did.
-  const steps = turnSteps(last?.role === 'assistant' && last === turn.at(-1) && !last.content.some(part => part.type === 'toolCall') ? turn.slice(0, -1) : turn);
+  // A handoff belongs to its own request: replayed later, it reads as a tool to call again.
+  const steps = turnSteps(last?.role === 'assistant' && last === turn.at(-1) && !last.content.some(part => part.type === 'toolCall') ? turn.slice(0, -1) : turn).flatMap((message): Message[] => {
+    if (message.role === 'toolResult') return message.toolName === 'checkpoint' ? [] : [message];
+    if (message.role !== 'assistant' || !message.content.some(part => part.type === 'toolCall' && part.name === 'checkpoint')) return [message];
+    const content = message.content.filter(part => !(part.type === 'toolCall' && part.name === 'checkpoint'));
+    return content.length ? [{ ...message, content }] : [];
+  });
   const stopped = capabilityDenied || policy.denied ? 'approval_denied' : input.signal?.aborted ? 'cancelled' : searchFailed ? 'search_unavailable' : timeout ? 'timeout' : toolLimit ? 'tool_limit' : planRepair && !planText(text) && looksLikePlan(text) ? 'invalid_plan' : stop;
   // A server that says the model called a tool but sends no call it could parse leaves nothing to run or show.
   const lostCall = last?.role === 'assistant' && lost(last);
@@ -839,7 +925,8 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
   const answered = last?.role === 'assistant' && last.stopReason === 'stop' && Boolean(text.trim());
   const reason = evidence.reason ?? (last?.role === 'assistant' && last.stopReason === 'length' ? overthought ? 'overthinking' : 'unsupported' : undefined) ?? (lostCall ? 'provider_error' : undefined) ?? (stop && ['unsupported', 'turn_limit', 'provider_error'].includes(stop) ? stop as EscalationReason : undefined)
     ?? (evidence.unresolvedChecks.size || evidence.lastCheck === 'failed' ? 'test_failures' : evidence.failures && !answered ? 'tool_failures' : undefined);
-  const success = !stopped && !reason && evidence.lastCheck !== 'failed' && (answered || reported);
+  const handedOff = Boolean(checkpointed || missedCheckpoint);
+  const success = !handedOff && !stopped && !reason && evidence.lastCheck !== 'failed' && (answered || reported);
   // What the model last saw of this request, for a retry on the same model: after a compaction here, everything after
   // its summary (which may reach back into earlier turns); otherwise everything after the earlier turns it opened with.
   const compactedHere = lead !== opening.lead;
@@ -866,8 +953,9 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
     searchExhausted: evidence.searchExhausted || searchFailed,
     shellRan: policy.shellRan,
     handoff: telemetry.redact(handoff),
-    reason: stopped === 'approval_denied' ? undefined : reason,
-    stopped,
+    reason: stopped === 'approval_denied' || handedOff ? undefined : reason,
+    stopped: handedOff ? 'checkpoint' : stopped,
+    ...(checkpointed ? { checkpoint: checkpointed } : missedCheckpoint ? { checkpointMissed: { reason: dueReason, attempts: misses } } : {}),
     turns: Math.min(inference.turns, config.policy.limits.maxTurns),
     toolCalls: Math.min(evidence.toolCalls, config.policy.limits.maxToolCalls),
     check: evidence.unresolvedChecks.size ? 'failed' : evidence.lastCheck,

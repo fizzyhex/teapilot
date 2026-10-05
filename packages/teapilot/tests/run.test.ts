@@ -61,8 +61,8 @@ it('reserves known sibling delegations before the first junior can spend their c
       return;
     }
     if (++parentCalls === 1) multiCompletion(res, [
-      { id: 'delegate-a', name: 'delegate_task', arguments: { description: 'Read source first', prompt: 'Read source.txt and report.', agent_type: 'research', artifacts: [] } },
-      { id: 'delegate-b', name: 'delegate_task', arguments: { description: 'Read source second', prompt: 'Read source.txt and report.', agent_type: 'research', artifacts: [] } },
+      { id: 'delegate-a', name: 'delegate_task', arguments: { label: 'Read source first', prompt: 'Read source.txt and report.', agent_type: 'research', artifacts: [] } },
+      { id: 'delegate-b', name: 'delegate_task', arguments: { label: 'Read source second', prompt: 'Read source.txt and report.', agent_type: 'research', artifacts: [] } },
     ]);
     else completion(res, { text: 'Both juniors reported.' });
   });
@@ -84,7 +84,7 @@ it('pauses only the instructor attempt while a post-junior continuation approval
   const f = await setup((body, _req, res) => {
     const system = (body.messages ?? []).filter((message: any) => message.role === 'system').map((message: any) => message.content).join('\n');
     if (system.includes('You are junior')) completion(res, { tool: { name: 'report', arguments: { status: 'done', summary: 'finished' } } });
-    else if (++parentCalls === 1) completion(res, { tool: { name: 'delegate_task', arguments: { description: 'Read source', prompt: 'Read and report.', agent_type: 'research', artifacts: [] } } });
+    else if (++parentCalls === 1) completion(res, { tool: { name: 'delegate_task', arguments: { label: 'Read source', prompt: 'Read and report.', agent_type: 'research', artifacts: [] } } });
     else completion(res, { text: 'Continued after approval.' });
   });
   const scratch = join(f.config.stateDir, 'workspaces', 'session', '.scratch');

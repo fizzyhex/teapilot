@@ -7,7 +7,7 @@ import { defaultPolicy, JevRouter } from 'jevrouter';
 import type { AccessAdmin } from './agents/access.js';
 import type { PlayContext } from './agents/play.js';
 import type { ConversationWorkspace } from './agents/workspace.js';
-import { runAttempt, type AttemptResult } from './agents/run.js';
+import { runAttempt, type AttemptResult, type Resume } from './agents/run.js';
 import { tiers, type Config, type Tier, type TierPreference, type Workload } from './config.js';
 import { ExecutionPolicy, type Approve, type BeforeMutation } from './execution/policy.js';
 import { prepareConversation, type ConversationTurn, type TextContext, type EventSink } from './integration/events.js';
@@ -24,6 +24,7 @@ import { markWork } from './teachat/busy.js';
 import { directTier, effectiveProfile, modelFor, profileFor, thinkingFor } from './routing/execution.js';
 import { WebController } from './web/controller.js';
 import { RequestRecovery } from './agents/recovery.js';
+import { checkpointCard, checkpointDetails, continuation, Workflow, type CheckpointDecision, type CheckpointRecord, type HandoffReason } from './agents/checkpoint.js';
 import { RequestAllowance, planningCallLimit, resolveToolBudget } from './agents/allowance.js';
 import { TaskStore } from './workspace/task.js';
 import { PlanStore, compactPlan, planNotice, planText } from './workspace/plan.js';
@@ -79,7 +80,11 @@ export interface HostDependencies {
   onReasoning?: (text: string) => void;
   /** Asked when search is granted mid-request but unusable; without it the request goes on without search. */
   continueWithoutSearch?: (message: string) => Promise<boolean>;
+  /** Asked at each checkpoint; without it, work continues. Surfaces should not hold it open for long. */
+  onCheckpoint?: (checkpoint: CheckpointView, signal?: AbortSignal) => Promise<CheckpointDecision>;
 }
+/** A checkpoint as surfaces show it: a title and a few lines, with the full record behind details. */
+export interface CheckpointView { record: CheckpointRecord; title: string; lines: string[]; details: string }
 
 export async function runHost(config: Config, request: HostRequest, dependencies: HostDependencies): Promise<HostResult> {
   if (config.routingMode === 'direct' && !request.workload && !request.authorization) throw new Error('Direct routing requires teapilot ask or teapilot code.');
@@ -118,6 +123,10 @@ export async function runHost(config: Config, request: HostRequest, dependencies
   // URLs the user wrote or earlier tools returned may be read; anything the model composes may not.
   const web = new WebController(config, { event: (type, fields) => telemetry.event(type, fields) });
   const recovery = new RequestRecovery();
+  // Checkpoints need an orchestrator that keeps working; side questions and read-only proposals never hand off.
+  const checkpointLimit = config.policy.limits.maxCheckpoints ?? 3;
+  const workflow = checkpointLimit > 0 && !request.side && !request.readOnly
+    ? Workflow.open(requestId, checkpointLimit, request.scratch && config.scratchpad?.enabled !== false ? request.scratch : undefined) : undefined;
   let task: TaskStore | undefined;
   let skillCatalog: SkillCatalog | undefined;
   let taskId = request.taskId ?? requestId;
@@ -399,9 +408,15 @@ export async function runHost(config: Config, request: HostRequest, dependencies
         skillCatalog = await skillCache(config.stateDir).catalog(settings, preferences, request.signal);
         for (const warning of skillCatalog.warnings) dependencies.onProgress?.(warning);
       }
-      previous = await runAttempt({
-        allowance: recovery.allowance ??= new RequestAllowance({ calls: request.readOnly ? Math.min(config.policy.limits.maxToolCalls, config.policy.limits.planningToolCalls ?? planningCallLimit) : config.policy.limits.maxToolCalls, modelCalls: config.policy.limits.maxTurns * (config.policy.escalation.maxEscalations + 1), timeoutMs: config.policy.limits.attemptTimeoutMs * (config.policy.escalation.maxEscalations + 1), delegations: config.policy.limits.maxJuniorTurns ?? 6 }, task, resolveToolBudget(config, { readOnly: request.readOnly, casual, side: request.side })),
-        config, skillCatalog, workload, tier, cwd, web: request.authorization ? activePermissions.includes('web.search') : Boolean(request.web), budget, telemetry, recovery, task, taskId: task ? taskId : undefined, readOnly: request.readOnly,
+      const flow = workflow && !casual && modelFor(config, tier).toolCalling ? workflow : undefined;
+      // With checkpoints the orchestrator's window ends in a handoff, not a request to approve another batch.
+      const budgetLimits = { ...resolveToolBudget(config, { readOnly: request.readOnly, casual, side: request.side }), ...(flow ? { maxContinuationBatches: 0 } : {}) };
+      // A parked workflow is offered to this request's first orchestrator; the person's message decides whether it resumes.
+      const parked = !previous && flow?.parked ? `${continuation(flow.parked, true)}\n\n[the person's new message follows. continue the parked workflow only if it asks you to.]\n\n` : '';
+      if (parked && flow?.parked) { flow.save({ ...flow.parked, status: 'resumed' }); flow.parked = undefined; }
+      const attempt = (prompt: string, resume: Resume | undefined) => runAttempt({
+        allowance: recovery.allowance ??= new RequestAllowance({ calls: request.readOnly ? Math.min(config.policy.limits.maxToolCalls, config.policy.limits.planningToolCalls ?? planningCallLimit) : config.policy.limits.maxToolCalls, modelCalls: config.policy.limits.maxTurns * (config.policy.escalation.maxEscalations + 1), timeoutMs: config.policy.limits.attemptTimeoutMs * (config.policy.escalation.maxEscalations + 1), delegations: config.policy.limits.maxJuniorTurns ?? 6 }, task, budgetLimits),
+        workflow: flow, config, skillCatalog, workload, tier, cwd, web: request.authorization ? activePermissions.includes('web.search') : Boolean(request.web), budget, telemetry, recovery, task, taskId: task ? taskId : undefined, readOnly: request.readOnly,
         mode: request.mode, conversational: request.conversational, side: request.side, casual, authorization: request.authorization, access: request.access, play: request.play, workspace: request.workspace,
         currentRequest: userRequest,
         expectsPlan: request.planAction === 'new' || request.planAction === 'revise',
@@ -425,20 +440,40 @@ export async function runHost(config: Config, request: HostRequest, dependencies
           await telemetry.event('approval', { kind: approval.kind, approved });
           return approved;
         },
-        signal: request.signal, resume, images,
-        prompt: resume ? resumeNotice(config, previousTier!, tier, previous!.reason)
-          : basePrompt + (previous ? `\nPrevious attempt stopped: ${previous.reason}. ${previous.changedFiles?.length || previous.shellRan ? 'Existing edits are still in the repository; inspect them before proceeding. Do not restart blindly.' : 'It changed no files; continue the task from the context below.'}\nRecent execution context:\n${previous.handoff ?? previous.text.slice(-6000)}` : ''),
+        signal: request.signal, resume, images, prompt,
       });
-      previousTier = tier;
-      check = previous.check;
-      for (const path of previous.changedFiles ?? []) changedFiles.add(path);
-      for (const [path, size] of Object.entries(previous.fileSizes ?? {})) fileSizes.set(path, size);
-      for (const failed of previous.failedCalls ?? []) failedCalls.set(`${failed.call}\n${failed.error}`, failed);
-      shellRan ||= Boolean(previous.shellRan);
-      // A later attempt in the same request gains nothing from searching a dead or exhausted service again.
-      if (previous.searchExhausted) {
-        searchDisabled = true;
-        if (activePermissions.includes('web.search')) activePermissions.splice(activePermissions.indexOf('web.search'), 1);
+      previous = await attempt(resume ? resumeNotice(config, previousTier!, tier, previous!.reason)
+        : parked + basePrompt + (previous ? `\nPrevious attempt stopped: ${previous.reason}. ${previous.changedFiles?.length || previous.shellRan ? 'Existing edits are still in the repository; inspect them before proceeding. Do not restart blindly.' : 'It changed no files; continue the task from the context below.'}\nRecent execution context:\n${previous.handoff ?? previous.text.slice(-6000)}` : ''), resume);
+      // Each checkpoint hands the request to a fresh orchestrator on the same tier, with renewed limits and no routing.
+      for (;;) {
+        previousTier = tier;
+        check = previous.check;
+        for (const path of previous.changedFiles ?? []) changedFiles.add(path);
+        for (const [path, size] of Object.entries(previous.fileSizes ?? {})) fileSizes.set(path, size);
+        for (const failed of previous.failedCalls ?? []) failedCalls.set(`${failed.call}\n${failed.error}`, failed);
+        shellRan ||= Boolean(previous.shellRan);
+        // A later attempt in the same request gains nothing from searching a dead or exhausted service again.
+        if (previous.searchExhausted) {
+          searchDisabled = true;
+          if (activePermissions.includes('web.search')) activePermissions.splice(activePermissions.indexOf('web.search'), 1);
+        }
+        const record = flow && !request.signal?.aborted && !accessFailure ? previous.checkpoint ?? await forcedCheckpoint(flow, previous) : undefined;
+        if (!record) break;
+        const view: CheckpointView = { record, ...checkpointCard(record), details: checkpointDetails(record, flow!.path(record)) };
+        dependencies.onEvent?.({ type: 'checkpoint', generation: record.generation, title: view.title, lines: view.lines, forced: record.host.forced });
+        const decision: CheckpointDecision = await dependencies.onCheckpoint?.(view, request.signal).catch(() => ({ action: 'continue' as const })) ?? { action: 'continue' };
+        await telemetry.event('checkpoint_decision', { generation: record.generation, action: decision.action, forced: record.host.forced });
+        if (request.signal?.aborted) return await finish(false, 'cancelled', 'Request cancelled.');
+        if (decision.action === 'stop') {
+          flow!.save({ ...record, status: 'parked' });
+          return await finish(false, 'parked', `parked at checkpoint ${record.generation}. ask to continue it whenever you're ready.`);
+        }
+        if (decision.action === 'steer') { record.steer = decision.text.trim().slice(0, 2000); flow!.save(record); }
+        recovery.allowance = undefined;
+        attempts++;
+        models.push(modelFor(config, tier).id);
+        dependencies.onEvent?.({ type: 'attempt_start', attempt: attempts, model: modelFor(config, tier).id, tier, checkpoint: record.generation });
+        previous = await attempt(continuation(record), undefined);
       }
       if (accessFailure) return await finish(false, 'approval_denied', incomplete(previous, accessFailure));
       await telemetry.event('attempt_end', { decisionId: decision?.decision_id, capability: selected, success: previous.success, reason: previous.reason, stopped: previous.stopped, turns: previous.turns, toolCalls: previous.toolCalls, check: previous.check, ...(previous.success ? {} : { ending: previous.ending }) });
@@ -485,6 +520,15 @@ export async function runHost(config: Config, request: HostRequest, dependencies
     await telemetry.event('request_error', { name: error instanceof Error ? error.name : 'Error' });
     throw error;
   } finally { try { await unlock(); } finally { await idle(); dependencies.onActivity?.(undefined); } }
+}
+
+/** The host's own checkpoint, for an orchestrator that ran out without submitting one: its notes are absent, its facts are not. */
+async function forcedCheckpoint(flow: Workflow, attempt: AttemptResult): Promise<CheckpointRecord | undefined> {
+  if (!flow.canCheckpoint) return undefined;
+  const stops: Record<string, HandoffReason> = { timeout: 'time', tool_limit: 'tool_calls', turn_limit: 'model_calls' };
+  const reason = attempt.checkpointMissed?.reason ?? stops[attempt.stopped ?? ''] ?? (attempt.reason === 'turn_limit' ? 'model_calls' : undefined);
+  if (!reason) return undefined;
+  return flow.checkpoint({ reason, forced: true, attempts: attempt.checkpointMissed?.attempts ?? 0 });
 }
 
 /** What a retry on the same model is told: why the last attempt stopped, and what this one has that it lacked. */

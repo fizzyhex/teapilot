@@ -16,6 +16,8 @@ import type { DiscordSettings } from '../../src/discord/settings.js';
 import { viewSource } from 'pretty-send';
 import { MESSAGE_LIMIT, viewSourcePrefix } from '../../src/discord/render.js';
 import { checkFiles, checkMessage, checkModal, componentsV2, DiscordRejected } from './validate.js';
+import type { CheckpointDecision } from '../../src/agents/checkpoint.js';
+import { checkpointDetailsText, checkpointModal, checkpointModalPrefix, checkpointPrefix, checkpointRow, checkpointVerdict, checkpointWaiting, steerHoldMs, type CheckpointButton } from '../../src/discord/checkpoint.js';
 
 type Json = Record<string, unknown>;
 type Row = { type: number; components: Json[] };
@@ -73,6 +75,8 @@ export interface Message {
   approval?: (approved: boolean) => void;
   /** Whitelisted users may answer the approval too, not only operators. */
   approvalUsers?: boolean;
+  /** Set while a checkpoint card waits for continue, steer or stop. */
+  checkpoint?: { nonce: string; details: string; resolve(decision: CheckpointDecision, actor?: string): void; steering(): boolean };
 }
 
 /** A mistake in how the simulator was asked to act, such as clicking a control that does not exist. */
@@ -290,6 +294,27 @@ export class World {
         return posted;
       },
       typing: () => this.emit(`… ${bot.name} is typing in ${channel.name}`),
+      // Like the real gateway (src/discord/checkpoint.ts): it continues by itself unless someone steers or stops.
+      askCheckpoint: (text, details, signal, timeoutMs = 45_000) => {
+        if (signal.aborted) return Promise.resolve({ action: 'continue' as const });
+        const nonce = String(++this.counters.approval);
+        const message = this.post(channel, bot.name, { content: checkpointWaiting(text, timeoutMs), components: [checkpointRow(nonce) as Row] });
+        return new Promise<CheckpointDecision>(resolve => {
+          let timer = setTimeout(() => finish({ action: 'continue' }), timeoutMs);
+          const finish = (decision: CheckpointDecision, actor?: string) => {
+            if (!message.checkpoint) return;
+            message.checkpoint = undefined;
+            clearTimeout(timer);
+            signal.removeEventListener('abort', abort);
+            this.update(message, { content: settle(text, checkpointVerdict(decision, actor)), components: [] });
+            resolve(decision);
+          };
+          const abort = () => finish({ action: 'continue' });
+          message.checkpoint = { nonce, details, resolve: finish,
+            steering: () => { if (!message.checkpoint) return false; clearTimeout(timer); timer = setTimeout(() => finish({ action: 'continue' }), steerHoldMs); return true; } };
+          signal.addEventListener('abort', abort, { once: true });
+        });
+      },
       askApproval: (text, signal, users = false) => {
         if (signal.aborted) return Promise.resolve(false);
         const nonce = ++this.counters.approval;
@@ -376,6 +401,7 @@ export class World {
     if (typeof control.url === 'string') return `${person.name} opened ${control.url}; links never reach teapilot.`;
     const custom = String(control.custom_id);
     if (custom.startsWith('teapilot:')) return this.answerApproval(person, message, custom.endsWith(':approve'));
+    if (custom.startsWith(checkpointPrefix)) return this.pressCheckpoint(person, message, custom.split(':').at(-1) as CheckpointButton);
     if (custom.startsWith('teapilot-plan:')) return this.pressPlan(person, message, custom.slice('teapilot-plan:'.length) as PlanAction);
     if (custom.startsWith(browsePrefix)) return this.pressBrowse(person, message, custom.slice(browsePrefix.length));
     if (custom.startsWith(grantPrefix)) return this.pressGrant(person, message, custom.slice(grantPrefix.length) as Permission);
@@ -394,6 +420,26 @@ export class World {
     this.update(message, { content: settle(message.content, `**${approved ? 'Approved' : 'Denied'}** by <@${person.id}>`), components: [] });
     resolve(approved);
     return `${person.name} ${approved ? 'approved' : 'denied'} ${message.id}.`;
+  }
+
+  /** Like the real gateway: details are private, steer opens a form, and anyone who may use teapilot can answer. */
+  private pressCheckpoint(person: Person, message: Message, action: CheckpointButton): string {
+    const label = `${person.name} clicked [${action}] on ${message.id}.`;
+    const note = (content: string) => `${label}\n${this.render(this.post(message.channel, bot.name, { content }, person.name))}`;
+    const checkpoint = message.checkpoint;
+    if (!checkpoint) return note('this checkpoint has already moved on.');
+    if (action === 'details') return note(checkpointDetailsText(checkpoint.details, MESSAGE_LIMIT));
+    if (!this.operators.includes(person.id) && this.handlers?.allowed?.(person.id) !== true) return note('You are not allowed to use teapilot.');
+    if (action === 'steer') {
+      checkpoint.steering();
+      const payload = checkpointModal(checkpoint.nonce) as ModalPayload;
+      this.check(`the form on ${message.id}`, () => checkModal(payload));
+      this.forms.set(person.name, { message, payload });
+      this.emit(`${person.name} opened form "${payload.title}" from ${message.id}`);
+      return `${label}\n${person.name} sees a form:\n${this.renderForm(payload)}`;
+    }
+    checkpoint.resolve({ action: action === 'stop' ? 'stop' : 'continue' }, person.id);
+    return label;
   }
 
   /** Like the real gateway: the buttons edit the plan in place, and only a refusal is said, privately. Request change opens a form. */
@@ -509,6 +555,13 @@ ${this.render(this.post(message.channel, bot.name, { content: note }, person.nam
     }
     this.forms.delete(person.name);
     if (form.payload.custom_id.startsWith(browseModalPrefix)) return this.submitBrowse(person, form, fields[String(inputs[0]!.custom_id)] ?? '');
+    if (form.payload.custom_id.startsWith(checkpointModalPrefix)) {
+      const text = (fields.steer ?? '').trim();
+      const checkpoint = form.message.checkpoint;
+      if (!checkpoint) return `${person.name} submitted "${form.payload.title}", but the checkpoint had already moved on.`;
+      checkpoint.resolve(text ? { action: 'steer', text } : { action: 'continue' }, person.id);
+      return `${person.name} submitted "${form.payload.title}" on ${form.message.id}.`;
+    }
     if (form.payload.custom_id.startsWith('teapilot-plan-modal:')) {
       const controls = this.plans.get(form.message.id);
       const note = controls ? controls.press('change', { id: person.id, name: person.name }, fields[planModal.field] ?? '') : 'This plan is no longer available: teapilot restarted since, or it was replaced.';

@@ -1,7 +1,8 @@
 import { layout, type Message as AnswerMessage, type Resolved } from 'pretty-send';
 import { casualLines, paceLines } from '../casual.js';
 import { runSession, type SessionExtension } from '../chat.js';
-import type { HostDependencies, HostRequest, HostResult } from '../host.js';
+import type { CheckpointView, HostDependencies, HostRequest, HostResult } from '../host.js';
+import type { CheckpointDecision } from '../agents/checkpoint.js';
 import { formatInterruption } from '../interruption.js';
 import { repositoryOffered, repositoryPermissions } from '../execution/grants.js';
 import type { Approval, Approve } from '../execution/policy.js';
@@ -32,6 +33,8 @@ export interface DiscordTransport {
   askApproval(text: string, signal: AbortSignal, users?: boolean): Promise<boolean>;
   /** Continuation batches auto-approve after a short response window; absent transports fail closed. */
   askContinuationBudget?(text: string, signal: AbortSignal, timeoutMs?: number): Promise<'approved' | 'denied' | 'auto-approved'>;
+  /** A checkpoint card: continue, steer (a form), stop, and private details. Continues by itself after `timeoutMs`. */
+  askCheckpoint?(text: string, details: string, signal: AbortSignal, timeoutMs?: number): Promise<CheckpointDecision>;
   typing(): void;
   /** Posts files as attachments, with a line of text. */
   sendFiles?(text: string, files: Array<{ name: string; data: Buffer }>): Promise<string>;
@@ -70,7 +73,7 @@ export interface ConversationOptions {
   request: HostRequest;
   maxPromptChars: number;
   queue: TurnQueue;
-  run: (request: HostRequest, dependencies: Pick<HostDependencies, 'approve' | 'onEvent' | 'onReasoning'>) => Promise<HostResult>;
+  run: (request: HostRequest, dependencies: Pick<HostDependencies, 'approve' | 'onEvent' | 'onReasoning' | 'onCheckpoint'>) => Promise<HostResult>;
   redact: (text: string) => string;
   /** Operator log in the terminal running teapilot discord start. */
   log: (text: string) => void;
@@ -79,6 +82,8 @@ export interface ConversationOptions {
   /** Answer one message and end, for transports that cannot receive follow-ups. */
   once?: boolean;
   approvalTimeoutMs?: number;
+  /** How long a checkpoint card waits before work continues by itself. */
+  checkpointTimeoutMs?: number;
   progressIntervalMs?: number;
   /** How often a running turn's status card moves on by itself. */
   heartbeatMs?: number;
@@ -201,6 +206,17 @@ export class Conversation {
       signal?.addEventListener('abort', closed, { once: true });
       this.waiting = { resolve: text => { signal?.removeEventListener('abort', closed); resolve(text); }, reject };
     });
+  };
+
+  /** Checkpoints show what is objectively done and let anyone here steer or stop; silence continues the work. */
+  private checkpoint = async (view: CheckpointView, signal?: AbortSignal): Promise<CheckpointDecision> => {
+    const ask = this.options.transport.askCheckpoint;
+    if (!ask) return { action: 'continue' };
+    const text = this.options.redact(`**${view.title}**\n${view.lines.map(line => `-# ${line}`).join('\n')}`);
+    const signals = [this.options.request.signal, this.turn?.signal, signal].filter((value): value is AbortSignal => Boolean(value));
+    const decision = await ask(text, this.options.redact(view.details), AbortSignal.any(signals), this.options.checkpointTimeoutMs ?? 45_000);
+    this.options.log(`${this.options.key}: checkpoint ${view.record.generation} ${decision.action}`);
+    return decision;
   };
 
   // Only operators may answer approvals, so only an operator's message can approve everything up front.
@@ -402,7 +418,7 @@ export class Conversation {
         signal.throwIfAborted();
         if (typed) this.options.transport.typing();
         if (!answerOnly && card.set('thinking') === 'queued') refresh();
-        return await this.options.run({ ...request, signal }, { approve: this.approve, onEvent: this.onEvent, onReasoning: this.onReasoning });
+        return await this.options.run({ ...request, signal }, { approve: this.approve, onEvent: this.onEvent, onReasoning: this.onReasoning, onCheckpoint: this.checkpoint });
       }, () => { if (answerOnly) void this.say('Queued behind another task.'); else { card.set('queued'); refresh(); } });
     } catch (error) {
       const stopped = turn.signal.aborted;
