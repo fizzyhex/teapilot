@@ -293,6 +293,17 @@ it('selects individual skills, disables whole sets, and resets inheritance expli
   await store.command('offline on', caller); await expect(store.command('update', caller)).rejects.toThrow('offline');
 });
 
+it('suggests chosen and starter sets, and cached skills only for actions that take one', async () => {
+  const f = await setup(), store = new SkillStore(f.config.stateDir, f.settings, f.cache), caller = { userId: 'user', conversation: 'solo', operator: false };
+  await store.command('add gh:someone/custom', caller);
+  expect(await store.suggest('update', '', caller)).toEqual([starterSets[0], 'gh:someone/custom', starterSets[1]]);
+  expect(await store.suggest('enable', 'exam', caller)).toEqual([]);
+  await f.cache.refresh({ source: starterSets[1] });
+  expect(await store.suggest('enable', 'EXAM', caller)).toEqual([`${starterSets[1]}::example`]);
+  expect(await store.suggest('list', 'exam', caller)).toEqual([]);
+  expect(f.transport.revision).toHaveBeenCalledTimes(1);
+});
+
 it('does not silently overwrite damaged selections and bounds the number of selected sets', async () => {
   const f = await setup(), store = new SkillStore(f.config.stateDir, f.settings, f.cache);
   expect(() => normalizeSets(Array.from({ length: 17 }, (_, index) => ({ source: `gh:owner/repo${index}` })))).toThrow('at most');
@@ -305,6 +316,8 @@ it('registers Discord skill controls everywhere and preserves targets and scopes
   expect(commandDefinitions.find(command => command.name === 'skills')).toMatchObject({ integration_types: [0, 1], contexts: [0, 1, 2] });
   expect(commandText('skills', 'enable', 'gh:anthropics/skills::pdf', 'personal')).toBe('/skills enable gh:anthropics/skills::pdf personal');
   expect(commandText('skills', 'offline', 'on', 'global')).toBe('/skills offline on global');
+  expect(commandText('skills', 'enable')).toBe('/skills enable');
+  expect(commandDefinitions.find(command => command.name === 'skills')).toMatchObject({ options: expect.arrayContaining([expect.objectContaining({ name: 'enable', options: expect.arrayContaining([expect.objectContaining({ name: 'target', autocomplete: true })]) })]) });
 });
 
 it('routes private Discord choices through real requests, isolates users, and restores choices after restart', async () => {

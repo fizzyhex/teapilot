@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { replaceFileSync } from '../replace.js';
 import { relativeSkillPath } from '../workspace/skills.js';
 import { skillCache, type SkillCache } from './cache.js';
-import { defaultSkillSets, normalizeSets, preferencesSchema, repositorySource, starterSets, type SkillPreferences, type SkillSet, type SkillSettings } from './settings.js';
+import { defaultSkillSets, maxSkillSets, normalizeSets,preferencesSchema, repositorySource, starterSets, type SkillPreferences, type SkillSet, type SkillSettings } from './settings.js';
 
 export const skillScopes = ['conversation', 'personal', 'global'] as const;
 export type SkillScope = typeof skillScopes[number];
@@ -126,6 +126,22 @@ export class SkillStore {
       lines.push(...catalog.warnings);
     }
     return lines.join('\n');
+  }
+  /** Targets to offer as /skills is typed: chosen and starter sets, plus their cached skills for actions that take one. Never waits on the network. */
+  async suggest(action: string, typed: string, caller: SkillCaller, signal?: AbortSignal): Promise<string[]> {
+    if (!this.settings.enabled || this.settings.directory) return [];
+    const data = this.load();
+    const preferences = (caller.conversation && data.conversations[caller.conversation]) || { ...this.defaults(data), ...(caller.userId ? data.personal[caller.userId] : {}) };
+    const sets = new Map<string, SkillSet>();
+    for (const { include: _include, exclude: _exclude, ...set } of [...normalizeSets(preferences.sets ?? defaultSkillSets()), ...starterSets.map((source): SkillSet => ({ source }))]) {
+      const id = repositorySource(set).id;
+      if (!sets.has(id) && sets.size < maxSkillSets) sets.set(id, set);
+    }
+    const skills = ['enable', 'add', 'disable', 'remove'].includes(action)
+      ? (await this.cache.catalog({ ...this.settings, offline: true }, { sets: [...sets.values()] }, signal)).skills.map(skill => skill.id)
+      : [];
+    const needle = typed.trim().toLowerCase();
+    return [...sets.keys(), ...skills].filter(id => id.toLowerCase().includes(needle));
   }
 }
 

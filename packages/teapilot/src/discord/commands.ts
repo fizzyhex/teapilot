@@ -53,7 +53,7 @@ const subcommand = (name: string, description: string, options?: Option[]) => ({
 export const commandDefinitions: CommandDefinition[] = [
   { name: 'skills', description: 'Choose repository skill sets and individual skills', options: [
     ...['list', 'enable', 'disable', 'add', 'remove', 'update'].map(action => subcommand(action, `${action} skill sets or skills`, [
-      { type: 3, name: 'target', description: 'gh:owner/repo, optionally #revision or ::skill', required: ['enable', 'disable', 'add', 'remove'].includes(action) } as Option,
+      { type: 3, name: 'target', description: 'gh:owner/repo, optionally #revision or ::skill', required: ['enable', 'disable', 'add', 'remove'].includes(action), autocomplete: true } as Option,
       optional('scope', 'Where to keep this choice', skillScopes),
     ])),
     subcommand('offline', 'Use cached skill sets without network requests', [value('Offline mode', ['on', 'off']), optional('scope', 'Where to keep this choice', skillScopes)]),

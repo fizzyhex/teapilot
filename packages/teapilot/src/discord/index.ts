@@ -435,12 +435,18 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
     }
     await command.respond('no active conversation here. send a message to start one.');
   };
-  /** Folders of the workspace /workspace tree is about to show, for Discord to offer as they are typed. */
+  /** Folders for /workspace tree and sets or skills for /skills, for Discord to offer as they are typed. */
   const handleComplete = async (completion: GatewayCompletion): Promise<void> => {
-    if (completion.text !== '/workspace tree' || completion.authorIsBot || !allowed(completion.authorId)) { await completion.respond([]); return; }
+    const skills = /^\/skills (\S+)$/.exec(completion.text);
+    if (!(skills || completion.text === '/workspace tree') || completion.authorIsBot || !allowed(completion.authorId)) { await completion.respond([]); return; }
     const target = route(completion, settings, allowed);
     const seat = seats.seat(completion.channelId, completion.authorId);
     const key = seat ? historyKeyOf(completion.channelId, completion.authorId, seat) : target?.key || undefined;
+    if (skills) {
+      const caller = { conversation: key, userId: completion.authorId, operator: access.roleOf(completion.authorId) === 'operator' };
+      await completion.respond(await skillStore.suggest(skills[1]!, completion.typed, caller, signal).catch(() => []));
+      return;
+    }
     const typed = completion.typed.replace(/\\/g, '/').toLowerCase();
     await completion.respond(key ? files.folders(key).filter(folder => folder.toLowerCase().includes(typed)) : []);
   };
