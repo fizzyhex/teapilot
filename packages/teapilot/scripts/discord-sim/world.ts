@@ -17,7 +17,7 @@ import { viewSource } from 'pretty-send';
 import { MESSAGE_LIMIT, viewSourcePrefix } from '../../src/discord/render.js';
 import { checkFiles, checkMessage, checkModal, componentsV2, DiscordRejected } from './validate.js';
 import type { CheckpointDecision } from '../../src/agents/checkpoint.js';
-import { checkpointDetailsText, checkpointModal, checkpointModalPrefix, checkpointPrefix, checkpointRow, checkpointVerdict, checkpointWaiting, steerHoldMs, type CheckpointButton } from '../../src/discord/checkpoint.js';
+import { checkpointDetailsText, checkpointModal, checkpointWaitMs, checkpointModalPrefix, checkpointPrefix, checkpointRow, checkpointVerdict, checkpointWaiting, steerHoldMs, type CheckpointButton } from '../../src/discord/checkpoint.js';
 
 type Json = Record<string, unknown>;
 type Row = { type: number; components: Json[] };
@@ -295,7 +295,7 @@ export class World {
       },
       typing: () => this.emit(`… ${bot.name} is typing in ${channel.name}`),
       // Like the real gateway (src/discord/checkpoint.ts): it continues by itself unless someone steers or stops.
-      askCheckpoint: (text, details, signal, timeoutMs = 45_000) => {
+      askCheckpoint: (text, details, signal, timeoutMs = checkpointWaitMs) => {
         if (signal.aborted) return Promise.resolve({ action: 'continue' as const });
         const nonce = String(++this.counters.approval);
         const message = this.post(channel, bot.name, { content: checkpointWaiting(text, timeoutMs), components: [checkpointRow(nonce) as Row] });

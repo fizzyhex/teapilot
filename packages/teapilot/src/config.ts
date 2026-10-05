@@ -72,8 +72,8 @@ export const policySchema = z.object({
     /** delegate_task messages one attempt may send to its juniors (agents/delegate.ts); 6 when unset. */
      maxJuniorTurns: z.number().int().min(0).max(30).optional(), planningToolCalls: z.number().int().min(1).max(300).optional(),
      instructorToolCalls: z.number().int().min(1).max(300).optional(), juniorToolCalls: z.number().int().min(1).max(300).optional(), maxContinuationBatches: z.number().int().min(0).max(10).optional(),
-     /** Fresh orchestrators one request may hand off to (agents/checkpoint.ts); 0 turns checkpoints off. */
-     maxCheckpoints: z.number().int().min(0).max(20).optional() }).strict(),
+     /** Fresh orchestrators one request may hand off to (agents/checkpoint.ts); unlimited when unset, 0 turns checkpoints off. */
+     maxCheckpoints: z.number().int().min(0).optional() }).strict(),
   escalation: z.object({ maxEscalations: z.number().int().min(0).max(3), consecutiveFailures: z.number().int().min(1).max(10), repeatedToolCalls: z.number().int().min(2).max(10) }).strict(),
   execution: z.object({ trustedCommands: z.array(z.string().min(1)), largeOverwriteBytes: z.number().int().min(1) }).strict(),
   /** deepEffort: the reasoning level the deep tier runs (medium unless xhigh is opted into). */

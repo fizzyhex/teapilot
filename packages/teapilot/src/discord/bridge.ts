@@ -3,6 +3,7 @@ import { casualLines, paceLines } from '../casual.js';
 import { runSession, type SessionExtension } from '../chat.js';
 import type { CheckpointView, HostDependencies, HostRequest, HostResult } from '../host.js';
 import type { CheckpointDecision } from '../agents/checkpoint.js';
+import { checkpointWaitMs } from './checkpoint.js';
 import { formatInterruption } from '../interruption.js';
 import { repositoryOffered, repositoryPermissions } from '../execution/grants.js';
 import type { Approval, Approve } from '../execution/policy.js';
@@ -214,7 +215,7 @@ export class Conversation {
     if (!ask) return { action: 'continue' };
     const text = this.options.redact(`**${view.title}**\n${view.lines.map(line => `-# ${line}`).join('\n')}`);
     const signals = [this.options.request.signal, this.turn?.signal, signal].filter((value): value is AbortSignal => Boolean(value));
-    const decision = await ask(text, this.options.redact(view.details), AbortSignal.any(signals), this.options.checkpointTimeoutMs ?? 45_000);
+    const decision = await ask(text, this.options.redact(view.details), AbortSignal.any(signals), this.options.checkpointTimeoutMs ?? checkpointWaitMs);
     this.options.log(`${this.options.key}: checkpoint ${view.record.generation} ${decision.action}`);
     return decision;
   };

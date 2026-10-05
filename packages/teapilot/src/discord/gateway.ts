@@ -17,7 +17,7 @@ import { browserLink, parseCustomId, playPrefix, type MessagePayload } from './p
 import type { PlayInteraction, PlaySurface } from './play/runtime.js';
 import type { DiscordSettings } from './settings.js';
 import type { CheckpointDecision } from '../agents/checkpoint.js';
-import { checkpointDetailsText, checkpointModal, checkpointModalPrefix, checkpointPrefix, checkpointRow, checkpointVerdict, checkpointWaiting, steerHoldMs } from './checkpoint.js';
+import { checkpointDetailsText, checkpointModal, checkpointWaitMs, checkpointModalPrefix, checkpointPrefix, checkpointRow, checkpointVerdict, checkpointWaiting, steerHoldMs } from './checkpoint.js';
 import { browserMenu } from './commands.js';
 
 /** How far the Reply menu follows a message's replies back, and how long it may spend fetching them. */
@@ -343,7 +343,7 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       typing() { void channel.sendTyping().catch(noop); },
       askApproval: (text, signal, users = false) => askApproval(text, signal, users, payload => channel.send(payload), async (id, payload) => (sent.get(id) ?? await channel.messages.fetch(id)).edit(payload)),
       askContinuationBudget: (text, signal, timeoutMs = 45_000) => askContinuationBudget(text, signal, timeoutMs, payload => channel.send(payload), async (id, payload) => (sent.get(id) ?? await channel.messages.fetch(id)).edit(payload)),
-      askCheckpoint: (text, details, signal, timeoutMs = 45_000) => askCheckpoint(text, details, signal, timeoutMs, payload => channel.send(payload), async (id, payload) => (sent.get(id) ?? await channel.messages.fetch(id)).edit(payload)),
+      askCheckpoint: (text, details, signal, timeoutMs = checkpointWaitMs) => askCheckpoint(text, details, signal, timeoutMs, payload => channel.send(payload), async (id, payload) => (sent.get(id) ?? await channel.messages.fetch(id)).edit(payload)),
     };
   };
 
@@ -396,7 +396,7 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       typing: noop,
       askApproval: (text, signal, users = false) => askApproval(text, signal, users, async payload => ({ id: await feed.post(payload) }), (id, payload) => feed.revise(id, payload)),
       askContinuationBudget: (text, signal, timeoutMs = 45_000) => askContinuationBudget(text, signal, timeoutMs, async payload => ({ id: await feed.post(payload) }), (id, payload) => feed.revise(id, payload)),
-      askCheckpoint: (text, details, signal, timeoutMs = 45_000) => askCheckpoint(text, details, signal, timeoutMs, async payload => ({ id: await feed.post(payload) }), (id, payload) => feed.revise(id, payload)),
+      askCheckpoint: (text, details, signal, timeoutMs = checkpointWaitMs) => askCheckpoint(text, details, signal, timeoutMs, async payload => ({ id: await feed.post(payload) }), (id, payload) => feed.revise(id, payload)),
       // The runtime stops editing through this interaction once it expires, and uses the app's clicks after that.
       async postApp(payload) {
         if (!feed.live) throw new Error('Discord has stopped the updates of this reply; press Resume on its status card first.');

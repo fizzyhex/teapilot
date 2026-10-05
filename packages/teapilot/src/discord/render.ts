@@ -65,8 +65,12 @@ export function elapsed(ms: number): string {
  * previews the reasoning or answer being written in small text. `summary` collapses it to one line, and
  * `details` is the whole log for whoever asks.
  */
+const taskIcons: Record<string, string> = { open: '♟️', running: '♟️', awaiting_verification: '🔎', blocked: '⛔' };
+
 export class StatusCard {
   private readonly steps: Step[] = [];
+  /** Delegated tasks by id; those not yet verified or cancelled show under the header. */
+  private readonly tasks = new Map<string, { label: string; junior?: string; state: string }>();
   private phase: CardPhase = 'thinking';
   private running?: string;
   private answer = '';
@@ -90,6 +94,10 @@ export class StatusCard {
     if (event.type === 'compaction_start') { this.phase = 'compacting'; return true; }
     if (event.type === 'compaction' || event.type === 'compaction_failed') { this.phase = 'thinking'; this.steps.push({ note: this.redact(describeCompaction(event)) }); return true; }
     if (event.type === 'tip') { this.steps.push({ note: describeTip(event) }); return true; }
+    if (event.type === 'task' && typeof event.id === 'string') {
+      this.tasks.set(event.id, { label: this.redact(String(event.label ?? '')), junior: typeof event.junior === 'string' ? event.junior : undefined, state: String(event.state) });
+      return true;
+    }
     return false;
   }
   /** Reasoning as it streams. Returns whether the card changed. */
@@ -116,7 +124,9 @@ export class StatusCard {
       : this.phase === 'thinking' && last && 'reasoning' in last && last.reasoning.trim() ? `-# 💭 ${escapeMarkdown(tail(last.reasoning, 160))}` : undefined;
     const tools = this.steps.flatMap(step => 'reasoning' in step ? [] : [line(step)]).map(step => step.replace(/\s+/g, ' ').trim()).map(text => `-# ${escapeMarkdown(text.length > 150 ? `${text.slice(0, 147)}...` : text)}`);
     let shown = tools.slice(-(this.options.maxSteps ?? 8));
-    const compose = () => [header, ...(tools.length > shown.length ? [`-# … ${tools.length - shown.length} earlier`] : []), ...shown, ...(preview ? [preview] : [])].join('\n');
+    const ongoing = [...this.tasks].filter(([, task]) => task.state !== 'verified' && task.state !== 'cancelled')
+      .map(([id, task]) => `-# ${taskIcons[task.state] ?? '♟️'} ${id} ${escapeMarkdown(task.label.slice(0, 60))}${task.junior ? ` · ${escapeMarkdown(task.junior)}` : ''} · ${task.state.replaceAll('_', ' ')}`);
+    const compose = () => [header, ...ongoing, ...(tools.length > shown.length ? [`-# … ${tools.length - shown.length} earlier`] : []), ...shown, ...(preview ? [preview] : [])].join('\n');
     while (shown.length && compose().length > MESSAGE_LIMIT) shown = shown.slice(1);
     return compose().slice(0, MESSAGE_LIMIT);
   }

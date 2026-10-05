@@ -1,4 +1,4 @@
-import { expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { route, type IncomingMessage } from '../src/discord/access.js';
 import { quoteMessage, StatusCard, throttle } from '../src/discord/render.js';
 import { readDiscordSettings } from '../src/discord/settings.js';
@@ -132,4 +132,19 @@ it('lists a tip among the steps as a light bulb and its name', () => {
   card.push({ type: 'tool_execution_end', tool: 'write', path: 'bot.py' });
   expect(card.push({ type: 'tip', name: 'useJavascript' })).toBe(true);
   expect(card.render()).toBe('🫖 thinking. · 0s\n-# write bot.py\n-# 💡 useJavascript');
+});
+
+describe('status card tasks', () => {
+  it('lists delegated tasks while they are in progress, and drops them once settled', () => {
+    const card = new StatusCard(text => text, { now: () => 0 });
+    expect(card.push({ type: 'task', id: 't1', label: 'level data', junior: 'junior-alfa', state: 'running' })).toBe(true);
+    card.push({ type: 'task', id: 't2', label: 'controls', junior: 'junior-bravo', state: 'blocked' });
+    expect(card.render()).toContain('-# ♟️ t1 level data · junior-alfa · running');
+    expect(card.render()).toContain('-# ⛔ t2 controls · junior-bravo · blocked');
+    card.push({ type: 'task', id: 't1', label: 'level data', junior: 'junior-alfa', state: 'awaiting_verification' });
+    expect(card.render()).toContain('-# 🔎 t1 level data · junior-alfa · awaiting verification');
+    card.push({ type: 'task', id: 't1', label: 'level data', junior: 'junior-alfa', state: 'verified' });
+    card.push({ type: 'task', id: 't2', label: 'controls', junior: 'junior-bravo', state: 'cancelled' });
+    expect(card.render()).not.toMatch(/t1|t2/);
+  });
 });

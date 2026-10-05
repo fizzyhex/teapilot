@@ -29,5 +29,8 @@ export function checkpointVerdict(decision: CheckpointDecision, actor?: string):
 /** Details are private and stay inside one message. */
 export const checkpointDetailsText = (details: string, limit: number) => `\`\`\`\n${details.slice(0, limit - 8)}\n\`\`\``;
 
+/** How long a card waits before the work continues by itself. */
+export const checkpointWaitMs = 200_000;
+
 /** Writing a direction takes longer than the card waits: steering holds it, though never for more than this. */
 export const steerHoldMs = 5 * 60_000;

@@ -48,6 +48,9 @@ describe('workflow state', () => {
     expect(result.content[0]).toMatchObject({ text: expect.stringContaining('verified - checked the level file') });
     expect(() => flow.move('t1', 'running')).toThrow(/final/);
     expect(flow.taskOf('junior-alfa')).toBeUndefined();
+    // A junior that reported itself stuck may still have finished: its orchestrator can verify it directly.
+    const stuck = flow.openTask('controls', 'junior-bravo'); flow.move(stuck.id, 'running'); flow.move(stuck.id, 'blocked');
+    expect(flow.move(stuck.id, 'verified').state).toBe('verified');
     await expect(tool.execute('y', { task: 't9', state: 'cancelled' })).rejects.toThrow(/no task t9/);
   });
 
@@ -71,7 +74,7 @@ describe('workflow state', () => {
     expect(checkpointCard(record)).toMatchObject({ title: 'checkpoint 1 · out of time (forced)', lines: expect.arrayContaining(['⚠ 3 operations with unknown outcome']) });
   });
 
-  it('records commits since the workflow began and the working tree, from git itself', async () => {
+  it('records each checkpoint\'s own commits and the working tree, from git itself', async () => {
     const root = await folder();
     const git = (...args: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: root });
     git('init', '-q', '-b', 'main'); await writeFile(join(root, 'a.txt'), 'a'); git('add', '-A'); git('commit', '-qm', 'start');
@@ -87,6 +90,43 @@ describe('workflow state', () => {
     const text = continuation(record);
     // Host facts come before the agent's words, which are labelled as guidance.
     expect(text.indexOf('objective state (host-recorded)')).toBeLessThan(text.indexOf("previous agent's handoff (guidance, not fact)"));
+    // The next checkpoint shows only what was committed after this one, on its card too.
+    git('add', '-A'); git('commit', '-qm', 'add controls');
+    const second = await flow.checkpoint({ reason: 'tool_calls', forced: true, attempts: 0 });
+    expect(second.host.git!.commits).toHaveLength(1);
+    expect(second.host.git!.commits[0]).toContain('add controls');
+    expect(second.host.git!.base).toBe(record.host.git!.head);
+    expect(checkpointCard(second).lines).toContain(`commits: 1 new (${second.host.git!.head})`);
+    const quiet = await flow.checkpoint({ reason: 'tool_calls', forced: true, attempts: 0 });
+    expect(quiet.host.git!.commits).toEqual([]);
+    expect(checkpointCard(quiet).lines).toContain(`commits: none new (${quiet.host.git!.head})`);
+  });
+
+  it('counts commits from where a parked checkpoint left off', async () => {
+    const root = await folder(), scratch = await folder();
+    const git = (...args: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: root });
+    git('init', '-q', '-b', 'main'); await writeFile(join(root, 'a.txt'), 'a'); git('add', '-A'); git('commit', '-qm', 'start');
+    const flow = new Workflow('r1', Infinity, scratch);
+    await flow.useRoot(root);
+    await writeFile(join(root, 'b.txt'), 'b'); git('add', '-A'); git('commit', '-qm', 'before parking');
+    const parked = await flow.checkpoint({ reason: 'time', forced: true, attempts: 0 });
+    flow.save({ ...parked, status: 'parked' });
+    await writeFile(join(root, 'c.txt'), 'c'); git('add', '-A'); git('commit', '-qm', 'after resuming');
+    const resumed = Workflow.open('r2', Infinity, scratch);
+    await resumed.useRoot(root);
+    const record = await resumed.checkpoint({ reason: 'time', forced: true, attempts: 0 });
+    expect(record.host.git!.commits).toEqual([expect.stringContaining('after resuming')]);
+  });
+
+  it('has no checkpoint cap unless one is configured, and reports every task change', async () => {
+    const changes: string[] = [];
+    const flow = new Workflow('r', Infinity);
+    flow.onTask = task => changes.push(`${task.id}:${task.state}`);
+    for (let index = 0; index < 25; index++) await flow.checkpoint({ reason: 'time', forced: true, attempts: 0 });
+    expect(flow.canCheckpoint).toBe(true);
+    const task = flow.openTask('level data', 'junior-alfa');
+    flow.move(task.id, 'running'); flow.move(task.id, 'awaiting_verification'); flow.move(task.id, 'verified');
+    expect(changes).toEqual(['t1:open', 't1:running', 't1:awaiting_verification', 't1:verified']);
   });
 
   it('writes each generation whole and restores a parked one with its tasks and juniors', async () => {

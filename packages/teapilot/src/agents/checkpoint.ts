@@ -22,7 +22,8 @@ const transitions: Record<TaskState, readonly TaskState[]> = {
   open: ['running', 'blocked', 'cancelled'],
   running: ['awaiting_verification', 'blocked', 'cancelled'],
   awaiting_verification: ['verified', 'blocked', 'cancelled', 'running'],
-  blocked: ['running', 'cancelled'],
+  // A junior can report itself stuck on work that its orchestrator then checks and finds complete.
+  blocked: ['running', 'verified', 'cancelled'],
   verified: [], cancelled: [],
 };
 export const terminalState = (state: TaskState) => !transitions[state].length;
@@ -38,7 +39,8 @@ export type HandoffReason = 'tool_calls' | 'time' | 'context' | 'model_calls';
 
 export interface HostState {
   reason: HandoffReason; forced: boolean; attempts: number;
-  git?: { root: string; branch?: string; head?: string; base?: string; commits: string[]; dirty: string[]; dirtyCount: number };
+  /** `commits` are those since the previous checkpoint (or the workflow's start): `base`, shortened. `headSha` is where the next one counts from. */
+  git?: { root: string; branch?: string; head?: string; headSha?: string; base?: string; commits: string[]; dirty: string[]; dirtyCount: number };
   tasks: WorkTask[];
   failures: Operation[];
   /** Started, but whether they took effect was never confirmed: never retried automatically. */
@@ -90,6 +92,8 @@ export class Workflow {
   private base?: string;
   root?: string;
   generation = 0;
+  /** Told of every task change, for progress displays. */
+  onTask?: (task: WorkTask) => void;
   /** A checkpoint parked by an earlier request, offered to this one's first orchestrator. */
   parked?: CheckpointRecord;
 
@@ -106,7 +110,7 @@ export class Workflow {
     if (parked?.status === 'parked') {
       flow.parked = parked;
       flow.generation = flow.first = parked.generation;
-      flow.base = parked.host.git?.base;
+      flow.base = parked.host.git?.headSha ?? parked.host.git?.base;
       for (const task of parked.host.tasks) flow.tasks.set(task.id, { ...task, ...(task.result ? { result: { ...task.result, consumed: false } } : {}) });
       for (const junior of parked.juniors) flow.juniors.set(junior.name, junior);
       for (const skill of parked.host.skills) flow.skills.add(skill);
@@ -126,6 +130,7 @@ export class Workflow {
   openTask(label: string, junior: string): WorkTask {
     const task: WorkTask = { id: `t${this.tasks.size + 1}`, label: label.trim().slice(0, 80), junior, state: 'open' };
     this.tasks.set(task.id, task);
+    this.onTask?.(task);
     return task;
   }
   /** The task a junior is working through, if it is still open to more work. */
@@ -137,6 +142,7 @@ export class Workflow {
     if (!transitions[task.state].includes(state)) throw new Error(`task ${id} is ${task.state}; it can become ${transitions[task.state].join(', ') || 'nothing (final)'}`);
     task.state = state;
     if (note !== undefined) task.note = note.trim().slice(0, 200) || undefined;
+    this.onTask?.(task);
     return task;
   }
 
@@ -172,11 +178,12 @@ export class Workflow {
   }
   private async git(root: string): Promise<HostState['git'] | undefined> {
     try {
-      const [branch, head, status] = await Promise.all([git(root, 'rev-parse', '--abbrev-ref', 'HEAD'), git(root, 'rev-parse', '--short', 'HEAD'), git(root, 'status', '--porcelain=v1')]);
+      const [branch, headSha, status] = await Promise.all([git(root, 'rev-parse', '--abbrev-ref', 'HEAD'), git(root, 'rev-parse', 'HEAD'), git(root, 'status', '--porcelain=v1')]);
+      const head = headSha.slice(0, 7);
       const commits = this.base ? (await git(root, 'log', '--oneline', '-n', '8', `${this.base}..HEAD`)).split('\n').filter(Boolean) : [];
       // The scratchpad is teapilot's own working space, not the project's.
       const dirty = status.split('\n').filter(Boolean).map(line => line.trim()).filter(line => !/^\S+\s+"?\.scratch\//.test(line));
-      return { root, branch, head, ...(this.base ? { base: this.base.slice(0, 7) } : {}), commits, dirty: dirty.slice(0, 8), dirtyCount: dirty.length };
+      return { root, branch, head, headSha, ...(this.base ? { base: this.base.slice(0, 7) } : {}), commits, dirty: dirty.slice(0, 8), dirtyCount: dirty.length };
     } catch { return undefined; }
   }
 
@@ -190,6 +197,8 @@ export class Workflow {
     };
     this.save(record);
     this.generation = record.generation; this.sequence = record.sequence;
+    // Each checkpoint reports the commits made since the one before it.
+    if (host.git?.headSha) this.base = host.git.headSha;
     // The next generation starts with what is new since this one.
     this.failures = []; this.unknown = [];
     for (const task of this.tasks.values()) if (task.result) task.result.consumed = false;

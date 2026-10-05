@@ -124,9 +124,15 @@ export async function runHost(config: Config, request: HostRequest, dependencies
   const web = new WebController(config, { event: (type, fields) => telemetry.event(type, fields) });
   const recovery = new RequestRecovery();
   // Checkpoints need an orchestrator that keeps working; side questions and read-only proposals never hand off.
-  const checkpointLimit = config.policy.limits.maxCheckpoints ?? 3;
+  // Uncapped unless configured: spend, permissions and cancellation still bound the request.
+  const checkpointLimit = config.policy.limits.maxCheckpoints ?? Infinity;
   const workflow = checkpointLimit > 0 && !request.side && !request.readOnly
     ? Workflow.open(requestId, checkpointLimit, request.scratch && config.scratchpad?.enabled !== false ? request.scratch : undefined) : undefined;
+  if (workflow) {
+    workflow.onTask = task => dependencies.onEvent?.({ type: 'task', id: task.id, label: task.label, junior: task.junior, state: task.state });
+    // Tasks a parked workflow left open are still in progress here.
+    for (const task of workflow.tasks.values()) workflow.onTask(task);
+  }
   let task: TaskStore | undefined;
   let skillCatalog: SkillCatalog | undefined;
   let taskId = request.taskId ?? requestId;
