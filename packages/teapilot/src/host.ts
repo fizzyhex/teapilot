@@ -230,6 +230,8 @@ export async function runHost(config: Config, request: HostRequest, dependencies
   };
   let previous: AttemptResult | undefined;
   let previousTier: Tier | undefined;
+  /** The last failure handed off, so a failure straight after it ends the request rather than looping. */
+  let failedOver: { reason: HandoffReason; generation: number } | undefined;
   const finish = async (success: boolean, status: string, text: string): Promise<HostResult> => {
     if (!success && request.signal?.aborted) status = 'cancelled';
     // All abort exits use the same acknowledgement, including stops between attempts.
@@ -450,75 +452,94 @@ export async function runHost(config: Config, request: HostRequest, dependencies
       });
       previous = await attempt(resume ? resumeNotice(config, previousTier!, tier, previous!.reason)
         : parked + basePrompt + (previous ? `\nPrevious attempt stopped: ${previous.reason}. ${previous.changedFiles?.length || previous.shellRan ? 'Existing edits are still in the repository; inspect them before proceeding. Do not restart blindly.' : 'It changed no files; continue the task from the context below.'}\nRecent execution context:\n${previous.handoff ?? previous.text.slice(-6000)}` : ''), resume);
-      // Each checkpoint hands the request to a fresh orchestrator on the same tier, with renewed limits and no routing.
+      // A failure that would end the request hands off to a fresh orchestrator instead, with advice in place of the error.
+      const ending = async (status: string, fallback?: string) => {
+        const record = flow && !request.signal?.aborted ? await failover(flow, previous!, failedOver) : undefined;
+        if (!record) return await finish(false, status, incomplete(previous!, fallback));
+        failedOver = { reason: record.host.reason, generation: record.generation };
+        // An answer the next agent gives without search is marked like one begun without it.
+        if (record.host.reason === 'search_unavailable') searchUnverified = true;
+        previous = { ...previous!, checkpoint: record };
+        accessFailure = undefined;
+        return undefined;
+      };
+      // Ends in a return, or a break that moves on to another tier; a failure handed off goes round again.
       for (;;) {
-        previousTier = tier;
-        check = previous.check;
-        for (const path of previous.changedFiles ?? []) changedFiles.add(path);
-        for (const [path, size] of Object.entries(previous.fileSizes ?? {})) fileSizes.set(path, size);
-        for (const failed of previous.failedCalls ?? []) failedCalls.set(`${failed.call}\n${failed.error}`, failed);
-        shellRan ||= Boolean(previous.shellRan);
-        // A later attempt in the same request gains nothing from searching a dead or exhausted service again.
-        if (previous.searchExhausted) {
-          searchDisabled = true;
-          if (activePermissions.includes('web.search')) activePermissions.splice(activePermissions.indexOf('web.search'), 1);
+        // Each checkpoint hands the request to a fresh orchestrator on the same tier, with renewed limits and no routing.
+        for (;;) {
+          previousTier = tier;
+          check = previous.check;
+          for (const path of previous.changedFiles ?? []) changedFiles.add(path);
+          for (const [path, size] of Object.entries(previous.fileSizes ?? {})) fileSizes.set(path, size);
+          for (const failed of previous.failedCalls ?? []) failedCalls.set(`${failed.call}\n${failed.error}`, failed);
+          shellRan ||= Boolean(previous.shellRan);
+          // A later attempt in the same request gains nothing from searching a dead or exhausted service again.
+          if (previous.searchExhausted) {
+            searchDisabled = true;
+            if (activePermissions.includes('web.search')) activePermissions.splice(activePermissions.indexOf('web.search'), 1);
+          }
+          const record = flow && !request.signal?.aborted && !accessFailure ? previous.checkpoint ?? await forcedCheckpoint(flow, previous) : undefined;
+          if (!record) break;
+          const view: CheckpointView = { record, ...checkpointCard(record), details: checkpointDetails(record, flow!.path(record)) };
+          dependencies.onEvent?.({ type: 'checkpoint', generation: record.generation, title: view.title, lines: view.lines, forced: record.host.forced });
+          const decision: CheckpointDecision = await dependencies.onCheckpoint?.(view, request.signal).catch(() => ({ action: 'continue' as const })) ?? { action: 'continue' };
+          await telemetry.event('checkpoint_decision', { generation: record.generation, action: decision.action, forced: record.host.forced });
+          if (request.signal?.aborted) return await finish(false, 'cancelled', 'Request cancelled.');
+          if (decision.action === 'stop') {
+            flow!.save({ ...record, status: 'parked' });
+            return await finish(false, 'parked', `parked at checkpoint ${record.generation}. ask to continue it whenever you're ready.`);
+          }
+          if (decision.action === 'steer') { record.steer = decision.text.trim().slice(0, 2000); flow!.save(record); }
+          recovery.allowance = undefined;
+          attempts++;
+          models.push(modelFor(config, tier).id);
+          dependencies.onEvent?.({ type: 'attempt_start', attempt: attempts, model: modelFor(config, tier).id, tier, checkpoint: record.generation });
+          previous = await attempt(continuation(record), undefined, record.host.skills);
         }
-        const record = flow && !request.signal?.aborted && !accessFailure ? previous.checkpoint ?? await forcedCheckpoint(flow, previous) : undefined;
-        if (!record) break;
-        const view: CheckpointView = { record, ...checkpointCard(record), details: checkpointDetails(record, flow!.path(record)) };
-        dependencies.onEvent?.({ type: 'checkpoint', generation: record.generation, title: view.title, lines: view.lines, forced: record.host.forced });
-        const decision: CheckpointDecision = await dependencies.onCheckpoint?.(view, request.signal).catch(() => ({ action: 'continue' as const })) ?? { action: 'continue' };
-        await telemetry.event('checkpoint_decision', { generation: record.generation, action: decision.action, forced: record.host.forced });
-        if (request.signal?.aborted) return await finish(false, 'cancelled', 'Request cancelled.');
-        if (decision.action === 'stop') {
-          flow!.save({ ...record, status: 'parked' });
-          return await finish(false, 'parked', `parked at checkpoint ${record.generation}. ask to continue it whenever you're ready.`);
+        if (accessFailure) { const ended = await ending('approval_denied', accessFailure); if (ended) return ended; continue; }
+        await telemetry.event('attempt_end', { decisionId: decision?.decision_id, capability: selected, success: previous.success, reason: previous.reason, stopped: previous.stopped, turns: previous.turns, toolCalls: previous.toolCalls, check: previous.check, ...(previous.success ? {} : { ending: previous.ending }) });
+        if (previous.success) return await finish(true, 'completed', previous.text);
+        if (task && (!task.remaining().calls || !task.remaining().modelCalls || !task.remaining().ms)) {
+          const status = !task.remaining().ms ? 'timeout' : !task.remaining().calls ? 'tool_limit' : 'turn_limit';
+          return await finish(false, status, incomplete({ ...previous, stopped: status }));
         }
-        if (decision.action === 'steer') { record.steer = decision.text.trim().slice(0, 2000); flow!.save(record); }
-        recovery.allowance = undefined;
-        attempts++;
-        models.push(modelFor(config, tier).id);
-        dependencies.onEvent?.({ type: 'attempt_start', attempt: attempts, model: modelFor(config, tier).id, tier, checkpoint: record.generation });
-        previous = await attempt(continuation(record), undefined, record.host.skills);
-      }
-      if (accessFailure) return await finish(false, 'approval_denied', incomplete(previous, accessFailure));
-      await telemetry.event('attempt_end', { decisionId: decision?.decision_id, capability: selected, success: previous.success, reason: previous.reason, stopped: previous.stopped, turns: previous.turns, toolCalls: previous.toolCalls, check: previous.check, ...(previous.success ? {} : { ending: previous.ending }) });
-      if (previous.success) return await finish(true, 'completed', previous.text);
-      if (task && (!task.remaining().calls || !task.remaining().modelCalls || !task.remaining().ms)) {
-        const status = !task.remaining().ms ? 'timeout' : !task.remaining().calls ? 'tool_limit' : 'turn_limit';
-        return await finish(false, status, incomplete({ ...previous, stopped: status }));
-      }
-      if (casual || !previous.reason || ['budget', 'approval_denied', 'cancelled', 'timeout', 'tool_limit', 'search_unavailable'].includes(previous.stopped ?? '') || index === config.policy.escalation.maxEscalations) {
-        return await finish(false, previous.stopped ?? previous.reason ?? 'incomplete', incomplete(previous, index === config.policy.escalation.maxEscalations ? 'Fallback: configured escalation limit reached.' : undefined));
-      }
-      // Overthinking steps down to less reasoning on the same model; everything else steps up.
-      const onward = previous.reason === 'overthinking'
-        ? tiers.slice(0, tiers.indexOf(tier)).reverse().filter(lower => profileFor(lower).model === profileFor(tier).model)
-        : tiers.slice(tiers.indexOf(tier) + 1);
-      const fallback = onward.map(nextTier => {
-        const candidate = capabilities(config, budget, localOnline, { workload, tier: nextTier }, { physicalOnline, relatedLock: request.relatedTier }).find(c => c.id === `${workload}.${nextTier}`)!;
-        if (request.web && !modelFor(config, nextTier).toolCalling) candidate.availability = { available: false, reason: 'Web search requires tool calling' };
-        const currentModel = modelFor(config, tier), nextModel = modelFor(config, nextTier);
-        if (previous?.reason === 'provider_error' && currentModel.provider === nextModel.provider && currentModel.baseUrl === nextModel.baseUrl && currentModel.id === nextModel.id)
-          candidate.availability = { available: false, reason: 'this provider/model already exhausted recovery; a different tier is not a different model' };
-        return { tier: nextTier, assessment: assessCandidate(config, candidate) };
-      });
-      const next = fallback.find(item => item.assessment.allowed)?.tier;
-      if (!next) {
-        const resumableSameTier = ['unsupported', 'turn_limit', 'ineffective_calls', 'tool_failures', 'test_failures'];
-        const repositoryWork = selected?.startsWith('coder.') || changedFiles.size > 0 || shellRan;
-        // Without repository work, resuming the same model after repeated calls just repeats them.
-        const madeProgress = previous.reason === 'ineffective_calls' ? repositoryWork : previous.turns > 0 || repositoryWork;
-        if (!previous.reason || !resumableSameTier.includes(previous.reason) || !madeProgress) {
-          return await finish(false, 'escalation_unavailable', incomplete(previous, `Fallback unavailable: ${fallback.map(item => `${item.tier}: ${item.assessment.reason}`).join('; ') || `no ${previous.reason === 'overthinking' ? 'lower' : 'higher'} tier configured`}.`));
+        if (casual || !previous.reason || ['budget', 'approval_denied', 'cancelled', 'timeout', 'tool_limit', 'search_unavailable'].includes(previous.stopped ?? '') || index === config.policy.escalation.maxEscalations) {
+          const ended = await ending(previous.stopped ?? previous.reason ?? 'incomplete', index === config.policy.escalation.maxEscalations ? 'Fallback: configured escalation limit reached.' : undefined);
+          if (ended) return ended;
+          continue;
         }
-        dependencies.onProgress?.(`No higher-tier fallback is available; continuing ${selected} with its execution handoff.`);
-        await telemetry.event('continuation', { capability: selected, reason: previous.reason, fallback: 'unavailable' });
-        scope = { workload, tier };
-        continue;
+        // Overthinking steps down to less reasoning on the same model; everything else steps up.
+        const onward = previous.reason === 'overthinking'
+          ? tiers.slice(0, tiers.indexOf(tier)).reverse().filter(lower => profileFor(lower).model === profileFor(tier).model)
+          : tiers.slice(tiers.indexOf(tier) + 1);
+        const fallback = onward.map(nextTier => {
+          const candidate = capabilities(config, budget, localOnline, { workload, tier: nextTier }, { physicalOnline, relatedLock: request.relatedTier }).find(c => c.id === `${workload}.${nextTier}`)!;
+          if (request.web && !modelFor(config, nextTier).toolCalling) candidate.availability = { available: false, reason: 'Web search requires tool calling' };
+          const currentModel = modelFor(config, tier), nextModel = modelFor(config, nextTier);
+          if (previous?.reason === 'provider_error' && currentModel.provider === nextModel.provider && currentModel.baseUrl === nextModel.baseUrl && currentModel.id === nextModel.id)
+            candidate.availability = { available: false, reason: 'this provider/model already exhausted recovery; a different tier is not a different model' };
+          return { tier: nextTier, assessment: assessCandidate(config, candidate) };
+        });
+        const next = fallback.find(item => item.assessment.allowed)?.tier;
+        if (!next) {
+          const resumableSameTier = ['unsupported', 'turn_limit', 'ineffective_calls', 'tool_failures', 'test_failures'];
+          const repositoryWork = selected?.startsWith('coder.') || changedFiles.size > 0 || shellRan;
+          // Without repository work, resuming the same model after repeated calls just repeats them.
+          const madeProgress = previous.reason === 'ineffective_calls' ? repositoryWork : previous.turns > 0 || repositoryWork;
+          if (!previous.reason || !resumableSameTier.includes(previous.reason) || !madeProgress) {
+            const ended = await ending('escalation_unavailable', `Fallback unavailable: ${fallback.map(item => `${item.tier}: ${item.assessment.reason}`).join('; ') || `no ${previous.reason === 'overthinking' ? 'lower' : 'higher'} tier configured`}.`);
+            if (ended) return ended;
+            continue;
+          }
+          dependencies.onProgress?.(`No higher-tier fallback is available; continuing ${selected} with its execution handoff.`);
+          await telemetry.event('continuation', { capability: selected, reason: previous.reason, fallback: 'unavailable' });
+          scope = { workload, tier };
+          break;
+        }
+        await telemetry.event('escalation', { from: selected, to: `${workload}.${next}`, reason: previous.reason });
+        scope = { workload, tier: next };
+        break;
       }
-      await telemetry.event('escalation', { from: selected, to: `${workload}.${next}`, reason: previous.reason });
-      scope = { workload, tier: next };
     }
     return await finish(false, 'limit', 'Escalation limit reached.');
   } catch (error) {
@@ -535,6 +556,14 @@ async function forcedCheckpoint(flow: Workflow, attempt: AttemptResult): Promise
   const reason = attempt.checkpointMissed?.reason ?? stops[attempt.stopped ?? ''] ?? (attempt.reason === 'turn_limit' ? 'model_calls' : undefined);
   if (!reason) return undefined;
   return flow.checkpoint({ reason, forced: true, attempts: attempt.checkpointMissed?.attempts ?? 0 });
+}
+
+/** A failure that would end the request, as a checkpoint; not for the agent a failure already handed to, so failures never chain. */
+async function failover(flow: Workflow, attempt: AttemptResult, last?: { reason: HandoffReason; generation: number }): Promise<CheckpointRecord | undefined> {
+  const failures: Record<string, HandoffReason> = { approval_denied: 'cancelled', context_limit: 'context_limit', search_unavailable: 'search_unavailable', ineffective_calls: 'ineffective_calls' };
+  const reason = failures[attempt.stopped ?? ''] ?? failures[attempt.reason ?? ''];
+  if (!reason || !flow.canCheckpoint || last?.generation === flow.generation) return undefined;
+  return flow.checkpoint({ reason, forced: true, attempts: 0 });
 }
 
 /** What a retry on the same model is told: why the last attempt stopped, and what this one has that it lacked. */

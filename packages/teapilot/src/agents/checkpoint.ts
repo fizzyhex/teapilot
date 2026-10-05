@@ -35,7 +35,8 @@ export interface WorkTask {
 }
 export interface SavedJunior { name: string; description?: string; agent_type?: JuniorType; assignment?: string; artifacts?: string[]; turns: ConversationTurn[]; scratch: string; turn: number }
 interface Operation { tool: string; call: string; error?: string }
-export type HandoffReason = 'tool_calls' | 'time' | 'context' | 'model_calls';
+/** Limits that came due, then failures that would otherwise have ended the request (always forced by the host). */
+export type HandoffReason = 'tool_calls' | 'time' | 'context' | 'model_calls' | 'cancelled' | 'context_limit' | 'ineffective_calls' | 'search_unavailable';
 
 export interface HostState {
   reason: HandoffReason; forced: boolean; attempts: number;
@@ -243,7 +244,17 @@ function recentFiles(folder: string): string[] {
   return files.sort((a, b) => b.at - a.at).slice(0, 4).map(file => file.path);
 }
 
-const reasons: Record<HandoffReason, string> = { tool_calls: 'out of tool calls', time: 'out of time', context: 'context full', model_calls: 'out of model calls' };
+const reasons: Record<HandoffReason, string> = {
+  tool_calls: 'out of tool calls', time: 'out of time', context: 'context full', model_calls: 'out of model calls',
+  cancelled: 'action not approved', context_limit: 'hit the context limit', ineffective_calls: 'calls weren’t making progress', search_unavailable: 'search unavailable',
+};
+/** What the next agent is told about a failure handoff, in place of the bare error. */
+const failureAdvice: Partial<Record<HandoffReason, string>> = {
+  cancelled: 'the user didn\'t approve the action. stop now and check with them, or try a different approach.',
+  context_limit: 'the previous agent hit the context limit. try orchestration with `delegate_task`, or a narrower approach.',
+  ineffective_calls: 'the previous agent\'s tools were returning the same results repeatedly. consider alternate routes.',
+  search_unavailable: 'web search is unavailable. stop now and tell the user, or continue offline if appropriate.',
+};
 const taskLine = (task: WorkTask) => `task ${task.id} "${task.label}"${task.junior ? ` (${task.junior})` : ''}: ${task.state.replaceAll('_', ' ')}${task.note ? ` - ${task.note}` : ''}${task.result && !terminalState(task.state) ? `; result ${task.result.status}${task.result.consumed ? '' : ', not yet read by you'}${task.result.file ? ` (${task.result.file})` : ''}` : ''}`;
 
 /** What the next orchestrator is told: small, with the host's facts first and the agent's words marked as such. */
@@ -264,6 +275,9 @@ export function continuation(record: CheckpointRecord, parked = false): string {
   lines.push('', record.handoff ? `previous agent's handoff (guidance, not fact):\n- status: ${record.handoff.status}\n- next: ${record.handoff.next}` : 'the previous agent left no handoff.');
   if (record.steer) lines.push('', `the user steered at this checkpoint: ${record.steer}`);
   lines.push('', 'treat host state as authoritative and the handoff as guidance. inspect before trusting either.');
+  // After the line Details cuts at: it speaks to the agent, not the person.
+  const advice = failureAdvice[host.reason];
+  if (advice) lines.push(advice);
   return lines.join('\n');
 }
 

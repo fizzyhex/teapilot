@@ -280,16 +280,18 @@ describe('real JevRouter SDK + pi loop with mock HTTP providers', () => {
   });
 
   it('bounds an endless model loop and never executes a denied shell command', async () => {
-    let inference = 0;
-    const f = await setup((_body, req, res) => {
+    let inference = 0; const prompts: string[] = [];
+    const f = await setup((body, req, res) => {
       if (req.url === '/jev') jev(res, 'coder.normal');
       else if (req.url?.endsWith('/models')) res.end('{}');
-      else { inference++; completion(res, { tool: { name: 'bash', arguments: { command: 'echo unsafe' } } }); }
+      else { inference++; prompts.push(JSON.stringify(body.messages)); completion(res, { tool: { name: 'bash', arguments: { command: 'echo unsafe' } } }); }
     });
     const result = await runHost(f.config, { cwd: f.cwd, prompt: 'Run a command' }, { approve: async () => false });
+    // A denial hands off once, with advice to check with the user; the same denial straight after ends the request.
     expect(result.status).toBe('approval_denied');
-    expect(inference).toBe(1);
-    expect(result.attempts).toBe(1);
+    expect(inference).toBe(2);
+    expect(result.attempts).toBe(2);
+    expect(prompts[1]).toContain('didn\'t approve the action');
   });
 
   it('stops repeated ineffective reads and enforces a hard turn limit', async () => {

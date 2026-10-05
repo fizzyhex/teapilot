@@ -260,7 +260,8 @@ it('a local inspection loop preserves same-tier recovery and reports its final f
   f.config.routingMode = 'direct'; f.config.models.capable.baseUrl = server.url;
   f.config.models.fast.enabled = false;
   const result = await runHost(f.config, { cwd: f.cwd, workload: 'coder', prompt: 'Create Pong' }, { approve: async () => false });
-  expect(result).toMatchObject({ success: false, status: 'ineffective_calls', attempts: 4 });
+  // Escalation comes first; once none is left, one fresh agent gets a turn before the request ends.
+  expect(result).toMatchObject({ success: false, status: 'ineffective_calls', attempts: 5 });
   expect(result.text).toContain('the calls weren’t making progress');
   expect(result.interruption?.detail).toContain('configured escalation limit reached');
   expect(result.text).not.toContain('checks');

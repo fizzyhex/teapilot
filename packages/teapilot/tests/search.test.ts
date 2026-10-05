@@ -1,6 +1,6 @@
 import { afterEach, expect, it } from 'vitest';
 import { checkSearch, fallbackEngines, searchQuery } from '../src/search.js';
-import { runHost } from '../src/host.js';
+import { runHost, type CheckpointView } from '../src/host.js';
 import { SessionGrants } from '../src/execution/grants.js';
 import { completion, fixture, jev, mockServer } from './helpers.js';
 
@@ -39,21 +39,24 @@ it('asks fallback engines when every default engine is blocked', async () => {
   expect((await searchQuery(empty.url, 'sabacc')).unresponsive).toEqual([]);
 });
 
-it('a search outage during execution cannot produce a successful unverified answer', async () => {
+it('a search outage during execution hands off, and cannot produce an unmarked unverified answer', async () => {
   const f = await fixture(); cleanup.push(f.cleanup);
   let searches = 0, inference = 0;
-  const server = await mockServer((_body, req, res) => {
+  const server = await mockServer((body, req, res) => {
     if (req.url?.startsWith('/search?')) {
       if (++searches === 1) res.end('{"results":[]}');
       else { res.writeHead(503); res.end('{}'); }
     } else if (req.url?.endsWith('/models')) res.end('{}');
+    else if (JSON.stringify(body.messages).includes('web search is unavailable. stop now and tell the user')) { inference++; completion(res, { text: 'search is down, so this is from memory.' }); }
     else { inference++; completion(res, { tool: { name: 'web_search', arguments: { query: 'current facts' } } }); }
   }); cleanup.push(server.close);
   f.config.routingMode = 'direct'; f.config.models.capable.baseUrl = server.url; f.config.searchUrl = server.url;
-  const result = await runHost(f.config, { cwd: f.cwd, workload: 'ask', web: true, prompt: 'Research current facts' }, { approve: async () => false });
-  expect(result).toMatchObject({ success: false, status: 'search_unavailable', attempts: 1 });
-  expect(inference).toBe(1);
-  expect(result.text).toContain('check the search connection');
+  const views: CheckpointView[] = [];
+  const result = await runHost(f.config, { cwd: f.cwd, workload: 'ask', web: true, prompt: 'Research current facts' }, { approve: async () => false, onCheckpoint: async view => { views.push(view); return { action: 'continue' }; } });
+  expect(views.map(view => view.record.host)).toMatchObject([{ reason: 'search_unavailable', forced: true }]);
+  expect(result).toMatchObject({ success: true, attempts: 2 });
+  expect(inference).toBe(2);
+  expect(result.text).toMatch(/^Web search was unavailable\. This answer is unverified/);
 });
 
 const downSearch = async (model: (body: any) => Parameters<typeof completion>[1]) => {
