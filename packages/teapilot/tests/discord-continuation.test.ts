@@ -2,7 +2,8 @@ import { afterEach, expect, it, vi } from 'vitest';
 
 const harness = vi.hoisted(() => ({ client: undefined as any }));
 
-vi.mock('discord.js', () => {
+vi.mock('discord.js', async () => {
+  const actual = await vi.importActual<Record<string, unknown>>('discord.js');
   class Builder {
     data: Record<string, any> = {};
     components: Builder[] = [];
@@ -10,6 +11,8 @@ vi.mock('discord.js', () => {
     setCustomId(custom_id: string) { this.data.custom_id = custom_id; return this; }
     setLabel(label: string) { this.data.label = label; return this; }
     setStyle(style: number) { this.data.style = style; return this; }
+    setDisabled(disabled: boolean) { this.data.disabled = disabled; return this; }
+    toJSON(): Record<string, any> { return { ...this.data, type: this.components.length ? 1 : 2, ...(this.components.length ? { components: this.components.map(component => component.toJSON()) } : {}) }; }
   }
   class Client {
     listeners = new Map<string, Array<(...args: any[]) => void>>();
@@ -25,7 +28,7 @@ vi.mock('discord.js', () => {
     async login() { this.emit('clientReady'); }
     async destroy() {}
   }
-  return {
+  return { ...actual,
     ActionRowBuilder: Builder, ButtonBuilder: Builder,
     ButtonStyle: { Primary: 1, Secondary: 2, Success: 3, Danger: 4 },
     ActivityType: { Custom: 4 }, ApplicationIntegrationType: { GuildInstall: 0 },
@@ -38,12 +41,15 @@ vi.mock('discord.js', () => {
 });
 
 import { connect } from '../src/discord/gateway.js';
+import type { Checkpoint } from '../src/agents/checkpoint.js';
+import { promptCommand } from '../src/discord/commands.js';
+import { checkMessage } from '../scripts/discord-sim/validate.js';
 
 const operator = 'operator';
 const interaction = (customId: string, message: any) => ({
   customId, message, user: { id: operator, username: operator },
   isButton: () => true, isStringSelectMenu: () => false, isModalSubmit: () => false,
-  isMessageContextMenuCommand: () => false, isChatInputCommand: () => false, isAutocomplete: () => false,
+  isMessageContextMenuCommand: () => false, isChatInputCommand: () => false, isAutocomplete: () => false, isFromMessage: () => true,
   deferUpdate: vi.fn(async () => undefined), update: vi.fn(async () => undefined),
   reply: vi.fn(async () => undefined),
 });
@@ -68,7 +74,7 @@ async function setup(extraHandlers: Record<string, any> = {}) {
   const source = { author: { id: operator, bot: false, username: operator }, channel, channelId: channel.id, guildId: null,
     content: 'test', mentions: { users: { has: () => false } }, attachments: new Map() };
   harness.client.emit('messageCreate', source);
-  return { gateway, sent, channel, client: harness.client, transport: incoming.transport() };
+  return { gateway, sent, channel, client: harness.client, handlers, transport: incoming.transport() };
 }
 
 it('opens a fresh private editor link from an authorized file-reply button', async () => {
@@ -103,7 +109,159 @@ const press = async (client: any, id: string, message: any) => {
   return click;
 };
 
-it('askContinuationBudget auto-approves after 45 seconds and clears its timer exactly once', async () => {
+const uiCheckpoint: Checkpoint = { version: 1, requestId: 'r', checkpointId: 9, sequence: 1, reason: 'request_calls', durability: 'request-local', expiresAt: Date.now() + 30_000,
+  snapshot: { amendments: [], artifacts: [], checks: [], results: [], workers: [], resources: {}, pendingUncertain: [] }, summary: ['check failed'], continuation: { offerId: 'lease', instructorCalls: 2, activeMs: 10_000, freshContext: false } };
+
+it('routes a private one-shot /prompt through the webhook checkpoint modal path', async () => {
+  let reply: any;
+  const { gateway, client, handlers } = await setup({ reply: (value: any) => { reply = value; } });
+  const privateChannel = { ...client.channels.fetch, isSendable: () => true, isThread: () => false };
+  const command: any = { id: 'interaction-one-shot', createdTimestamp: Date.now(), user: { id: operator, username: operator, bot: false }, commandName: promptCommand,
+    channelId: 'private', channel: privateChannel, context: 1, authorizingIntegrationOwners: {}, appPermissions: undefined,
+    isButton: () => false, isStringSelectMenu: () => false, isModalSubmit: () => false, isMessageContextMenuCommand: () => false, isChatInputCommand: () => true, isAutocomplete: () => false, inGuild: () => false,
+    options: { getString: (name: string) => name === 'prompt' ? 'task' : null, getBoolean: () => false, getAttachment: () => null },
+    deferReply: vi.fn(async () => undefined), editReply: vi.fn(async () => ({ id: 'webhook-card' })), followUp: vi.fn(async () => ({ id: 'followup' })), reply: vi.fn(async () => undefined), deleteReply: vi.fn(async () => undefined) };
+  client.emit('interactionCreate', command);
+  await vi.waitFor(() => expect(reply).toBeDefined());
+  expect(reply.oneShot).toBe(true);
+  const transport = reply.transport();
+  const controller = new AbortController();
+  const pending = transport.checkpoint!('one-shot checkpoint', uiCheckpoint, controller.signal,
+    (_action: string, _user: string, amendment?: string) => ({ requestId: 'r', checkpointId: 9, action: 'redirect', offerId: 'lease', amendment } as any), () => ({ text: 'stopping…' }));
+  await vi.waitFor(() => expect(command.editReply).toHaveBeenCalled());
+  const payload = command.editReply.mock.calls.at(-1)![0];
+  const changeId = payload.components[0].components.find((button: any) => button.data.label === 'Change direction').data.custom_id;
+  const change: any = interaction(changeId, { id: 'webhook-card' });
+  change.showModal = vi.fn(async (modal: any) => { change.modal = modal; });
+  client.emit('interactionCreate', change);
+  await vi.waitFor(() => expect(change.showModal).toHaveBeenCalledOnce());
+  const submit: any = { customId: change.modal.custom_id, message: { id: 'webhook-card' }, user: { id: operator, username: operator },
+    isButton: () => false, isModalSubmit: () => true, isStringSelectMenu: () => false, isMessageContextMenuCommand: () => false, isChatInputCommand: () => false, isAutocomplete: () => false, isFromMessage: () => true,
+    fields: { getTextInputValue: () => 'redirect safely' }, deferUpdate: vi.fn(async () => undefined), editReply: vi.fn(async () => undefined), reply: vi.fn(async () => undefined) };
+  client.emit('interactionCreate', submit);
+  await expect(pending).resolves.toMatchObject({ action: 'redirect', amendment: 'redirect safely' });
+  await vi.waitFor(() => expect(submit.editReply).toHaveBeenCalledOnce());
+  expect(submit.message.edit).toBeUndefined();
+  controller.abort(); await gateway.close();
+});
+
+it('opens Change direction modal immediately, accepts one amendment, and rejects stale duplicate submits', async () => {
+  const { gateway, sent, client, transport } = await setup();
+  const controller = new AbortController();
+  const decide = vi.fn((_action: string, _user: string, amendment?: string) => ({ requestId: 'r', checkpointId: 9, action: 'redirect', offerId: 'lease', amendment } as const));
+  const pending = transport.checkpoint!('checkpoint card', uiCheckpoint, controller.signal, decide, () => ({ text: 'stopping…' }));
+  await vi.waitFor(() => expect(sent).toHaveLength(1));
+  const card = sent[0];
+  const modalClick: any = interaction(buttonId(card, 'Change direction'), card);
+  modalClick.showModal = vi.fn(async (payload: any) => { modalClick.modal = payload; });
+  client.emit('interactionCreate', modalClick);
+  await vi.waitFor(() => expect(modalClick.showModal).toHaveBeenCalledOnce());
+  expect(modalClick.showModal.mock.calls[0]![0]).toMatchObject({ title: 'change direction', components: [{ components: [{ custom_id: 'amendment', required: true, max_length: 1000 }] }] });
+  expect(decide).not.toHaveBeenCalled();
+
+  const submit: any = { customId: modalClick.modal.custom_id, message: card, user: { id: operator, username: operator }, isButton: () => false, isMessageContextMenuCommand: () => false, isChatInputCommand: () => false, isAutocomplete: () => false,
+    isStringSelectMenu: () => false, isModalSubmit: () => true, isFromMessage: () => true,
+    fields: { getTextInputValue: () => 'avoid the old parser' }, deferUpdate: vi.fn(async () => undefined), editReply: vi.fn(async () => undefined), reply: vi.fn(async () => undefined) };
+  client.emit('interactionCreate', submit);
+  await expect(pending).resolves.toMatchObject({ action: 'redirect', amendment: 'avoid the old parser' });
+  await vi.waitFor(() => expect(submit.editReply).toHaveBeenCalledOnce());
+  expect(card.edit).not.toHaveBeenCalled();
+  expect(decide).toHaveBeenCalledTimes(1);
+  const stale = { ...submit, reply: vi.fn(async () => undefined) };
+  client.emit('interactionCreate', stale);
+  await vi.waitFor(() => expect(stale.reply).toHaveBeenCalledWith(expect.objectContaining({ content: 'this checkpoint is no longer open.' })));
+  await gateway.close();
+});
+
+it('resolves a claimed Continue before a stalled Discord message update', async () => {
+  const { gateway, sent, client, transport } = await setup();
+  let resolveUpdate!: () => void;
+  const clickUpdate = new Promise<void>(resolve => { resolveUpdate = resolve; });
+  const controller = new AbortController();
+  const pending = transport.checkpoint!('checkpoint card', uiCheckpoint, controller.signal,
+    () => ({ requestId: 'r', checkpointId: 9, action: 'continue', offerId: 'lease' }), () => ({ text: 'stopping…' }));
+  await vi.waitFor(() => expect(sent).toHaveLength(1));
+  const click = interaction(buttonId(sent[0], 'Continue'), sent[0]);
+  click.update = vi.fn(async () => { await clickUpdate; return undefined; });
+  client.emit('interactionCreate', click);
+  await expect(pending).resolves.toMatchObject({ action: 'continue', offerId: 'lease' });
+  expect(click.update).toHaveBeenCalledOnce();
+  resolveUpdate();
+  await gateway.close();
+});
+
+it('aborts during a delayed Discord post, then removes controls when the post eventually arrives', async () => {
+  vi.useFakeTimers();
+  const { gateway, sent, channel, transport } = await setup();
+  let publish!: (message: any) => void;
+  channel.send = vi.fn(() => new Promise(resolve => { publish = resolve; }));
+  const controller = new AbortController();
+  const pending = transport.checkpoint!('checkpoint card', uiCheckpoint, controller.signal,
+    () => ({ requestId: 'r', checkpointId: 9, action: 'continue', offerId: 'lease' }), () => ({ text: 'stopping…' }));
+  expect(vi.getTimerCount()).toBeGreaterThan(0);
+  controller.abort();
+  await expect(pending).resolves.toBeUndefined();
+  expect(vi.getTimerCount()).toBe(0);
+  const posted: any = { id: 'delayed', payload: {}, edits: [], edit: vi.fn(async (payload: any) => { posted.edits.push(payload); }) };
+  publish(posted);
+  await vi.waitFor(() => expect(posted.edit).toHaveBeenCalledOnce());
+  expect(posted.edits[0]).toMatchObject({ components: [], content: expect.stringContaining('checkpoint cancelled') });
+  expect(sent).toHaveLength(0);
+  await gateway.close();
+});
+
+it('bounds the entire checkpoint message, including facts, proposal and expiry footer', async () => {
+  const { gateway, sent, transport } = await setup();
+  const controller = new AbortController();
+  const huge = { ...uiCheckpoint, expiresAt: Date.now() + 60_000, summary: Array.from({ length: 80 }, () => 'verified check detail '.repeat(20)), modelHandoff: 'proposal '.repeat(500) };
+  const pending = transport.checkpoint!('checkpoint card '.repeat(400), huge, controller.signal, () => undefined, () => ({ text: 'stopping…' }));
+  await vi.waitFor(() => expect(sent).toHaveLength(1));
+  expect(sent[0].payload.content.length).toBeLessThanOrEqual(2000);
+  const row = sent[0].payload.components[0];
+  checkMessage({ content: sent[0].payload.content, components: [{ type: 1, components: row.components.map((button: any) => ({ type: 2, custom_id: button.data.custom_id, label: button.data.label, style: button.data.style, disabled: button.data.disabled })) }] });
+  controller.abort(); await expect(pending).resolves.toBeUndefined();
+  await gateway.close();
+});
+
+it('leaves a dismissed direction modal paused; abort wins and late Continue is rejected', async () => {
+  const { gateway, sent, client, transport } = await setup();
+  const controller = new AbortController();
+  const decide = vi.fn(() => ({ requestId: 'r', checkpointId: 9, action: 'continue', offerId: 'lease' } as const));
+  const pending = transport.checkpoint!('checkpoint card', uiCheckpoint, controller.signal, decide, () => ({ text: 'stopping…' }));
+  await vi.waitFor(() => expect(sent).toHaveLength(1));
+  const card = sent[0];
+  const click: any = interaction(buttonId(card, 'Change direction'), card);
+  click.showModal = vi.fn(async () => undefined);
+  client.emit('interactionCreate', click);
+  await vi.waitFor(() => expect(click.showModal).toHaveBeenCalledOnce());
+  expect(sent[0].edits).toHaveLength(0); // closing the form is not a decision
+  controller.abort();
+  await expect(pending).resolves.toBeUndefined();
+  const late = interaction(buttonId(card, 'Continue'), card);
+  client.emit('interactionCreate', late);
+  await vi.waitFor(() => expect(late.reply).toHaveBeenCalledWith(expect.objectContaining({ content: 'this checkpoint is no longer open.' })));
+  expect(decide).not.toHaveBeenCalled();
+  await gateway.close();
+});
+
+it('expires the checkpoint into a disabled card and rejects a late Continue', async () => {
+  vi.useFakeTimers();
+  const { gateway, sent, client, transport } = await setup();
+  const controller = new AbortController();
+  const expiring = { ...uiCheckpoint, expiresAt: Date.now() + 100 };
+  const pending = transport.checkpoint!('checkpoint card', expiring, controller.signal, () => ({ requestId: 'r', checkpointId: 9, action: 'continue', offerId: 'lease' }), () => ({ text: 'stopping…' }));
+  await vi.waitFor(() => expect(sent).toHaveLength(1));
+  const card = sent[0];
+  await vi.advanceTimersByTimeAsync(100);
+  await expect(pending).resolves.toBeUndefined();
+  expect(card.edits[0]).toMatchObject({ components: [], content: expect.stringContaining('checkpoint expired or cancelled') });
+  const stale = interaction(buttonId(card, 'Continue'), card);
+  client.emit('interactionCreate', stale);
+  await vi.waitFor(() => expect(stale.reply).toHaveBeenCalledWith(expect.objectContaining({ content: 'this checkpoint is no longer open.' })));
+  await gateway.close();
+});
+
+it('askContinuationBudget fails closed after its response window and clears its timer exactly once', async () => {
   vi.useFakeTimers();
   const { gateway, sent, channel, transport } = await setup();
   const controller = new AbortController();
@@ -112,10 +270,10 @@ it('askContinuationBudget auto-approves after 45 seconds and clears its timer ex
   expect(vi.getTimerCount()).toBe(1);
   expect(vi.getTimerCount()).toBe(1);
   await vi.advanceTimersByTimeAsync(45_000);
-  await expect(result).resolves.toBe('auto-approved');
+  await expect(result).resolves.toBe('denied');
   expect(sent[0].payload).toMatchObject({ content: 'continue?' });
   expect(sent[0].edits).toHaveLength(1);
-  expect(sent[0].edits[0]).toMatchObject({ content: expect.stringContaining('auto-approved after 45 seconds'), components: [] });
+  expect(sent[0].edits[0]).toMatchObject({ content: expect.stringContaining('no response — run paused'), components: [] });
   controller.abort();
   expect(sent[0].edits).toHaveLength(1);
   expect(vi.getTimerCount()).toBe(0);
@@ -225,7 +383,7 @@ it.each(['abort-first', 'timeout-first'] as const)('settles exactly once when ab
     await vi.advanceTimersByTimeAsync(100);
     controller.abort();
   }
-  await expect(result).resolves.toBe(order === 'abort-first' ? 'denied' : 'auto-approved');
+  await expect(result).resolves.toBe('denied');
   await vi.waitFor(() => expect(sent[0].edits).toHaveLength(1));
   expect(vi.getTimerCount()).toBe(0);
   const stale = interaction(id, sent[0]);

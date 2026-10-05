@@ -79,8 +79,8 @@ it('reserves known sibling delegations before the first junior can spend their c
   expect(delegated[1].toolCalls).toBeGreaterThanOrEqual(1);
 });
 
-it('pauses only the instructor attempt while a post-junior continuation approval waits', async () => {
-  let parentCalls = 0, approvalDelay = 0;
+it('pauses the instructor attempt while a post-junior checkpoint decision waits', async () => {
+  let parentCalls = 0, approvalDelay = 0, batchesAtDecision = -1;
   const f = await setup((body, _req, res) => {
     const system = (body.messages ?? []).filter((message: any) => message.role === 'system').map((message: any) => message.content).join('\n');
     if (system.includes('You are junior')) completion(res, { tool: { name: 'report', arguments: { status: 'done', summary: 'finished' } } });
@@ -94,24 +94,166 @@ it('pauses only the instructor attempt while a post-junior continuation approval
   const allowance = new RequestAllowance({ calls: 10, modelCalls: 50, timeoutMs: 10_000, delegations: 3 }, undefined,
     { instructorCalls: 1, juniorCalls: 20, maxContinuationBatches: 1 });
   const result = await runAttempt({ ...f, tier: 'normal', workload: 'coder', web: false, prompt: 'Delegate a read and continue.', scratch, allowance,
-    approve: async approval => {
-      if (approval.kind === 'continuation_budget') {
-        const started = Date.now();
-        await new Promise(resolve => setTimeout(resolve, 1200));
-        approvalDelay = Date.now() - started;
-      }
-      return true;
+    approve: async () => true,
+    onCheckpoint: async checkpoint => {
+      batchesAtDecision = allowance.continuationBatchesUsed;
+      expect(checkpoint.snapshot.workers.some(worker => worker.ref.startsWith('worker:'))).toBe(true);
+      const started = Date.now();
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      approvalDelay = Date.now() - started;
+      return { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action: 'continue', offerId: checkpoint.continuation!.offerId };
     } });
   expect(approvalDelay).toBeGreaterThan(1000);
+  expect(batchesAtDecision).toBe(0);
   expect(result.success, JSON.stringify(result)).toBe(true);
   expect(result.text).toContain('Continued');
 });
 
-it('cancellation during a ready renewal gate admits no tool and creates no receipt', async () => {
+it('warns before the instructor lease ends, pauses at a checkpoint, and resumes with the same request counters', async () => {
+  let providerCalls = 0;
+  const checkpointWait = { start: 0, end: 0, providerCallsWhileWaiting: 0 };
+  const f = await setup((_body, _req, res) => {
+    const call = ++providerCalls;
+    if (call <= 3) completion(res, { tool: { name: 'read', arguments: { path: `checkpoint-${call}.txt` } } });
+    else completion(res, { text: call === 4 ? 'Three reads are complete; no check was run. Next: inspect the requested change.' : 'Finished from the inspected evidence.' });
+  });
+  for (let index = 1; index <= 3; index++) await writeFile(join(f.cwd, `checkpoint-${index}.txt`), `evidence ${index}`);
+  const allowance = new RequestAllowance({ calls: 10, modelCalls: 20, timeoutMs: 60_000, delegations: 2 }, undefined,
+    { instructorCalls: 4, juniorCalls: 20, maxContinuationBatches: 1 });
+  const result = await runAttempt({ ...f, tier: 'normal', workload: 'coder', web: false, approve: async () => true, prompt: 'Read three independent files and report.', allowance,
+    onCheckpoint: async checkpoint => {
+      checkpointWait.start++;
+      checkpointWait.providerCallsWhileWaiting = providerCalls;
+      expect(checkpoint).toMatchObject({ reason: 'instructor_calls', durability: 'request-local', continuation: { instructorCalls: 4 } });
+      await new Promise(resolve => setTimeout(resolve, 30));
+      checkpointWait.end++;
+      return { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action: 'continue', offerId: checkpoint.continuation!.offerId };
+    } });
+  expect(result.success, JSON.stringify(result)).toBe(true);
+  expect(result.toolCalls).toBe(3);
+  expect(allowance.remaining()).toMatchObject({ calls: 7, modelCalls: 15 });
+  expect(allowance.remaining().ms).toBeLessThan(59_950);
+  expect(allowance.continuationBatchesUsed).toBe(1);
+  expect(checkpointWait).toEqual({ start: 1, end: 1, providerCallsWhileWaiting: 4 });
+  expect(providerCalls).toBe(5);
+});
+
+it('declares no handoff tools and redeclares real tools before a checkpoint resume without legacy autoapproval', async () => {
+  const toolSets: string[][] = [];
+  let providerCalls = 0, legacyApprovals = 0, batchesAtCheckpoint = -1;
+  const f = await setup((body, _req, res) => {
+    providerCalls++;
+    const declared = (body.tools ?? []).map((tool: any) => tool.function.name);
+    toolSets.push(declared);
+    if (providerCalls === 1) {
+      if (!declared.includes('read')) return completion(res, { text: 'read was not declared' });
+      completion(res, { tool: { name: 'read', arguments: { path: 'checkpoint-1.txt' } } });
+    } else if (providerCalls === 2) {
+      if (declared.length) return completion(res, { text: 'handoff unexpectedly had tools' });
+      completion(res, { text: 'one read completed; no check was run.' });
+    } else {
+      if (!declared.includes('read')) return completion(res, { text: 'resume tools were not declared' });
+      completion(res, { text: 'Continued with the original objective.' });
+    }
+  });
+  await writeFile(join(f.cwd, 'checkpoint-1.txt'), 'evidence');
+  const allowance = new RequestAllowance({ calls: 10, modelCalls: 20, timeoutMs: 60_000, delegations: 2 }, undefined,
+    { instructorCalls: 1, juniorCalls: 20, maxContinuationBatches: 1 });
+  const result = await runAttempt({ ...f, tier: 'normal', workload: 'coder', web: false, prompt: 'Inspect the file.', allowance,
+    approve: async () => { legacyApprovals++; return true; },
+    onCheckpoint: async checkpoint => {
+      batchesAtCheckpoint = allowance.continuationBatchesUsed;
+      expect(checkpoint.modelHandoff).toContain('one read completed');
+      expect(checkpoint.snapshot.results).toContainEqual(expect.objectContaining({ ref: expect.stringMatching(/^(receipt|toolcall|saved-output):/), summary: expect.stringContaining('read succeeded') }));
+      return { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action: 'continue', offerId: checkpoint.continuation!.offerId };
+    } });
+  expect(result.success, JSON.stringify(result)).toBe(true);
+  expect(toolSets).toHaveLength(3);
+  expect(toolSets[0]).toContain('read');
+  expect(toolSets[1]).toEqual([]);
+  expect(toolSets[2]).toContain('read');
+  expect(batchesAtCheckpoint).toBe(0);
+  expect(legacyApprovals).toBe(0);
+});
+
+it('stops with a host checkpoint when no explicit decision handler is present', async () => {
+  let providerCalls = 0, toolCalls = 0;
+  const f = await setup((_body, _req, res) => {
+    if (++providerCalls === 1) completion(res, { tool: { name: 'read', arguments: { path: 'checkpoint-partial.txt' } } });
+    else completion(res, { text: 'one file was inspected; no verification was run.' });
+  });
+  await writeFile(join(f.cwd, 'checkpoint-partial.txt'), 'known evidence');
+  const allowance = new RequestAllowance({ calls: 10, modelCalls: 20, timeoutMs: 60_000, delegations: 2 }, undefined,
+    { instructorCalls: 1, juniorCalls: 20, maxContinuationBatches: 0 });
+  const result = await runAttempt({ ...f, tier: 'normal', workload: 'coder', web: false, approve: async () => true, prompt: 'Inspect the file.', allowance,
+    onEvent: event => { if (event.type === 'tool_execution_end' && event.tool === 'read') toolCalls++; } });
+  expect(result).toMatchObject({ success: false, stopped: 'checkpoint', checkpoint: { reason: 'instructor_calls', durability: 'request-local' } });
+  expect(result.text).toContain('one file was inspected');
+  expect(toolCalls).toBe(1);
+  expect(providerCalls).toBe(2);
+  expect(allowance.remaining().calls).toBe(9);
+});
+
+it('accepts a redirect amendment without replacing the original objective and rejects stale checkpoint identities', async () => {
+  let providerCalls = 0, redirectedMessages = '';
+  const f = await setup((body, _req, res) => {
+    const call = ++providerCalls;
+    if (call === 1) completion(res, { tool: { name: 'read', arguments: { path: 'redirect-evidence.txt' } } });
+    else if (call === 2) completion(res, { text: 'Read the source; no check was run.' });
+    else { redirectedMessages = JSON.stringify(body.messages); completion(res, { text: 'Applied the amendment while retaining the original task.' }); }
+  });
+  await writeFile(join(f.cwd, 'redirect-evidence.txt'), 'source fact');
+  const allowance = new RequestAllowance({ calls: 10, modelCalls: 20, timeoutMs: 60_000, delegations: 2 }, undefined,
+    { instructorCalls: 1, juniorCalls: 20, maxContinuationBatches: 1 });
+  const redirected = await runAttempt({ ...f, tier: 'normal', workload: 'coder', web: false, prompt: 'Inspect the source.', currentRequest: 'Original host objective: inspect the source.', approve: async () => true, allowance,
+    onCheckpoint: async checkpoint => ({ requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action: 'redirect', offerId: checkpoint.continuation!.offerId, amendment: 'focus the report on deployment risks' }) });
+  expect(redirected.success).toBe(true);
+  expect(redirectedMessages).toContain('Original host objective: inspect the source.');
+  expect(redirectedMessages).toContain('focus the report on deployment risks');
+
+  let staleCalls = 0;
+  const stale = await setup((_body, _req, res) => {
+    staleCalls++;
+    completion(res, staleCalls === 1 ? { tool: { name: 'read', arguments: { path: 'redirect-evidence.txt' } } } : { text: 'partial handoff' });
+  });
+  await writeFile(join(stale.cwd, 'redirect-evidence.txt'), 'source fact');
+  const staleAllowance = new RequestAllowance({ calls: 10, modelCalls: 20, timeoutMs: 60_000, delegations: 2 }, undefined,
+    { instructorCalls: 1, juniorCalls: 20, maxContinuationBatches: 1 });
+  const partial = await runAttempt({ ...stale, tier: 'normal', workload: 'coder', web: false, prompt: 'Inspect the source.', approve: async () => true, allowance: staleAllowance,
+    onCheckpoint: async checkpoint => ({ requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId + 1, action: 'continue', offerId: checkpoint.continuation!.offerId }) });
+  expect(partial).toMatchObject({ success: false, stopped: 'checkpoint' });
+  expect(staleCalls).toBe(2);
+  expect(staleAllowance.continuationBatchesUsed).toBe(0);
+});
+
+it('rejects a late checkpoint decision even when its request and offer ids match', async () => {
   let providerCalls = 0;
   const f = await setup((_body, _req, res) => {
     providerCalls++;
-    completion(res, { tool: { name: 'read', arguments: { path: 'source.txt' } } });
+    completion(res, providerCalls === 1 ? { tool: { name: 'read', arguments: { path: 'redirect-evidence.txt' } } } : { text: 'handoff facts' });
+  });
+  await writeFile(join(f.cwd, 'redirect-evidence.txt'), 'source fact');
+  const allowance = new RequestAllowance({ calls: 10, modelCalls: 20, timeoutMs: 60_000, delegations: 2 }, undefined,
+    { instructorCalls: 1, juniorCalls: 20, maxContinuationBatches: 1 });
+  const now = Date.now;
+  let result;
+  try {
+    result = await runAttempt({ ...f, tier: 'normal', workload: 'coder', web: false, prompt: 'Inspect the source.', approve: async () => true, allowance,
+      onCheckpoint: async checkpoint => {
+        Date.now = () => checkpoint.expiresAt + 1;
+        return { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action: 'continue', offerId: checkpoint.continuation!.offerId };
+      } });
+  } finally { Date.now = now; }
+  expect(result).toMatchObject({ success: false, stopped: 'checkpoint' });
+  expect(providerCalls).toBe(2);
+  expect(allowance.continuationBatchesUsed).toBe(0);
+});
+
+it('cancellation during a checkpoint decision wins over a late continue and admits no extra tool', async () => {
+  let providerCalls = 0;
+  const f = await setup((body, _req, res) => {
+    providerCalls++;
+    completion(res, (body.tools ?? []).some((tool: any) => tool.function.name === 'read') ? { tool: { name: 'read', arguments: { path: 'source.txt' } } } : { text: 'one read completed; stop before continuing.' });
   });
   await writeFile(join(f.cwd, 'source.txt'), 'source');
   const scratch = join(f.config.stateDir, 'workspaces', 'session', '.scratch');
@@ -120,18 +262,19 @@ it('cancellation during a ready renewal gate admits no tool and creates no recei
   task.startRequest('cancel-request', { calls: 10, modelCalls: 50, timeoutMs: 10_000, instructorCalls: 1, juniorCalls: 20, maxContinuationBatches: 2 });
   const controller = new AbortController();
   const result = await runAttempt({ ...f, tier: 'normal', workload: 'coder', web: false, prompt: 'Read source.', scratch, task, signal: controller.signal,
-    approve: async approval => {
-      if (approval.kind === 'continuation_budget') { queueMicrotask(() => controller.abort()); return true; }
-      return true;
+    approve: async () => true,
+    onCheckpoint: async checkpoint => {
+      queueMicrotask(() => controller.abort());
+      return { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action: 'continue', offerId: checkpoint.continuation!.offerId };
     } });
-  expect(result.stopped).toBe('cancelled');
-  expect(providerCalls).toBe(1);
+  expect(result.stopped, JSON.stringify(result)).toBe('cancelled');
+  expect(providerCalls).toBe(2);
   expect(task.remaining().calls).toBe(9);
   expect(task.snapshot().receipts).toHaveLength(1);
   expect(task.toolBudget()).toMatchObject({ instructorCalls: 1, instructorGranted: 1, continuationBatches: 0 });
 });
 
-it('denies queued tools without charges and allows exactly one final synthesis turn', async () => {
+it('does not execute queued tool suffix after the grant ends and returns a checkpoint partial', async () => {
   let providerCalls = 0, continuationApprovals = 0;
   const f = await setup((_body, _req, res) => {
     providerCalls++;
@@ -152,11 +295,12 @@ it('denies queued tools without charges and allows exactly one final synthesis t
       if (approval.kind === 'continuation_budget') { continuationApprovals++; return false; }
       return true;
     } });
-  expect(result.success, JSON.stringify(result)).toBe(true);
+  expect(result.success, JSON.stringify(result)).toBe(false);
+  expect(result.stopped).toBe('checkpoint');
   expect(result.text).toContain('partial synthesis');
   expect(providerCalls).toBe(2);
-  expect(continuationApprovals).toBe(1);
-  expect(task.snapshot().request).toMatchObject({ calls: 1, continuationDenied: true });
+  expect(continuationApprovals).toBe(0);
+  expect(task.snapshot().request).toMatchObject({ calls: 1, continuationDenied: false });
   expect(task.snapshot().receipts).toHaveLength(1);
   expect(task.snapshot().receipts[0]).toMatchObject({ tool: 'read', status: 'succeeded' });
   expect(result.toolCalls).toBe(1);

@@ -2,8 +2,8 @@ import type { ActivitySink } from '../activity.js';
 import { mkdir, stat, writeFile } from 'node:fs/promises';
 import { join, relative, resolve } from 'node:path';
 import { Agent, type AgentTool } from '@earendil-works/pi-agent-core';
-import { Type, type Message } from '@earendil-works/pi-ai';
-import { calibratedTokens, estimateValueTokens, IMAGE_TOKENS, replyRoom } from '../inference/context.js';
+import { Type, toToolDeclaration, type Message } from '@earendil-works/pi-ai';
+import { calibratedTokens, estimateValueTokens, IMAGE_TOKENS, MAX_PAYLOAD_BYTES, replyRoom } from '../inference/context.js';
 import type { Config, Tier, Workload } from '../config.js';
 import { modelFor, effectiveProfile } from '../routing/execution.js';
 import { modeFor, sideReadable, withPrerequisites, type Mode, type Permission } from '../execution/grants.js';
@@ -39,6 +39,8 @@ import type { SkillCatalog } from '../workspace/skills.js';
 import { skillCache } from '../skills/cache.js';
 import { SkillStore } from '../skills/store.js';
 import { skillQuery, skillReferencePrefix, skillSource, skillTools } from './skills.js';
+import { randomUUID } from 'node:crypto';
+import { freezeCheckpoint, type Checkpoint, type CheckpointDecision, type CheckpointHandler, type CheckpointReason } from './checkpoint.js';
 
 export interface AttemptInput {
   config: Config; tier: Tier; workload: Workload; cwd: string; prompt: string; web: boolean;
@@ -63,6 +65,7 @@ export interface AttemptInput {
   workspace?: ConversationWorkspace;
   requestCapabilities?: (required: Permission[], reason: string, signal?: AbortSignal) => Promise<boolean>;
   onAgenticWork?: () => void;
+  onCheckpoint?: CheckpointHandler;
   unresolvedChecks?: string[];
   /** Search already failed or ran dry earlier in this request; this attempt runs without it. */
   searchUnavailable?: boolean;
@@ -98,6 +101,8 @@ export interface AttemptInput {
 export interface Resume { messages: Message[]; summary?: Compaction }
 export interface AttemptResult {
   success: boolean; text: string; reason?: EscalationReason;
+  /** A request-local execution boundary; it is not a failure reason or a completion claim. */
+  checkpoint?: Checkpoint;
   stopped?: string; turns: number; toolCalls: number; check?: 'passed' | 'failed';
   handoff?: string;
   changedFiles?: string[]; fileSizes?: Record<string, number>; shellRan?: boolean;
@@ -168,12 +173,14 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
     try { pinnedObjective = `${objective.slice(0, 2400)}\n[complete objective in ${(await scratch.save('outputs', 'task-objective', objective, '.txt')).path}]`; }
     catch { /* If storage is unavailable, preserve the objective verbatim rather than silently clipping it. */ }
   }
-  const pinnedRequest = pinnedPrefix + JSON.stringify({
+  const makePinnedRequest = () => pinnedPrefix + JSON.stringify({
     ...(objective && objective !== requestWords ? { objective: pinnedObjective } : {}),
     ...(input.junior ? { junior: { description: input.junior.description, agent_type: input.junior.agent_type, assignment: input.junior.assignment, artifacts: input.junior.artifacts } } : {}),
     current: requestWords.length > 2400 ? `${requestWords.slice(0, 2400)}\n[continued ${requestSource ? `in ${requestSource}` : 'in the verbatim current user message, retained outside compaction'}]` : requestWords,
+    amendments: recovery.checkpointAmendments.slice(-10),
     readOnly: Boolean(input.readOnly),
   });
+  let pinnedRequest = makePinnedRequest();
   const carriesRequest = (message: unknown): boolean => {
     const item = message as { role?: string; content?: string | Array<{ type?: string; text?: string }> };
     if (item.role !== 'user') return false;
@@ -351,15 +358,104 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
   const approvalAbort = new AbortController();
   const arm = (ms: number) => { timer = setTimeout(() => { timeout = true; approvalAbort.abort(new Error('attempt timed out')); agent.abort(); }, ms); };
   const clock = {
-    pause: () => { if (pauses++ === 0 && !terminated) { clearTimeout(timer); remaining = Math.max(0, deadline - Date.now()); } },
+     pause: () => { if (pauses++ === 0 && !terminated) { clearTimeout(timer); remaining = Math.max(0, deadline - Date.now()); } },
      resume: () => { pauses = Math.max(0, pauses - 1); if (!pauses && remaining !== undefined && !terminated && !input.signal?.aborted && !approvalAbort.signal.aborted) { deadline = Date.now() + remaining; arm(remaining); remaining = undefined; } },
+     setRemaining: (ms: number) => { if (remaining !== undefined) remaining = Math.max(0, ms); },
+     activeRemaining: () => remaining ?? Math.max(0, deadline - Date.now()),
   };
-  const continuationApproval: Approve = async approval => {
+  let checkpointPending = false, checkpointHandoffStarted = false, checkpointResumePending = false, checkpointFreshContext = false;
+  let checkpointReason: CheckpointReason = 'instructor_calls', checkpointResult: Checkpoint | undefined, lastCheckpoint: Checkpoint | undefined;
+  let lastContextEstimate: number | undefined;
+  const checkpointDecision = async (reason: CheckpointReason, handoff: string, allowContinuation = true): Promise<'continue' | 'partial'> => {
+    const state = task?.snapshot();
+    const remaining = allowance.remaining();
+    const instructorCalls = allowContinuation && inference.turns < config.policy.limits.maxTurns && ['instructor_calls', 'attempt_time', 'context_pressure'].includes(reason) && allowance.continuationBatchesUsed < allowance.maxContinuationBatches
+      ? Math.min(allowance.instructorBatchCalls, remaining.calls) : 0;
+    const activeMs = instructorCalls && remaining.ms > 1000 ? Math.min(config.policy.limits.attemptTimeoutMs, remaining.ms - 1000) : 0;
+    const offerId = instructorCalls && activeMs ? randomUUID() : undefined;
+    const sequence = ++recovery.checkpointSequence;
+    const taskChecks = state?.checks.slice(-8).map(item => ({ ref: `check:${item.commandHash ?? fingerprint(item.command).slice(0, 24)}`, status: item.epoch < state.sourceEpoch ? 'stale (source changed after check)' : item.status, summary: item.command.slice(0, 180) })) ?? [];
+    const recordedChecks = [...recovery.checkpointChecks.entries()].slice(-8).map(([ref, check]) => ({ ref: `check:${ref}`, status: check.sourceEpoch < (state?.sourceEpoch ?? recovery.checkpointSourceEpoch) ? 'stale (source changed after check)' : check.status, summary: check.command.slice(0, 180) }));
+    const observedMessages = messages() as Array<{ role: string; toolCallId?: string; isError?: boolean; content?: Array<{ type: string; id?: string; name?: string; arguments?: unknown }> }>;
+    const settledCalls = new Set(observedMessages.filter(message => message.role === 'toolResult' && !message.isError).map(message => message.toolCallId));
+    const observedWrites = observedMessages.filter(message => message.role === 'assistant').flatMap(message => (message.content ?? []).filter(part => part.type === 'toolCall' && ['write', 'edit'].includes(part.name ?? '') && settledCalls.has(part.id)).map(part => String((part.arguments as { path?: unknown } | undefined)?.path ?? '')).filter(Boolean));
+    const fileRefs = new Set([...evidence.changedFiles, ...observedWrites.map(path => activePathPolicy().resolve(path)), ...Object.values(state?.execution ?? {}).flatMap(item => item.changedFiles)]);
+    const usage = allowance.resourceUsage();
+    const spend = input.budget.spent();
+    const resultRecords = [
+      ...(state?.receipts.slice(-8).map(item => ({ ref: `receipt:${item.id}`, summary: `${item.tool} ${item.status}: ${item.summary}`.slice(0, 200) })) ?? []),
+      ...recovery.checkpointResults.slice(-8),
+    ].slice(-10);
+    const workerRecords = [...(state?.juniors.slice(-6).map(item => ({ ref: `worker:${item.name}`, summary: item.turns.at(-1)?.assistant.slice(0, 180) })) ?? []), ...[...recovery.checkpointWorkers.entries()].slice(-6).map(([name, summary]) => ({ ref: `worker:${name}`, summary: summary.slice(0, 180) }))].slice(-8);
+    const failureRecords = [...evidence.failedCalls.map(item => ({ ref: `failure:${fingerprint(item).slice(0, 20)}`, summary: `${item.call}: ${item.error}`.slice(0, 200) })), ...[...recovery.repeated.entries()].filter(([, count]) => count > 1).slice(-6).map(([key, count]) => ({ ref: `repeat:${fingerprint(key).slice(0, 20)}`, summary: `repeated result (${count}): ${key.slice(0, 160)}` }))].slice(-10);
+    const checkpoint: Checkpoint = {
+      version: 1, requestId: telemetry.requestId, checkpointId: sequence, sequence, reason,
+      durability: 'request-local', expiresAt: Date.now() + 60_000,
+      snapshot: {
+        ...((state?.objective ?? input.currentRequest ?? input.requestText ?? input.prompt) ? { originalObjective: (state?.objective ?? input.currentRequest ?? input.requestText ?? input.prompt).slice(0, 1200) } : {}),
+        amendments: recovery.checkpointAmendments.slice(-10),
+        artifacts: [...(state?.artifacts.slice(-6).map(item => ({ ref: `artifact:${item.id}`, summary: `${item.kind} ${item.path}`.slice(0, 180) })) ?? []), ...[...fileRefs].slice(-8).map(path => ({ ref: `file:${relative(ownFiles && within(ownRoot!, path, true) ? ownRoot! : input.cwd, path) || path}` }))].slice(-8),
+        checks: [...taskChecks, ...recordedChecks, ...(!taskChecks.length && !recordedChecks.length ? evidence.checks.slice(-8).map(item => ({ ref: `check:${fingerprint(item.command).slice(0, 24)}`, status: item.status, summary: item.command.slice(0, 180) })) : [])].slice(-8),
+        results: resultRecords,
+        workers: workerRecords,
+        resources: { requestCallsUsed: usage.callsUsed, requestCallsRemaining: remaining.calls, modelCallsUsed: usage.modelCallsUsed, modelCallsRemaining: remaining.modelCalls, activeMsRemaining: clock.activeRemaining(), aggregateMsRemaining: remaining.ms, contextLimitTokens: profile.contextTokens, contextEstimateTokens: lastContextEstimate ?? 'unknown', delegationsUsed: usage.delegationsUsed, juniorCalls: JSON.stringify(usage.juniorCalls), requestSpendUsd: spend.request, instructorCallsRemaining: allowance.callsRemainingFor(), continuationBatchesRemaining: Math.max(0, allowance.maxContinuationBatches - allowance.continuationBatchesUsed) },
+        pendingUncertain: [...(state?.receipts.filter(item => item.status === 'pending' || item.status === 'uncertain').slice(-8).map(item => `receipt:${item.id}:${item.status}`) ?? []), ...(policy.shellRan ? ['shell effects may be incomplete; inspect workspace'] : [])].slice(-8),
+        failures: failureRecords,
+      },
+      summary: [
+        `host observed ${evidence.toolCalls} tool calls; ${evidence.changedFiles.size} changed file(s)`,
+        `checks: ${evidence.lastCheck ?? 'not established'}; unresolved: ${evidence.unresolvedChecks.size}`,
+        'partial work is not verified complete; inspect referenced artifacts before continuing',
+      ],
+      ...(handoff.trim() ? { modelHandoff: handoff.trim().slice(0, 1200) } : {}),
+      ...(offerId ? { continuation: { offerId, instructorCalls, activeMs, freshContext: reason === 'context_pressure' } } : {}),
+    };
+    const sanitize = (value: unknown): unknown => typeof value === 'string' ? telemetry.redact(value).slice(0, 1200)
+      : Array.isArray(value) ? value.map(sanitize)
+      : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([key, child]) => [key, sanitize(child)])) : value;
+    const sanitizedCheckpoint = sanitize(checkpoint) as Checkpoint;
+    checkpointResult = sanitizedCheckpoint;
+    lastCheckpoint = sanitizedCheckpoint;
+    if (!input.onCheckpoint || input.signal?.aborted || approvalAbort.signal.aborted) return 'partial';
+    const expiresAt = checkpoint.expiresAt;
     clock.pause();
-    try { return await input.approve(approval); }
-    finally { clock.resume(); }
+    let decision: CheckpointDecision | undefined;
+    const waitAbort = new AbortController();
+    const propagateAbort = () => waitAbort.abort(approvalAbort.signal.reason);
+    approvalAbort.signal.addEventListener('abort', propagateAbort, { once: true });
+    let expiryTimer: NodeJS.Timeout | undefined;
+    let abortHandler: (() => void) | undefined;
+    const expired = Symbol('checkpoint expired');
+    try {
+      const answer = Promise.resolve().then(() => input.onCheckpoint!(freezeCheckpoint(sanitizedCheckpoint), waitAbort.signal)).catch(() => undefined);
+      const expiration = new Promise<typeof expired>(resolve => { expiryTimer = setTimeout(() => { waitAbort.abort(new Error('checkpoint expired')); resolve(expired); }, Math.max(0, expiresAt - Date.now())); });
+      const aborted = new Promise<symbol>(resolve => {
+        if (approvalAbort.signal.aborted) resolve(Symbol('aborted'));
+        else { abortHandler = () => resolve(Symbol('aborted')); approvalAbort.signal.addEventListener('abort', abortHandler, { once: true }); }
+      });
+      const result = await Promise.race([answer, expiration, aborted]);
+      if (result === expired || typeof result === 'symbol') { clock.resume(); return 'partial'; }
+      decision = result;
+    } catch { clock.resume(); return 'partial'; }
+    finally { clearTimeout(expiryTimer); approvalAbort.signal.removeEventListener('abort', propagateAbort); if (abortHandler) approvalAbort.signal.removeEventListener('abort', abortHandler); }
+    if (input.signal?.aborted || approvalAbort.signal.aborted || Date.now() > expiresAt || !decision
+      || decision.requestId !== sanitizedCheckpoint.requestId || decision.checkpointId !== sanitizedCheckpoint.checkpointId) { clock.resume(); return 'partial'; }
+    if (decision.action === 'finish_partial') { clock.resume(); return 'partial'; }
+    if (!offerId || !checkpoint.continuation || decision.offerId !== offerId || !instructorCalls || !activeMs
+      || decision.action === 'redirect' && !decision.amendment.trim()) { clock.resume(); return 'partial'; }
+    if (allowance.grantCheckpointBatch() <= 0) { clock.resume(); return 'partial'; }
+    clock.setRemaining(activeMs);
+    clock.resume();
+    checkpointResult = undefined;
+    checkpointFreshContext = reason === 'context_pressure';
+    checkpointResumePending = true;
+    if (decision.action === 'redirect') {
+      recovery.checkpointAmendments.push(decision.amendment.trim().slice(0, 1000));
+      if (recovery.checkpointAmendments.length > 10) recovery.checkpointAmendments.splice(0, recovery.checkpointAmendments.length - 10);
+      pinnedRequest = makePinnedRequest();
+    }
+    return 'continue';
   };
-  const gateInstructor = () => allowance.ensureInstructor(approvalAbort.signal, continuationApproval);
   // Juniors keep their transcripts in the scratchpad, and a short context gains little from them.
   const delegation = model.toolCalling && !input.casual && !input.side && !input.junior && scratchFolder && config.delegation?.enabled !== false && profile.contextTokens >= delegationMinContext
     ? delegateTool({ ...input, config, recovery }, scratchFolder, ownRoot, clock, runAttempt, allowance) : undefined;
@@ -419,6 +515,8 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
   }
   if (fit?.turns) await telemetry.event('history_fit', { attempt: input.attempt ?? 0, ...fit, ...(summary ? { summarised: true } : {}), ...(config.test?.historyTokens !== undefined || config.test?.compactHistory ? { forced: true } : {}) });
   const stream = guardedStream(config, tier, input.budget, telemetry, inference, { ...(playing ? { outputTokens: profile.maxOutputTokens } : {}), admit: () => allowance.consumeModel() });
+  const handoffStream = guardedStream(config, tier, input.budget, telemetry, inference, { outputTokens: Math.min(1200, profile.maxOutputTokens), thinking: 'off', admit: () => allowance.consumeModel() });
+  let checkpointHandoffRequest = false;
   // The summary at the head of the context, and where in the agent's messages the newest compaction kept from.
   let lead = summary ? history[0] : undefined, keptFrom = 0, compactionFailed = false;
   const opening = { lead, history: new Set<unknown>(history) };
@@ -521,19 +619,74 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
     streamFn: (...args) => {
       input.onActivity?.({ kind: 'composing', label: 'composing response...' });
       if (config.test?.traceDir) void trace(config.test.traceDir, args[1]);
+      if (checkpointHandoffRequest) { checkpointHandoffRequest = false; return handoffStream(...args); }
       return stream(...args);
     },
     toolExecution: 'sequential',
     // Before every request, the first included, so an attempt carrying on from another starts within the limit too.
     prepareRequest: async ({ context: given }) => {
-      if (!input.readOnly && allowance.remaining().calls <= 0) toolLimit = true;
-      const canRenew = !input.junior && !input.readOnly && !input.side && !input.casual && !evidence.answerNow && !toolLimit && !timeout && !evidence.reason && !capabilityDenied && !policy.denied;
-      const budgetState = canRenew ? await gateInstructor() : allowance.denied ? 'denied' : 'ready';
+      if (allowance.remaining().modelCalls <= 0 || allowance.remaining().ms <= 0) {
+        // A hard aggregate ceiling is terminal. A checkpoint must never offer a
+        // renewal when this request has no model-call allowance left.
+        inference.stop = allowance.remaining().modelCalls <= 0 ? 'turn_limit' : 'timeout';
+        agent.abort();
+        return { context: { ...given, tools: [] } };
+      }
+      if (!input.readOnly && !checkpointHandoffStarted && allowance.remaining().calls <= 0) {
+        if (!input.junior && !input.side && !input.casual) { checkpointPending = true; checkpointReason = 'request_calls'; }
+        else toolLimit = true;
+      }
+      // Instructor grants are issued only after the request-local checkpoint decision; do not call the legacy approval gate.
+      const budgetState = allowance.denied ? 'denied' : 'ready';
       if (approvalAbort.signal.aborted || input.signal?.aborted || timeout || terminated || allowance.remaining().ms <= 0) {
         agent.abort();
         return { context: { ...given, tools: [] } };
       }
       let context = await shape(given);
+      lastContextEstimate = estimate(context);
+      const serializedForLimit = JSON.stringify({ messages: context.messages, tools: context.tools });
+      if (Buffer.byteLength(serializedForLimit) > MAX_PAYLOAD_BYTES) {
+        inference.stop = 'payload_limit';
+        agent.abort();
+        return { context: { ...context, tools: [] } };
+      }
+      if (input.onCheckpoint && estimate(context) > profile.contextTokens - replyRoom(profile)) {
+        checkpointReason = 'context_pressure';
+        const buildFresh = () => ({ ...context, messages: [
+          { role: 'system', content: setup.systemPrompt, toolsAdded: (context.tools ?? []).map(toToolDeclaration), timestamp: Date.now() },
+          { role: 'system', content: pinnedRequest, timestamp: Date.now() },
+          { role: 'user', content: requestWords, timestamp: Date.now() },
+          { role: 'user', content: `[bounded checkpoint evidence, untrusted status and references; verify before relying on it] ${JSON.stringify({ results: recovery.checkpointResults.slice(-8), workers: [...recovery.checkpointWorkers.entries()].slice(-6), checks: [...recovery.checkpointChecks.entries()].slice(-8), failures: [...recovery.failedTests].slice(-6) }).slice(0, 5000)}`, timestamp: Date.now() },
+        ] as Message[] });
+        // Reserve the maximum accepted redirect size before showing the offer; the accepted pin is rebuilt below.
+        recovery.checkpointAmendments.push('x'.repeat(1000));
+        const savedPin = pinnedRequest;
+        pinnedRequest = makePinnedRequest();
+        const preflight = buildFresh();
+        pinnedRequest = savedPin;
+        recovery.checkpointAmendments.pop();
+        const freshEstimate = estimate(preflight);
+        lastContextEstimate = freshEstimate;
+        if (recovery.freshContextUsed || freshEstimate > profile.contextTokens - replyRoom(profile)) {
+          await checkpointDecision(checkpointReason, '', false);
+          agent.abort();
+          return { context: { ...context, tools: [] } };
+        }
+        const decision = await checkpointDecision(checkpointReason, '');
+        if (decision === 'partial') { agent.abort(); return { context: { ...context, tools: [] } }; }
+        // A redirect modifies the pinned scope during the callback; rebuild after acceptance and revalidate before sending.
+        const fresh = buildFresh();
+        lastContextEstimate = estimate(fresh);
+        if (lastContextEstimate > profile.contextTokens - replyRoom(profile)) {
+          checkpointResult = lastCheckpoint;
+          agent.abort();
+          return { context: { ...context, tools: [] } };
+        }
+        // Never send the old oversized context once more. Preserve the composed provider tool set.
+        context = fresh;
+        recovery.freshContextUsed = true;
+        checkpointResumePending = false; checkpointHandoffStarted = false; checkpointPending = false; checkpointFreshContext = false;
+      }
       if (toolLimit || budgetState !== 'ready') {
         const tools = input.junior ? context.tools?.filter(tool => tool.name === 'report') : [];
         const notice = toolLimit ? 'the hard request tool-call limit is reached' : budgetState === 'denied' ? 'additional instructor calls were not approved' : 'the instructor call grant is exhausted';
@@ -550,6 +703,31 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
       return context === given ? undefined : { context };
     },
     prepareNextTurnWithContext: async ({ context }) => {
+      const warningAt = Math.min(3, Math.max(1, Math.floor(allowance.instructorBatchCalls * 0.15)));
+      const activeWarningAt = Math.min(15_000, config.policy.limits.attemptTimeoutMs * 0.1);
+      const aggregateWarningAt = Math.min(60_000, allowance.limits.timeoutMs * 0.02);
+      if (!checkpointResumePending && !checkpointHandoffStarted && !input.junior && !input.readOnly && !input.side && !input.casual
+        && !(playing && inference.turns >= config.policy.limits.maxTurns - 1)
+        && (checkpointPending || inference.turns >= config.policy.limits.maxTurns - 1 || allowance.callsRemainingFor() === 0 || allowance.instructorCallsUsed > 0 && allowance.callsRemainingFor() <= warningAt || clock.activeRemaining() <= activeWarningAt || allowance.remaining().ms <= aggregateWarningAt || allowance.remaining().modelCalls <= 1)) {
+        checkpointReason = checkpointPending ? checkpointReason : allowance.remaining().ms <= aggregateWarningAt ? 'request_time' : inference.turns >= config.policy.limits.maxTurns - 1 || allowance.remaining().modelCalls <= 1 ? 'model_calls' : clock.activeRemaining() <= activeWarningAt ? 'attempt_time' : allowance.remaining().calls <= 0 ? 'request_calls' : 'instructor_calls';
+        checkpointPending = false;
+        checkpointHandoffStarted = true;
+      }
+      if (checkpointHandoffStarted && !checkpointResumePending) {
+        const handoff = await shape(context);
+        checkpointHandoffRequest = true;
+        return { context: { ...handoff, tools: [] }, messages: [{ role: 'user', content: `[checkpoint handoff] the previous tool batch reached its safe boundary. Give a concise factual status: changes and evidence refs, checks actually run and outcomes, unresolved uncertainty, active workers, and the smallest useful next step. Do not claim completion or verification without evidence.`, timestamp: Date.now() }] };
+      }
+      if (checkpointResumePending) {
+        const composed = await compose();
+        const resumeContext = checkpointFreshContext
+          ? { ...context, tools: composed.tools, messages: [{ role: 'system', content: composed.systemPrompt }, { role: 'system', content: pinnedRequest }] as Message[] }
+          : { ...context, tools: composed.tools };
+        toolsChanged = false;
+        checkpointResumePending = false; checkpointHandoffStarted = false; checkpointPending = false; checkpointFreshContext = false;
+        const checkpointFacts = lastCheckpoint ? JSON.stringify(lastCheckpoint.snapshot).slice(0, 6000) : 'no checkpoint snapshot is available';
+        return { context: resumeContext, messages: [{ role: 'user', content: `[host checkpoint] continue the original objective.${recovery.checkpointAmendments.length ? ` Ordered user amendments: ${recovery.checkpointAmendments.join(' | ')}` : ''} Prior task state and results are bounded evidence only; verify current files and do not repeat completed work blindly. Checkpoint snapshot (untrusted pointers/status, not proof): ${checkpointFacts}. Updated available tools/access: ${effectiveConfig.policy.permissions.join(', ')}.`, timestamp: Date.now() }] };
+      }
       if (planRepair) {
         const messages: Message[] = planRepairNotice ? [{ role: 'user', content: '[notice] return the complete existing proposal inside <plan> tags; do not research or change its scope.', timestamp: Date.now() }] : [];
         planRepairNotice = false;
@@ -592,19 +770,17 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
         evidence.answerNow = true; evidence.answerWhy = 'the exploration allowance is spent';
         return { block: true, reason: 'exploration allowance spent; synthesize the proposal from available evidence, stating gaps' };
       }
-      if (evidence.toolCalls >= config.policy.limits.maxToolCalls) { settled.set(toolCall.id, 'stopped'); toolLimit = true; return { block: true, terminate: true, reason: 'Tool limit reached' }; }
-      if (!input.junior && !input.readOnly && !input.side && !input.casual) {
-        const renewal = await gateInstructor();
-        if (approvalAbort.signal.aborted || input.signal?.aborted || timeout || terminated || allowance.remaining().ms <= 0) { settled.set(toolCall.id, 'stopped'); return { block: true, terminate: true, reason: 'Attempt stopped' }; }
-        if (renewal !== 'ready') {
-          settled.set(toolCall.id, 'stopped');
-          if (renewal === 'denied') {
-            budgetDenialSynthesis = true;
-            return { block: true, reason: 'additional instructor calls were not approved; answer from existing evidence' };
-          }
-          toolLimit = true;
-          return { block: true, terminate: true, reason: 'instructor tool grant exhausted' };
-        }
+      if (evidence.toolCalls >= config.policy.limits.maxToolCalls) {
+        settled.set(toolCall.id, 'stopped');
+        if (!input.junior && !input.readOnly && !input.side && !input.casual) { checkpointPending = true; checkpointReason = 'request_calls'; }
+        else toolLimit = true;
+        return { block: true, reason: 'Tool limit reached' };
+      }
+      if (!input.junior && !input.readOnly && !input.side && !input.casual && allowance.callsRemainingFor() <= 0) {
+        checkpointPending = true;
+        checkpointReason = allowance.remaining().calls <= 0 ? 'request_calls' : 'instructor_calls';
+        settled.set(toolCall.id, 'stopped');
+        return { block: true, reason: 'instructor lease reached; this unexecuted batch suffix is not replayed' };
       }
       if (!allowance.canAdmitTool(toolCall.id, input.junior?.name, input.budgetReservation)) { settled.set(toolCall.id, 'stopped'); toolLimit = true; return { block: true, reason: 'reserved request capacity is unavailable; finish from existing evidence' }; }
       if (task) {
@@ -664,6 +840,28 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
       if (touched) await telemetry.event('scratch_access', { tool: toolCall.name, toolCallId: toolCall.id, attempt: input.attempt ?? 0, file: touched, succeeded: !isError, chars: shown.length });
       evidence.observe(toolCall.name, args, isError, kept ? kept.text : shown, kept?.saved?.path, outcome?.changed,
         sourceSaved?.complete ? sourceSaved.sha256 : fingerprint(result.content.map(part => part.type === 'text' ? { ...part, text: part.text.replace(savedLine, '').trim() } : part)));
+      const updateCheckpointResult = (ref: string, summary: string) => {
+        recovery.checkpointResults.push({ ref, summary: summary.slice(0, 240) });
+        if (recovery.checkpointResults.length > 16) recovery.checkpointResults.splice(0, recovery.checkpointResults.length - 16);
+      };
+      const savedRef = kept?.saved?.path ? `saved-output:${relative(scratch?.folder ?? input.cwd, kept.saved.path)}` : undefined;
+      updateCheckpointResult(savedRef ?? (receipt ? `receipt:${receipt}` : `toolcall:${toolCall.id}`), `${toolCall.name} ${isError ? 'failed' : 'succeeded'}${shown ? `: ${shown}` : ''}`);
+      const juniorName = typeof (result.details as { junior?: unknown } | undefined)?.junior === 'string' ? (result.details as { junior: string }).junior : undefined;
+      if (juniorName) {
+        const report = shown.slice(0, 240);
+        recovery.checkpointWorkers.set(juniorName, report);
+        while (recovery.checkpointWorkers.size > 12) recovery.checkpointWorkers.delete(recovery.checkpointWorkers.keys().next().value!);
+      }
+      const command = String((args as { command?: unknown }).command ?? '');
+      const isCheck = toolCall.name === 'bash' && isCheckCommand(command);
+      const changedSource = !isError && outcome?.changed !== false && ['write', 'edit', 'play_update', 'play_start'].includes(toolCall.name);
+      if (changedSource) recovery.checkpointSourceEpoch = task?.snapshot().sourceEpoch ?? recovery.checkpointSourceEpoch + 1;
+      if (isCheck) {
+        const sourceEpoch = task?.snapshot().sourceEpoch ?? recovery.checkpointSourceEpoch;
+        const ref = fingerprint(command).slice(0, 24);
+        recovery.checkpointChecks.set(ref, { command, status: isError ? 'failed' : 'passed', sourceEpoch });
+        while (recovery.checkpointChecks.size > 16) recovery.checkpointChecks.delete(recovery.checkpointChecks.keys().next().value!);
+      }
       if (task && toolCall.name === 'bash' && isCheckCommand(String((args as { command?: string }).command ?? ''))) {
         const command = String((args as { command?: string }).command ?? '');
         if (executionPersisted) localUnresolvedChecks.delete(command);
@@ -723,8 +921,30 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
       if (extra.length) return { content: [...content, ...extra.map(text => ({ type: 'text' as const, text }))], isError };
       return kept || outcome?.failed ? { content, isError } : undefined;
     },
-    finishTurn: ({ message }) => {
+    finishTurn: async ({ message }) => {
       if (!input.junior) allowance.finishQueuedBatch();
+      if (capabilityDenied || policy.denied || evidence.reason && evidence.reason !== 'ineffective_calls' || searchFailed || toolLimit || timeout || input.signal?.aborted || approvalAbort.signal.aborted) {
+        checkpointPending = false; checkpointHandoffStarted = false;
+        return { action: 'end' as const };
+      }
+      if (checkpointHandoffStarted && (message.stopReason !== 'stop' || inference.stop || budgetDenialSynthesis)) {
+        checkpointPending = false; checkpointHandoffStarted = false;
+        return { action: 'end' as const };
+      }
+      if (checkpointPending) {
+        checkpointPending = false;
+        checkpointHandoffStarted = true;
+        return { action: 'continue' as const };
+      }
+      if (checkpointHandoffStarted) {
+        const handoff = message.content.filter(part => part.type === 'text').map(part => part.text).join('\n').trim().slice(0, 1200);
+        const canContinue = message.stopReason === 'stop' && !inference.stop && !timeout && !input.signal?.aborted && !approvalAbort.signal.aborted && !capabilityDenied && !policy.denied && !budgetDenialSynthesis;
+        const decision = await checkpointDecision(checkpointReason, handoff, canContinue);
+        if (decision === 'partial') { agent.abort(); return { action: 'end' as const }; }
+        checkpointResumePending = true;
+        checkpointPending = false; checkpointHandoffStarted = false;
+        return { action: 'continue' as const };
+      }
       if (capabilityDenied || policy.denied || evidence.reason || searchFailed || toolLimit || timeout || input.signal?.aborted) return { action: 'end' };
       if (budgetDenialSynthesis) {
         if (!budgetDenialSynthesisStarted) { budgetDenialSynthesisStarted = true; return { action: 'continue' }; }
@@ -809,6 +1029,7 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
   try {
     input.signal?.throwIfAborted();
     await agent.prompt(input.prompt, pictures.length ? pictures : undefined);
+    if (inference.stop === 'context_limit' && !checkpointResult) await checkpointDecision('context_pressure', '', false);
   } finally {
     terminated = true;
     if (!input.junior) allowance.finishQueuedBatch();
@@ -830,16 +1051,16 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
   const stop = kept ? undefined : inference.stop;
   // A final reply without calls is the answer itself; everything before it is what the tools did.
   const steps = turnSteps(last?.role === 'assistant' && last === turn.at(-1) && !last.content.some(part => part.type === 'toolCall') ? turn.slice(0, -1) : turn);
-  const stopped = capabilityDenied || policy.denied ? 'approval_denied' : input.signal?.aborted ? 'cancelled' : searchFailed ? 'search_unavailable' : timeout ? 'timeout' : toolLimit ? 'tool_limit' : planRepair && !planText(text) && looksLikePlan(text) ? 'invalid_plan' : stop;
+  const stopped = input.signal?.aborted ? 'cancelled' : timeout ? 'timeout' : checkpointResult ? 'checkpoint' : capabilityDenied || policy.denied ? 'approval_denied' : searchFailed ? 'search_unavailable' : toolLimit ? 'tool_limit' : planRepair && !planText(text) && looksLikePlan(text) ? 'invalid_plan' : stop;
   // A server that says the model called a tool but sends no call it could parse leaves nothing to run or show.
   const lostCall = last?.role === 'assistant' && lost(last);
   // Running out of tokens with only thinking to show is overthinking; with an answer or a call under way, the reply was too long.
   const overthought = last?.role === 'assistant' && last.content.some(part => part.type === 'thinking' && part.thinking.trim()) && !text.trim() && !last.content.some(part => part.type === 'toolCall');
   // A model that answers after a failed call has seen the error; its answer stands rather than being retried as incomplete.
   const answered = last?.role === 'assistant' && last.stopReason === 'stop' && Boolean(text.trim());
-  const reason = evidence.reason ?? (last?.role === 'assistant' && last.stopReason === 'length' ? overthought ? 'overthinking' : 'unsupported' : undefined) ?? (lostCall ? 'provider_error' : undefined) ?? (stop && ['unsupported', 'turn_limit', 'provider_error'].includes(stop) ? stop as EscalationReason : undefined)
+  const reason = checkpointResult ? undefined : evidence.reason ?? (last?.role === 'assistant' && last.stopReason === 'length' ? overthought ? 'overthinking' : 'unsupported' : undefined) ?? (lostCall ? 'provider_error' : undefined) ?? (stop && ['unsupported', 'turn_limit', 'provider_error'].includes(stop) ? stop as EscalationReason : undefined)
     ?? (evidence.unresolvedChecks.size || evidence.lastCheck === 'failed' ? 'test_failures' : evidence.failures && !answered ? 'tool_failures' : undefined);
-  const success = !stopped && !reason && evidence.lastCheck !== 'failed' && (answered || reported);
+  const success = !checkpointResult && !stopped && !reason && evidence.lastCheck !== 'failed' && (answered || reported);
   // What the model last saw of this request, for a retry on the same model: after a compaction here, everything after
   // its summary (which may reach back into earlier turns); otherwise everything after the earlier turns it opened with.
   const compactedHere = lead !== opening.lead;
@@ -857,6 +1078,7 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
   return {
     success,
     text,
+    ...(checkpointResult ? { checkpoint: checkpointResult } : {}),
     steps,
     failedCalls: evidence.failedCalls,
     changedFiles,

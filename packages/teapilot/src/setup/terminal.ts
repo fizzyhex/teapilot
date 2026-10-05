@@ -5,14 +5,41 @@ import { terminalColour, terminalRows, type TerminalPresentation } from '../pres
 import type { ActivityUI } from '../activity.js';
 import type { ComposerContext } from '../composer.js';
 import { SetupScreen } from './screen.js';
+import type { Checkpoint, CheckpointDecision } from '../agents/checkpoint.js';
 
 export interface SetupUI extends ActivityUI {
   input(message: string, fallback?: string, secret?: boolean, signal?: AbortSignal): Promise<string>;
-  choose(message: string, choices: string[], fallback?: number): Promise<number>;
+  choose(message: string, choices: string[], fallback?: number, signal?: AbortSignal): Promise<number>;
   confirm(message: string, signal?: AbortSignal): Promise<boolean>;
   log(message: string): void;
   /** Take over the terminal for tabbed setup, when it is interactive and large enough. */
   screen?(): SetupScreen | undefined;
+}
+
+/** Bounded checkpoint choices shared by the real terminal and its UI tests. */
+export async function terminalCheckpointDecision(checkpoint: Readonly<Checkpoint>, ui: Pick<SetupUI, 'choose' | 'input'> | undefined,
+  signal: AbortSignal, options: { interactive: boolean; json: boolean; now?: () => number }): Promise<CheckpointDecision | undefined> {
+  const { interactive, json } = options;
+  const now = options.now ?? Date.now;
+  if (!ui || !interactive || json || signal.aborted || now() >= checkpoint.expiresAt) return undefined;
+  const deadline = new AbortController();
+  const timer = setTimeout(() => deadline.abort(), Math.max(0, checkpoint.expiresAt - now()));
+  const boundedSignal = AbortSignal.any([signal, deadline.signal]);
+  const choices = checkpoint.continuation ? ['Continue', 'Change direction', 'Finish partial'] : ['Finish partial'];
+  try {
+    const choice = await ui.choose('Checkpoint paused. Use Change direction to steer this task; ordinary messages start the next turn.', choices, choices.length - 1, boundedSignal);
+    if (boundedSignal.aborted || now() >= checkpoint.expiresAt) return undefined;
+    if (!checkpoint.continuation || choice === choices.length - 1) return { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action: 'finish_partial' };
+    if (choice === 0) return { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action: 'continue', offerId: checkpoint.continuation.offerId };
+    if (choice !== 1) return undefined;
+    let amendment = '';
+    while (!amendment.trim()) {
+      amendment = await ui.input('What should change? (blank keeps the checkpoint paused)', undefined, false, boundedSignal);
+      if (boundedSignal.aborted || now() >= checkpoint.expiresAt) return undefined;
+    }
+    return { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action: 'redirect', offerId: checkpoint.continuation.offerId, amendment: amendment.trim().slice(0, 1000) };
+  } catch { return undefined; }
+  finally { clearTimeout(timer); }
 }
 
 export async function chooseMany(ui: SetupUI, message: string, choices: string[], fallback = 0): Promise<number[]> {
@@ -93,11 +120,11 @@ export function terminalUI(signal: AbortSignal, presentation?: TerminalPresentat
         presentation?.endPrompt(submitted, occupied ?? Number.MAX_SAFE_INTEGER);
       }
     },
-    async choose(message: string, choices: string[], fallback = 0): Promise<number> {
+    async choose(message: string, choices: string[], fallback = 0, extraSignal?: AbortSignal): Promise<number> {
       write(`\n${paint('bold', message)}\n\n`);
       choices.forEach((choice, index) => write(`  ${paint('cyan', String(index + 1))}. ${choice}\n`));
       for (;;) {
-        const value = Number(await ui.input('Choose', String(fallback + 1)));
+        const value = Number(await ui.input('Choose', String(fallback + 1), false, extraSignal));
         if (Number.isInteger(value) && value >= 1 && value <= choices.length) return value - 1;
         ui.log(`Enter a number from 1 to ${choices.length}.`);
       }

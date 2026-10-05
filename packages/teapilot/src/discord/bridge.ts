@@ -2,6 +2,7 @@ import { layout, type Message as AnswerMessage, type Resolved } from 'pretty-sen
 import { casualLines, paceLines } from '../casual.js';
 import { runSession, type SessionExtension } from '../chat.js';
 import type { HostDependencies, HostRequest, HostResult } from '../host.js';
+import type { Checkpoint, CheckpointDecision } from '../agents/checkpoint.js';
 import { formatInterruption } from '../interruption.js';
 import { repositoryOffered, repositoryPermissions } from '../execution/grants.js';
 import type { Approval, Approve } from '../execution/policy.js';
@@ -32,6 +33,8 @@ export interface DiscordTransport {
   askApproval(text: string, signal: AbortSignal, users?: boolean): Promise<boolean>;
   /** Continuation batches auto-approve after a short response window; absent transports fail closed. */
   askContinuationBudget?(text: string, signal: AbortSignal, timeoutMs?: number): Promise<'approved' | 'denied' | 'auto-approved'>;
+  /** A request-local execution checkpoint. This is deliberately distinct from feed Resume. */
+  checkpoint?(text: string, checkpoint: Checkpoint, signal: AbortSignal, decide: (action: 'continue' | 'redirect' | 'finish_partial', userId: string, amendment?: string) => CheckpointDecision | undefined, stop: (userId: string) => CardReply): Promise<CheckpointDecision | undefined>;
   typing(): void;
   /** Posts files as attachments, with a line of text. */
   sendFiles?(text: string, files: Array<{ name: string; data: Buffer }>): Promise<string>;
@@ -70,7 +73,7 @@ export interface ConversationOptions {
   request: HostRequest;
   maxPromptChars: number;
   queue: TurnQueue;
-  run: (request: HostRequest, dependencies: Pick<HostDependencies, 'approve' | 'onEvent' | 'onReasoning'>) => Promise<HostResult>;
+  run: (request: HostRequest, dependencies: Pick<HostDependencies, 'approve' | 'onEvent' | 'onReasoning' | 'onCheckpoint'>) => Promise<HostResult>;
   redact: (text: string) => string;
   /** Operator log in the terminal running teapilot discord start. */
   log: (text: string) => void;
@@ -402,7 +405,36 @@ export class Conversation {
         signal.throwIfAborted();
         if (typed) this.options.transport.typing();
         if (!answerOnly && card.set('thinking') === 'queued') refresh();
-        return await this.options.run({ ...request, signal }, { approve: this.approve, onEvent: this.onEvent, onReasoning: this.onReasoning });
+        return await this.options.run({ ...request, signal }, { approve: this.approve, onEvent: this.onEvent, onReasoning: this.onReasoning,
+          onCheckpoint: async (checkpoint, checkpointSignal) => {
+            const decide = (action: 'continue' | 'redirect' | 'finish_partial', userId: string, amendment?: string): CheckpointDecision | undefined => {
+              if (signal.aborted || checkpointSignal.aborted || Date.now() >= checkpoint.expiresAt) return undefined;
+              if (userId !== speaker && !this.operator(userId)) return undefined;
+              if (action !== 'finish_partial' && !checkpoint.continuation) return undefined;
+              if (action === 'continue') return { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action, offerId: checkpoint.continuation!.offerId };
+              if (action === 'redirect') return amendment?.trim() ? { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action, offerId: checkpoint.continuation!.offerId, amendment: amendment.trim().slice(0, 1000) } : undefined;
+              return { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action };
+            };
+            if (!this.options.transport.checkpoint) {
+              await this.say('checkpoint reached, but this transport cannot collect a decision. stopping here; this request cannot resume after restart.', true);
+              return undefined;
+            }
+            const live = this.live;
+            const previous = live?.card.set('checkpoint');
+            live?.refresh();
+            const facts = checkpoint.summary.map(line => `• ${this.options.redact(line).slice(0, 300)}`).join('\n');
+            const offer = checkpoint.continuation ? `\n\nnext window: ${checkpoint.continuation.instructorCalls} instructor calls, ${Math.ceil(checkpoint.continuation.activeMs / 60_000)}m active${checkpoint.continuation.freshContext ? ', fresh context' : ''}` : '\n\nno continuation window remains inside this request’s authorization.';
+            const proposal = checkpoint.modelHandoff ? `\n\nmodel proposal (unverified): ${this.options.redact(checkpoint.modelHandoff).slice(0, 500)}` : '';
+            const text = `⏸️ checkpoint · request-local; not resumable after restart\n${facts || 'No verified summary available.'}${offer}${proposal}\n\nuse Change direction to steer this paused task; ordinary messages start the next turn.`.slice(0, 1600);
+            try { return await this.options.transport.checkpoint(text, checkpoint, AbortSignal.any([signal, checkpointSignal]), decide, userId => controls(true).press('stop', userId)); }
+            finally {
+              if (live && previous) {
+                const current = live.card.set(previous);
+                if (current !== 'checkpoint') live.card.set(current);
+                live.refresh();
+              }
+            }
+          } });
       }, () => { if (answerOnly) void this.say('Queued behind another task.'); else { card.set('queued'); refresh(); } });
     } catch (error) {
       const stopped = turn.signal.aborted;

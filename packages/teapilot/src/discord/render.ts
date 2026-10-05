@@ -25,14 +25,14 @@ export function quoteMessage(message: QuotedMessage, chain: ReplyChain = { messa
 }
 
 /** What a turn is doing now, as its status card's first line shows it. */
-export type CardPhase = 'queued' | 'thinking' | 'running' | 'writing' | 'compacting' | 'approval' | 'stopping';
+export type CardPhase = 'queued' | 'thinking' | 'running' | 'writing' | 'compacting' | 'approval' | 'checkpoint' | 'stopping';
 /** What a press on a status card shows the person who pressed it, and only them. */
 export interface CardReply { text: string; file?: { name: string; content: string } }
 /** A tool call, reasoning, or something the host did between them (a compaction, a tip), which is listed but not counted as a step. */
 type Step = { tool: string } | { reasoning: string } | { note: string };
 
 const phases: Record<CardPhase, string> = {
-  queued: '⏳ queued behind another task', thinking: '🫖 thinking', running: '⚙️ running', writing: '✍️ writing',
+  queued: '⏳ queued behind another task', thinking: '🫖 thinking', running: '⚙️ running', writing: '✍️ writing', checkpoint: '⏸️ checkpoint — awaiting your choice',
   compacting: '🗜️ compacting earlier context', approval: '⏸️ waiting for approval', stopping: '⏹️ stopping',
 };
 /** Reasoning kept per turn for Details, so a runaway model cannot grow it without bound. */

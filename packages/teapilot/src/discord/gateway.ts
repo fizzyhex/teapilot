@@ -4,6 +4,7 @@ import type { ActionRowBuilder, APIModalInteractionResponseCallbackData, Attachm
 import type { IncomingMessage } from './access.js';
 import type { SideAnswer } from './aside-store.js';
 import type { CardButton, CardControls, DiscordTransport } from './bridge.js';
+import type { Checkpoint, CheckpointDecision } from '../agents/checkpoint.js';
 import { browseGone, browseModal, browseModalPrefix, browsePrefix, browseRows, browseSubmit, type BrowseAction, type BrowseSession, type WorkspaceBrowser } from './browse.js';
 import { attachmentOption, commandDefinitions, commandText, interactionLifetimeMs, promptAttachments, promptCommand, promptSetup, replyCommand, replyMenu, treeOption, withoutUserInstall, type PromptSetup } from './commands.js';
 import { isAside } from '../chat.js';
@@ -141,6 +142,8 @@ const pauseNote = '-# live updates frozen... discord stops them after 15 minutes
 const planPrefix = 'teapilot-plan:';
 /** Custom id prefix of the change request form: `teapilot-plan-modal:<message id>`. */
 const planModalPrefix = 'teapilot-plan-modal:';
+const checkpointPrefix = 'teapilot-checkpoint:';
+const checkpointModalPrefix = 'teapilot-checkpoint-modal:';
 /** Custom id prefix of a side answer's share menu: `teapilot-btw:<nonce>`. */
 const sidePrefix = 'teapilot-btw:';
 /** Custom id prefix of a compactly posted side answer's button: `teapilot-btw-show:<id>`, the id in the aside store. */
@@ -212,6 +215,7 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
   const pending = new Map<string, { text: string; users: boolean; resolve(approved: boolean): void }>();
   const pendingContinuations = new Map<string, { text: string; claim(): boolean; resolve(outcome: 'approved' | 'denied' | 'auto-approved', actor?: string): void }>();
   const cards = new Map<string, CardControls['press']>();
+  const checkpoints = new Map<string, { checkpoint: Checkpoint; decide: (action: 'continue' | 'redirect' | 'finish_partial', userId: string, amendment?: string) => CheckpointDecision | undefined; stop(userId: string): { text: string }; resolve(value: CheckpointDecision | undefined): void; finish(value: CheckpointDecision | undefined, verdict: string, reviseMessage?: boolean): void; text: string; messageId: string; finalContent?: string; settled: boolean }>();
   const remember = (id: string, controls: CardControls) => {
     cards.delete(id); cards.set(id, controls.press);
     if (cards.size > cardLimit) cards.delete(cards.keys().next().value!);
@@ -234,6 +238,48 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
     return emoji ? button.setEmoji(emoji) : button;
   }))] : [];
   const settle = (text: string, verdict: string) => `${text.slice(0, MESSAGE_LIMIT - verdict.length - 2)}\n\n${verdict}`;
+  const checkpointOffer = (text: string, checkpoint: Checkpoint, signal: AbortSignal,
+    decide: (action: 'continue' | 'redirect' | 'finish_partial', userId: string, amendment?: string) => CheckpointDecision | undefined,
+    stop: (userId: string) => { text: string },
+    post: (payload: Payload) => Promise<{ id: string }>,
+    revise: (id: string, payload: Payload) => Promise<unknown>): Promise<CheckpointDecision | undefined> => {
+    if (signal.aborted || Date.now() >= checkpoint.expiresAt) return Promise.resolve(undefined);
+    const nonce = randomUUID();
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`${checkpointPrefix}${nonce}:continue`).setLabel('Continue').setStyle(ButtonStyle.Success).setDisabled(!checkpoint.continuation),
+      new ButtonBuilder().setCustomId(`${checkpointPrefix}${nonce}:redirect`).setLabel('Change direction').setStyle(ButtonStyle.Primary).setDisabled(!checkpoint.continuation),
+      new ButtonBuilder().setCustomId(`${checkpointPrefix}${nonce}:finish`).setLabel('Finish partial').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`${checkpointPrefix}${nonce}:stop`).setLabel('Stop now').setStyle(ButtonStyle.Danger));
+    const footer = '\n\n-# checkpoint expired or cancelled';
+    const clippedText = text.length + footer.length <= MESSAGE_LIMIT ? text : `${text.slice(0, MESSAGE_LIMIT - footer.length - 2).trimEnd()}…`;
+    return new Promise<CheckpointDecision | undefined>(resolve => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const entry = { checkpoint, decide, stop, text: clippedText, messageId: '', finalContent: undefined as string | undefined, settled: false, resolve,
+        finish(value: CheckpointDecision | undefined, verdict: string, reviseMessage = true) {
+          if (entry.settled) return;
+          entry.settled = true;
+          checkpoints.delete(nonce);
+          if (timer) clearTimeout(timer);
+          signal.removeEventListener('abort', abort);
+          const id = entry.messageId;
+          entry.finalContent = settle(clippedText, verdict);
+          if (id && reviseMessage) void revise(id, { content: entry.finalContent, components: [], allowedMentions: { parse: [] } }).catch(noop);
+          resolve(value);
+        } };
+      const abort = () => entry.finish(undefined, '**checkpoint cancelled**');
+      checkpoints.set(nonce, entry);
+      if (checkpoints.size > cardLimit) { const oldest = checkpoints.keys().next().value!; checkpoints.get(oldest)?.finish(undefined, '**checkpoint no longer available**'); }
+      signal.addEventListener('abort', abort, { once: true });
+      timer = setTimeout(() => entry.finish(undefined, footer.trim()), Math.max(0, checkpoint.expiresAt - Date.now()));
+      if (signal.aborted || Date.now() >= checkpoint.expiresAt) { entry.finish(undefined, footer.trim()); return; }
+      // Don't hold the host decision hostage to a slow Discord REST call. If cancellation wins during send,
+      // the promise settles immediately and the eventual post is stripped of controls.
+      void post({ content: clippedText, components: [row], allowedMentions: { parse: [] } }).then(({ id }) => {
+        entry.messageId = id;
+        if (entry.settled) void revise(id, { content: entry.finalContent ?? settle(clippedText, '**checkpoint cancelled**'), components: [], allowedMentions: { parse: [] } }).catch(noop);
+      }, () => entry.finish(undefined, '**checkpoint could not be shown**'));
+    });
+  };
 
   type Payload = { content: string; components: Array<ActionRowBuilder<ButtonBuilder>>; allowedMentions: { parse: [] } };
   /** Approve/deny buttons under `text`; `post` and `revise` decide whether a channel or an interaction carries them. Operators answer; with `users`, so may whitelisted users. */
@@ -276,7 +322,7 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       pendingContinuations.set(nonce, { text,
         claim: () => { if (settled || claimed) return false; claimed = true; clearTimeout(timer); pendingContinuations.delete(nonce); return true; },
         resolve: (outcome, actor) => settle(outcome, outcome === 'approved' ? `**batch approved**${actor ? ` by <@${actor}>` : ''}` : outcome === 'auto-approved' ? '**auto-approved after 45 seconds**' : `**run stopped**${actor ? ` by <@${actor}>` : ''}`) });
-      timer = setTimeout(() => settle('auto-approved', '**auto-approved after 45 seconds**'), timeoutMs);
+      timer = setTimeout(() => settle('denied', '**no response — run paused**'), timeoutMs);
       signal.addEventListener('abort', abort, { once: true });
       if (signal.aborted) abort();
     }));
@@ -300,6 +346,11 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
         const message = id ? await (sent.get(id) ?? await channel.messages.fetch(id)).edit(payload) : await channel.send(payload);
         sent.set(message.id, message); remember(message.id, controls);
         return message.id;
+      },
+      async checkpoint(text, checkpoint, signal, decide, stop) {
+        return checkpointOffer(text, checkpoint, signal, decide, stop,
+          async payload => { const message = await channel.send(payload as BaseMessageOptions); sent.set(message.id, message); return { id: message.id }; },
+          async (id, payload) => { const message = sent.get(id) ?? await channel.messages.fetch(id); return message.edit(payload as BaseMessageOptions); });
       },
       async plan(messages, controls, ids = []) {
         const posted: string[] = [];
@@ -370,6 +421,11 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       typing: noop,
       askApproval: (text, signal, users = false) => askApproval(text, signal, users, async payload => ({ id: await feed.post(payload) }), (id, payload) => feed.revise(id, payload)),
       askContinuationBudget: (text, signal, timeoutMs = 45_000) => askContinuationBudget(text, signal, timeoutMs, async payload => ({ id: await feed.post(payload) }), (id, payload) => feed.revise(id, payload)),
+      async checkpoint(text, checkpoint, signal, decide, stop) {
+        return checkpointOffer(text, checkpoint, signal, decide, stop,
+          async payload => ({ id: await feed.post(payload as FeedMessage) }),
+          (id, payload) => feed.revise(id, payload as FeedMessage));
+      },
       // The runtime stops editing through this interaction once it expires, and uses the app's clicks after that.
       async postApp(payload) {
         if (!feed.live) throw new Error('Discord has stopped the updates of this reply; press Resume on its status card first.');
@@ -730,6 +786,17 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       });
       return;
     }
+    if (interaction.isModalSubmit() && interaction.customId.startsWith(checkpointModalPrefix)) {
+      const nonce = interaction.customId.slice(checkpointModalPrefix.length);
+      const entry = checkpoints.get(nonce);
+      if (!entry || entry.settled || Date.now() >= entry.checkpoint.expiresAt) { await interaction.reply({ content: 'this checkpoint is no longer open.', flags: MessageFlags.Ephemeral, ...quiet }).catch(noop); return; }
+      const decision = entry.decide('redirect', interaction.user.id, interaction.fields.getTextInputValue('amendment'));
+      if (!decision) { await interaction.reply({ content: 'only the requester or an operator can change this direction.', flags: MessageFlags.Ephemeral, ...quiet }).catch(noop); return; }
+      entry.finish(decision, `**direction changed by <@${interaction.user.id}>**`, false);
+      // Settle the paused host synchronously; a slow interaction webhook must not hold execution in a limbo state.
+      void interaction.deferUpdate().then(() => interaction.editReply({ content: settle(entry.text, `**direction changed by <@${interaction.user.id}>**`), components: [], ...quiet })).catch(noop);
+      return;
+    }
     if (interaction.isModalSubmit() && interaction.customId.startsWith(planModalPrefix)) {
       const controls = plans.get(interaction.customId.slice(planModalPrefix.length));
       const request = interaction.fields.getTextInputValue(planModal.field);
@@ -771,6 +838,25 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       return;
     }
     if (!interaction.isButton()) return;
+    if (interaction.customId.startsWith(checkpointPrefix)) {
+      const [nonce, action] = interaction.customId.slice(checkpointPrefix.length).split(':');
+      const entry = checkpoints.get(nonce ?? '');
+      if (!entry || entry.settled || Date.now() >= entry.checkpoint.expiresAt) { await interaction.reply({ content: 'this checkpoint is no longer open.', flags: MessageFlags.Ephemeral, ...quiet }).catch(noop); return; }
+      if (action === 'redirect') {
+        await interaction.showModal({ custom_id: `${checkpointModalPrefix}${nonce}`, title: 'change direction', components: [{ type: 1, components: [{ type: 4, custom_id: 'amendment', label: 'what should change?', style: 2, required: true, max_length: 1000 }] }] } as unknown as APIModalInteractionResponseCallbackData).catch(noop); return;
+      }
+      if (action === 'stop') {
+        const reply = entry.stop(interaction.user.id);
+        if (reply?.text !== 'stopping…') { await interaction.reply({ content: reply?.text ?? 'this turn cannot be stopped here.', flags: MessageFlags.Ephemeral, ...quiet }).catch(noop); return; }
+        await interaction.deferUpdate().catch(noop); return;
+      }
+      const decision = entry.decide(action === 'finish' ? 'finish_partial' : 'continue', interaction.user.id);
+      if (!decision) { await interaction.reply({ content: 'this choice is unavailable or you are not authorised.', flags: MessageFlags.Ephemeral, ...quiet }).catch(noop); return; }
+      const verdict = action === 'finish' ? '**finishing partial result**' : '**continuing within the approved window**';
+      entry.finish(decision, verdict, false);
+      void interaction.update({ content: settle(entry.text, verdict), components: [], ...quiet }).catch(noop);
+      return;
+    }
     if (interaction.customId.startsWith(choicePrefix)) {
       const [nonce, index] = interaction.customId.slice(choicePrefix.length).split(':');
       const entry = choices.get(nonce ?? '');

@@ -8,7 +8,7 @@ import { runSession } from './chat.js';
 import { doctor } from './diagnostics.js';
 import { setup } from './setup/index.js';
 import { ManagedSearch } from './setup/searxng.js';
-import { terminalUI } from './setup/terminal.js';
+import { terminalCheckpointDecision, terminalUI } from './setup/terminal.js';
 import type { Approve } from './execution/policy.js';
 import { serve } from './integration/service.js';
 import { SearchSetupError } from './search.js';
@@ -16,6 +16,7 @@ import { TerminalPresentation } from './presentation.js';
 import { isMode, SessionGrants } from './execution/grants.js';
 import { randomUUID } from 'node:crypto';
 import { SkillStore } from './skills/store.js';
+import type { Checkpoint, CheckpointDecision } from './agents/checkpoint.js';
 import { skillCache } from './skills/cache.js';
 
 const help = `teapilot!
@@ -162,7 +163,12 @@ async function main(): Promise<void> {
     if (values.tier !== undefined && !isTierPreference(values.tier)) throw new Error(`--tier must be ${tierPreferences.join(', ')}.`);
     const tier = values.tier;
     const request: HostRequest = { prompt, workload, cwd: resolve(values.cwd), web: values.web, correction: values.correction, tier, signal: controller.signal };
-    const dependencies = { approve, onActivity: presentation.setActivity, onProgress: (message: string) => presentation.log(redact(message)), onEvent: (event: import('./integration/events.js').HostEvent) => presentation.event(event) };
+    const dependencies = { approve, onActivity: presentation.setActivity, onProgress: (message: string) => presentation.log(redact(message)), onEvent: (event: import('./integration/events.js').HostEvent) => presentation.event(event),
+      onCheckpoint: async (checkpoint: Readonly<Checkpoint>, signal: AbortSignal): Promise<CheckpointDecision | undefined> => {
+        if (!ui || values.json || signal.aborted || controller.signal.aborted || Date.now() >= checkpoint.expiresAt) return undefined;
+        presentation.checkpoint(checkpoint, redact);
+        return terminalCheckpointDecision(checkpoint, ui, signal, { interactive, json: Boolean(values.json) });
+      } };
     const execute = async (request: HostRequest) => {
       let result;
       presentation.start();
@@ -174,7 +180,7 @@ async function main(): Promise<void> {
         if (!await ui.confirm('Continue without web search? The answer will be unverified against current sources.')) throw error;
         presentation.start();
         result = await runHost(config, { ...request, web: false }, dependencies);
-        result.text = `Web search was unavailable. This answer is unverified against current sources.\n\n${result.text}`;
+        result.text = `-# web search is unavailable - make sure docker desktop is running and run \`teapilot search status\`?\n\n${result.text}`;
       }
       // A conversational reply is shown a line at a time, like messages arriving, and without a result line.
       const lines = result.casual && result.success && !values.json ? casualLines(result.text) : undefined;

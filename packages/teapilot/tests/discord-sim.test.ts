@@ -13,6 +13,7 @@ import { PlayStore } from '../src/discord/play/store.js';
 import { SkippableClock } from '../scripts/discord-sim/clock.js';
 import { checkFiles, checkMessage, checkModal, DiscordRejected } from '../scripts/discord-sim/validate.js';
 import { channelId, people, SimError, World } from '../scripts/discord-sim/world.js';
+import type { Checkpoint } from '../src/agents/checkpoint.js';
 import { completion, fixture, jev, mockServer } from './helpers.js';
 
 const cleanups: Array<() => unknown> = [];
@@ -349,4 +350,27 @@ it('shows a plan as embeds, routes its buttons and change form to the conversati
   const shrunk = await transport.plan!([embed('Tea v3')], controls([]), grown);
   expect(shrunk).toEqual([grown[0]]);
   expect(() => world.find(grown[1]!)).toThrow(SimError);
+});
+
+it('routes checkpoint choices and bounded direction forms through simulated Discord controls', async () => {
+  const world = new World();
+  await world.connect({ token: 't', allowedUserIds: [people.op.id], channelIds: [channelId], root: '.', startMode: 'ask' }, { message: vi.fn(), command: vi.fn(), reply: vi.fn(), component: vi.fn(), asides: { keep: vi.fn(), find: vi.fn(), summarise: vi.fn() } }, vi.fn());
+  const checkpoint: Checkpoint = { version: 1, requestId: 'r', checkpointId: 1, sequence: 1, reason: 'instructor_calls', durability: 'request-local', expiresAt: Date.now() + 30_000, snapshot: { amendments: [], artifacts: [], checks: [], results: [], workers: [], resources: {}, pendingUncertain: [] }, summary: [], continuation: { offerId: 'offer', instructorCalls: 2, activeMs: 1000, freshContext: true } };
+  const decide = vi.fn((action: 'continue' | 'redirect' | 'finish_partial', user: string, amendment?: string) => {
+    if (user !== people.op.id) return undefined;
+    if (action === 'redirect') return { requestId: 'r', checkpointId: 1, action, offerId: 'offer', amendment: amendment ?? '' };
+    if (action === 'continue') return { requestId: 'r', checkpointId: 1, action, offerId: 'offer' };
+    return { requestId: 'r', checkpointId: 1, action };
+  });
+  const controller = new AbortController();
+  const pending = world.transport(world.channel('channel')).checkpoint!('checkpoint summary', checkpoint, controller.signal, decide, () => ({ text: 'stopping…' }));
+  const card = world.messages.at(-1)!;
+  expect(card.components[0]!.components.map(control => control.label)).toEqual(['Continue', 'Change direction', 'Finish partial', 'Stop now']);
+  expect(await world.click('stranger', card.id, 'continue')).toContain('cannot choose');
+  expect(decide).toHaveBeenCalledWith('continue', people.stranger.id);
+  expect(await world.click('op', card.id, 'redirect')).toContain('amendment: What should change?');
+  await world.submit('op', { amendment: 'Use another approach' });
+  expect(decide).toHaveBeenCalledWith('redirect', people.op.id, 'Use another approach');
+  await expect(pending).resolves.toMatchObject({ requestId: 'r', action: 'redirect', amendment: 'Use another approach' });
+  expect(card.components).toEqual([]);
 });

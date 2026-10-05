@@ -3,6 +3,7 @@ import { stripVTControlCharacters } from 'node:util';
 import type { Activity, ActivityUI } from './activity.js';
 import { loadClips, Playback, type Clips } from './art/playback.js';
 import { cellWidth, graphemes } from './composer.js';
+import type { Checkpoint } from './agents/checkpoint.js';
 
 const ACTIVITY_COLOUR = '38;2;186;187;241'; // #babbf1
 // this is catpuccin lavender :3
@@ -337,6 +338,16 @@ export class TerminalPresentation implements ActivityUI {
     // The next prompt is the confirmation for this approval: keep the command
     // and "Approve this action?" adjacent, with no artwork drawn between them.
     this.pendingApproval = true;
+  }
+
+  /** Render host-authored checkpoint facts separately from an unverified model proposal. */
+  checkpoint(checkpoint: Readonly<Checkpoint>, redact: (text: string) => string): void {
+    this.pause();
+    this.write(`\n${paint('1;33', 'Checkpoint', this.colour && !this.json)} · request-local; not resumable after restart\n`);
+    for (const fact of checkpoint.summary) this.write(`  • ${redact(fact)}\n`);
+    if (checkpoint.continuation) this.write(`  next window: ${checkpoint.continuation.instructorCalls} instructor calls, ${Math.ceil(checkpoint.continuation.activeMs / 60_000)}m active${checkpoint.continuation.freshContext ? ', fresh context' : ''}\n`);
+    else this.write('  no continuation window remains inside this request authorization\n');
+    if (checkpoint.modelHandoff) this.write(`  model proposal (unverified): ${redact(checkpoint.modelHandoff)}\n`);
   }
 
   /** Start before readline.question, then paint only while its input is untouched. */

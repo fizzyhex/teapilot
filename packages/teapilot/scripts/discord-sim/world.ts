@@ -9,6 +9,7 @@ import type { CardButton, CardControls, DiscordTransport } from '../../src/disco
 import type { connect, GatewayHandlers } from '../../src/discord/gateway.js';
 import { grantPrefix, grantsGone, grantView, type GrantPanel } from '../../src/discord/grants-panel.js';
 import type { Permission } from '../../src/execution/grants.js';
+import type { Checkpoint, CheckpointDecision } from '../../src/agents/checkpoint.js';
 import { planButtons, planModal, type PlanAction, type PlanControls } from '../../src/discord/plan.js';
 import { parseCustomId, type ModalPayload } from '../../src/discord/play/render.js';
 import type { PlayInteraction } from '../../src/discord/play/runtime.js';
@@ -105,6 +106,7 @@ export class World {
   private handlers?: GatewayHandlers;
   private operators: readonly string[] = [];
   private counters = { message: 0, thread: 0, approval: 0, browse: 0 };
+  private checkpoints = new Map<string, { message: Message; checkpoint: Checkpoint; decide: (action: 'continue' | 'redirect' | 'finish_partial', user: string, amendment?: string) => CheckpointDecision | undefined; stop: (user: string) => { text: string }; resolve: (value: CheckpointDecision | undefined) => void; settled: boolean; timer?: ReturnType<typeof setTimeout>; abort: () => void; signal: AbortSignal }>();
   /** Status cards by message id, as the gateway keeps them; a restart forgets them. */
   private cards = new Map<string, CardControls['press']>();
   /** Plans by the id of their last message, as the gateway keeps them; a restart forgets them. */
@@ -187,6 +189,7 @@ export class World {
         this.panels.clear();
         // Like the real gateway: pending approvals resolve as denied, and their buttons stay behind.
         for (const message of this.messages) { const resolve = message.approval; message.approval = undefined; resolve?.(false); }
+        for (const [nonce, entry] of this.checkpoints) this.finishCheckpoint(nonce, undefined, '**checkpoint cancelled**');
       },
     };
   };
@@ -309,7 +312,43 @@ export class World {
           signal.addEventListener('abort', expire, { once: true });
         });
       },
+      checkpoint: (text, checkpoint, signal, decide, stop) => this.offerCheckpoint(channel, text, checkpoint, signal, decide, stop),
     };
+  }
+
+  private finishCheckpoint(nonce: string, value: CheckpointDecision | undefined, verdict: string): void {
+    const entry = this.checkpoints.get(nonce);
+    if (!entry || entry.settled) return;
+    entry.settled = true;
+    this.checkpoints.delete(nonce);
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.signal.removeEventListener('abort', entry.abort);
+    // abort handler unregisters itself on every settlement.
+    entry.message.components = [];
+    entry.message.content = settle(entry.message.content, verdict);
+    entry.message.edits++;
+    this.emit(this.render(entry.message));
+    entry.resolve(value);
+  }
+
+  private offerCheckpoint(channel: Channel, text: string, checkpoint: Checkpoint, signal: AbortSignal,
+    decide: (action: 'continue' | 'redirect' | 'finish_partial', user: string, amendment?: string) => CheckpointDecision | undefined,
+    stop: (user: string) => { text: string }): Promise<CheckpointDecision | undefined> {
+    if (signal.aborted || Date.now() >= checkpoint.expiresAt) return Promise.resolve(undefined);
+    const nonce = `cp${++this.counters.approval}`;
+    const message = this.post(channel, bot.name, { content: text, components: [{ type: 1, components: [
+      { type: 2, style: 3, label: 'Continue', custom_id: `teapilot-checkpoint:${nonce}:continue`, disabled: !checkpoint.continuation },
+      { type: 2, style: 1, label: 'Change direction', custom_id: `teapilot-checkpoint:${nonce}:redirect`, disabled: !checkpoint.continuation },
+      { type: 2, style: 2, label: 'Finish partial', custom_id: `teapilot-checkpoint:${nonce}:finish` },
+      { type: 2, style: 4, label: 'Stop now', custom_id: `teapilot-checkpoint:${nonce}:stop` },
+    ] }] });
+    return new Promise(resolve => {
+      const entry: NonNullable<ReturnType<typeof this.checkpoints.get>> = { message, checkpoint, decide, stop, resolve, settled: false, signal, abort: () => this.finishCheckpoint(nonce, undefined, '**checkpoint cancelled**') };
+      this.checkpoints.set(nonce, entry);
+      entry.timer = setTimeout(() => this.finishCheckpoint(nonce, undefined, '**checkpoint expired**'), Math.max(0, checkpoint.expiresAt - Date.now()));
+      signal.addEventListener('abort', entry.abort, { once: true });
+      if (signal.aborted) entry.abort();
+    });
   }
 
   /** A person sends a message: in their DM by default, in `channel` (mentioning teapilot), or in a thread. */
@@ -375,6 +414,7 @@ export class World {
     if (control.type !== 2) throw new SimError(`${id} is a select; use select.`);
     if (typeof control.url === 'string') return `${person.name} opened ${control.url}; links never reach teapilot.`;
     const custom = String(control.custom_id);
+    if (custom.startsWith('teapilot-checkpoint:')) return this.pressCheckpoint(person, message, custom);
     if (custom.startsWith('teapilot:')) return this.answerApproval(person, message, custom.endsWith(':approve'));
     if (custom.startsWith('teapilot-plan:')) return this.pressPlan(person, message, custom.slice('teapilot-plan:'.length) as PlanAction);
     if (custom.startsWith(browsePrefix)) return this.pressBrowse(person, message, custom.slice(browsePrefix.length));
@@ -382,6 +422,29 @@ export class World {
     if (custom.startsWith('teapilot-card:')) return this.pressCard(person, message, custom.slice('teapilot-card:'.length) as CardButton);
     if (custom.startsWith(viewSourcePrefix)) return this.pressViewSource(person, message, custom);
     return this.interact(person, message, 'button', custom, `clicked [${this.label(control)}]`);
+  }
+
+  private pressCheckpoint(person: Person, message: Message, custom: string): string {
+    const [, nonce, action] = custom.split(':');
+    const entry = this.checkpoints.get(nonce!);
+    if (!entry || entry.message !== message || entry.settled || Date.now() >= entry.checkpoint.expiresAt) return `${person.name} clicked a checkpoint that is no longer pending.`;
+    if (action === 'redirect') {
+      const payload: ModalPayload = { custom_id: `teapilot-checkpoint-modal:${nonce}`, title: 'Change direction', components: [{ type: 1, components: [{ type: 4, custom_id: 'amendment', label: 'What should change?', style: 2, required: true, max_length: 1000 }] }] } as ModalPayload;
+      this.check(`the form on ${message.id}`, () => checkModal(payload));
+      this.forms.set(person.name, { message, payload });
+      this.emit(`${person.name} opened form "${payload.title}" from ${message.id}`);
+      return `${person.name} sees a form:\n${this.renderForm(payload)}`;
+    }
+    if (action === 'stop') {
+      const result = entry.stop(person.id);
+      if (result.text !== 'stopping…') return result.text;
+      this.finishCheckpoint(nonce!, undefined, '**stopped**');
+      return result.text;
+    }
+    const value = entry.decide(action === 'continue' ? 'continue' : 'finish_partial', person.id);
+    if (!value) return `${person.name} cannot choose that checkpoint action.`;
+    this.finishCheckpoint(nonce!, value, `**${action === 'continue' ? 'continued' : 'finished partial'}**`);
+    return `${person.name} chose ${action} on ${message.id}.`;
   }
 
   /** Like the real gateway: operators may answer approvals, and whitelisted users the ones that allow them. */
@@ -514,6 +577,15 @@ ${this.render(this.post(message.channel, bot.name, { content: note }, person.nam
       const note = controls ? controls.press('change', { id: person.id, name: person.name }, fields[planModal.field] ?? '') : 'This plan is no longer available: teapilot restarted since, or it was replaced.';
       return `${person.name} submitted "${form.payload.title}" on ${form.message.id}.${note ? `
 ${this.render(this.post(form.message.channel, bot.name, { content: note }, person.name))}` : ''}`;
+    }
+    if (form.payload.custom_id.startsWith('teapilot-checkpoint-modal:')) {
+      const nonce = form.payload.custom_id.slice('teapilot-checkpoint-modal:'.length);
+      const entry = this.checkpoints.get(nonce);
+      const amendment = fields.amendment ?? '';
+      const value = entry?.decide('redirect', person.id, amendment);
+      if (!entry || !value) return `${person.name} submitted a checkpoint form that is no longer pending.`;
+      this.finishCheckpoint(nonce, value, '**direction changed**');
+      return `${person.name} changed direction on ${form.message.id}.`;
     }
     return this.interact(person, form.message, 'modal', form.payload.custom_id, `submitted "${form.payload.title}"`, undefined, Object.fromEntries(ids.map(key => [key, fields[key] ?? ''])));
   }

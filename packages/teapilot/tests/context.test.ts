@@ -66,9 +66,47 @@ it('treats a tier’s reply limit as a ceiling for each call, not room held back
   expect(large.estimatedInputTokens + 16384).toBeGreaterThan(32768);
   expect(large).toMatchObject({ reservedOutputTokens: 8192, maxOutputTokens: 32768 - large.estimatedInputTokens });
   expect(bodies[1].max_tokens).toBe(32768 - large.estimatedInputTokens);
-  // Less than a quarter of the context left for the reply is still refused.
-  expect(await ask('word '.repeat(12000))).toMatchObject({ stopped: 'context_limit' });
+  // A context-admission failure is handed to the host as an honest, non-success checkpoint.
+  expect(await ask('word '.repeat(12000))).toMatchObject({ success: false, stopped: 'checkpoint', checkpoint: { reason: 'context_pressure' } });
   expect(bodies).toHaveLength(2);
+});
+
+it('continues after context pressure with tools on the fresh request and stops on an irreducible objective', async () => {
+  const bodies: any[] = [];
+  let listed = false;
+  const f = await setup((body, _req, res) => {
+    bodies.push(body);
+    const declarations = (body.tools ?? []).map((tool: any) => tool.function.name);
+    if (!listed && declarations.includes('ls')) { listed = true; completion(res, { tool: { name: 'ls', arguments: { path: '.' } } }); }
+    else completion(res, { text: listed ? 'Listed the current directory.' : 'tools were missing from the fresh request' });
+  });
+  Object.assign(f.config.models.capable, { contextTokens: 16384, maxOutputTokens: 1024 });
+  const bulk = 'obsolete history '.repeat(10_000);
+  await writeFile(join(f.cwd, 'checkpoint-visible-file.txt'), 'present\n');
+  const accepted = await runAttempt({ ...f, tier: 'normal', workload: 'coder', prompt: 'List the files in the current directory.', currentRequest: 'List the files in the current directory.', web: false,
+    resume: { messages: [{ role: 'user', content: bulk, timestamp: Date.now() }] }, approve: async () => true,
+    onCheckpoint: async checkpoint => {
+      expect(checkpoint.reason).toBe('context_pressure');
+      expect(checkpoint.continuation?.freshContext).toBe(true);
+      return { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action: 'redirect', offerId: checkpoint.continuation!.offerId, amendment: 'NEW-AMENDMENT-DO-NOT-EDIT' };
+    } });
+  expect(accepted, JSON.stringify(accepted)).toMatchObject({ success: true, text: 'Listed the current directory.', toolCalls: 1 });
+  expect(bodies).toHaveLength(2);
+  expect(bodies[0].tools.length).toBeGreaterThan(0);
+  expect(JSON.stringify(bodies[0])).not.toContain('obsolete history');
+  expect(JSON.stringify(bodies[0])).toContain('List the files in the current directory.');
+  expect(JSON.stringify(bodies[0])).toContain('NEW-AMENDMENT-DO-NOT-EDIT');
+  expect(bodies[0].tools.map((tool: any) => tool.function.name)).toContain('ls');
+  expect(JSON.stringify(bodies[1].messages)).toContain('checkpoint-visible-file.txt');
+  expect(JSON.stringify(bodies[1])).not.toContain('obsolete history');
+
+  const huge = await runAttempt({ ...f, tier: 'normal', workload: 'ask', prompt: 'word '.repeat(12_000), web: false, approve: async () => true,
+    onCheckpoint: async checkpoint => {
+      expect(checkpoint.reason).toBe('context_pressure');
+      expect(checkpoint.continuation).toBeUndefined();
+      return undefined;
+    } });
+  expect(huge).toMatchObject({ success: false, stopped: 'checkpoint', checkpoint: { reason: 'context_pressure' } });
 });
 
 it.each([400, 404, 422])('keeps provider HTTP %s separate from local overflow', async status => {
@@ -76,7 +114,7 @@ it.each([400, 404, 422])('keeps provider HTTP %s separate from local overflow', 
   const f = await setup((_body, _req, res) => { calls++; res.writeHead(status); res.end('{}'); });
   const input = { ...f, tier: 'normal' as const, workload: 'ask' as const, web: false, approve: async () => true };
   expect(await runAttempt({ ...input, prompt: 'hello' })).toMatchObject({ stopped: 'unsupported' });
-  expect(await runAttempt({ ...input, prompt: 'x!'.repeat(20000) })).toMatchObject({ stopped: 'context_limit' });
+  expect(await runAttempt({ ...input, prompt: 'x!'.repeat(20000) })).toMatchObject({ success: false, stopped: 'checkpoint', checkpoint: { reason: 'context_pressure' } });
   expect(calls).toBe(1);
   expect((await events(f.config)).some(e => e.type === 'provider_http_error' && e.status === status)).toBe(true);
 });
@@ -227,7 +265,7 @@ it('calibrates from reported input within an attempt, bounded below', async () =
   expect(last.estimatedInputTokens + 4096).toBeLessThanOrEqual(16384);
   // A tiny provider report cannot admit ~120 KB of code: the floor still rejects it.
   const large = await scripted([write(indentedPage(120 * 1024))], () => 10);
-  expect(large.result.stopped).toBe('context_limit');
+  expect(large.result).toMatchObject({ success: false, stopped: 'checkpoint', checkpoint: { reason: 'context_pressure' } });
   expect(large.admissions.at(-1)).toMatchObject({ method: 'calibrated-lexical', rejection: 'context_limit' });
 });
 

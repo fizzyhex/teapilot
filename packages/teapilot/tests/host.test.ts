@@ -118,6 +118,27 @@ describe('real JevRouter SDK + pi loop with mock HTTP providers', () => {
     expect(usage.firstTokenMs).toEqual(expect.any(Number));
   });
 
+  it('returns an explicit non-success partial host result for an undecided checkpoint', async () => {
+    let inference = 0;
+    const f = await setup((_body, req, res) => {
+      if (req.url === '/jev') jev(res, 'coder.normal');
+      else if (req.url?.endsWith('/models')) res.end('{}');
+      else if (++inference === 1) completion(res, { tool: { name: 'read', arguments: { path: 'evidence.txt' } } });
+      else completion(res, { text: 'Read one file; no check was run.' });
+    });
+    await writeFile(join(f.cwd, 'evidence.txt'), 'bounded fact');
+    f.config.policy.limits.instructorToolCalls = 1;
+    const result = await runHost(f.config, { cwd: f.cwd, prompt: 'Inspect the evidence.', workload: 'coder' }, {
+      approve: async () => true, localProbe: async () => true,
+      onCheckpoint: async checkpoint => ({ requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action: 'finish_partial' }),
+    });
+    expect(result).toMatchObject({ success: false, status: 'partial', checkpoint: { reason: 'instructor_calls', durability: 'request-local' } });
+    expect(result.text).toContain('work is partial, not complete');
+    expect(result.checkpoint?.snapshot.results.length).toBeGreaterThan(0);
+    expect(result.checkpoint?.snapshot.results[0]).toMatchObject({ ref: expect.stringMatching(/^(receipt|toolcall|saved-output):/), summary: expect.stringContaining('read succeeded') });
+    expect(inference).toBe(2);
+  });
+
   it('coder uses pi read/write tools and receives AGENTS.md', async () => {
     let calls = 0;
     const f = await setup((body, req, res) => {
@@ -292,18 +313,18 @@ describe('real JevRouter SDK + pi loop with mock HTTP providers', () => {
     expect(result.attempts).toBe(1);
   });
 
-  it('stops repeated ineffective reads and enforces a hard turn limit', async () => {
+  it('stops repeated ineffective reads at a host checkpoint before the hard turn limit', async () => {
     let calls = 0;
-    const f = await setup((_body, req, res) => {
+    const f = await setup((body, req, res) => {
       if (req.url === '/jev') jev(res, 'coder.normal');
       else if (req.url?.endsWith('/models')) res.end('{}');
-      else { calls++; completion(res, { tool: { name: 'read', arguments: { path: 'input.txt' } } }); }
+      else { calls++; completion(res, (body.tools ?? []).length ? { tool: { name: 'read', arguments: { path: 'input.txt' } } } : { text: 'The repeated reads yielded no new evidence.' }); }
     });
     await writeFile(join(f.cwd, 'input.txt'), 'same content');
     f.config.policy.limits.maxTurns = 2;
     f.config.policy.escalation.maxEscalations = 0;
     const result = await runHost(f.config, { cwd: f.cwd, prompt: 'Inspect files' }, { approve: async () => false });
-    expect(result.status).toBe('turn_limit');
+    expect(result.status, JSON.stringify(result)).toBe('partial');
     expect(calls).toBe(2);
   });
 
@@ -357,17 +378,17 @@ describe('real JevRouter SDK + pi loop with mock HTTP providers', () => {
     expect(result.spentUsd).toBe(0.00001);
   });
 
-  it('blocks tools after the tool-call limit without another model turn', async () => {
+  it('blocks tools at the request-call limit and returns a checkpoint partial', async () => {
     let calls = 0;
-    const f = await setup((_body, req, res) => {
+    const f = await setup((body, req, res) => {
       if (req.url === '/jev') jev(res, 'coder.normal');
       else if (req.url?.endsWith('/models')) res.end('{}');
-      else { calls++; completion(res, { tool: { name: 'read', arguments: { path: 'input.txt' } } }); }
+      else { calls++; completion(res, (body.tools ?? []).length ? { tool: { name: 'read', arguments: { path: 'input.txt' } } } : { text: 'The request call limit was reached; no more reads ran.' }); }
     });
     await writeFile(join(f.cwd, 'input.txt'), 'hello');
     f.config.policy.limits.maxToolCalls = 1;
     const result = await runHost(f.config, { cwd: f.cwd, prompt: 'Inspect code' }, { approve: async () => false });
-    expect(result.status).toBe('tool_limit');
+    expect(result.status, JSON.stringify(result)).toBe('partial');
     expect(calls).toBe(2);
     expect((await events(f.config)).filter(e => e.type === 'tool')).toHaveLength(1);
   });
@@ -429,13 +450,14 @@ describe('real JevRouter SDK + pi loop with mock HTTP providers', () => {
   it('lists observed file edits with their size even when the workload label never becomes coder.*', async () => {
     // Mirrors the reviewed session: JevRouter's low-confidence fallback keeps the
     // workload at ask.normal, but a mid-run capability grant still writes a file.
-    let calls = 0;
+    let calls = 0, checkpointDecisions = 0;
     const f = await fixture(); cleanups.push(f.cleanup);
-    const server = await mockServer((_body, _req, res) => {
+    const server = await mockServer((body, _req, res) => {
       calls++;
       if (calls === 1) completion(res, { tool: { name: 'request_capabilities', arguments: { permissions: ['repository.write'] } } });
-      else if (calls === 2) completion(res, { tool: { name: 'write', arguments: { path: 'granted.txt', content: 'approved\n' } } });
-      else completion(res, { tool: { name: 'read', arguments: { path: 'granted.txt' } } });
+      else if (calls === 2) completion(res, { text: 'Capability was granted; continue with the requested file.' });
+      else if (calls === 3) completion(res, { tool: { name: 'write', arguments: { path: 'granted.txt', content: 'approved\n' } } });
+      else completion(res, (body.tools ?? []).length ? { tool: { name: 'read', arguments: { path: 'granted.txt' } } } : { text: 'The file was written; further reads did not run.' });
     });
     cleanups.push(server.close);
     f.config.routingMode = 'direct';
@@ -445,12 +467,14 @@ describe('real JevRouter SDK + pi loop with mock HTTP providers', () => {
     const result = await runHost(f.config, { cwd: f.cwd, prompt: 'Create granted.txt', mode: 'chat', authorization: grants }, {
       localProbe: async () => true,
       approve: async approval => approval.kind === 'capability',
+      onCheckpoint: async checkpoint => ++checkpointDecisions === 1
+        ? { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action: 'continue', offerId: checkpoint.continuation!.offerId }
+        : { requestId: checkpoint.requestId, checkpointId: checkpoint.checkpointId, action: 'finish_partial' },
     });
     expect(result.capability).toBe('ask.normal');
-    expect(result.status).toBe('tool_limit');
-    expect(result.text).toContain('edits to `granted.txt` are still there.');
-    expect(result.interruption?.edits).toEqual([{ path: 'granted.txt', size: Buffer.byteLength('approved\n') }]);
-    expect(result.text).not.toContain('none recorded');
+    expect(result.status).toBe('partial');
+    expect(result.checkpoint?.snapshot.artifacts).toContainEqual(expect.objectContaining({ ref: 'file:granted.txt' }));
+    expect(result.text).toContain('work is partial, not complete');
     expect(await readFile(join(f.cwd, 'granted.txt'), 'utf8')).toBe('approved\n');
   });
 
@@ -477,7 +501,7 @@ describe('real JevRouter SDK + pi loop with mock HTTP providers', () => {
     expect(result.text).toContain('Web search was unavailable. This answer is unverified');
   });
 
-  it('offers concrete next steps on a context-limit stop', async () => {
+  it('returns a host-only partial checkpoint when the current request cannot fit context', async () => {
     const f = await setup((_body, req, res) => {
       if (req.url === '/jev') jev(res, 'ask.normal');
       else if (req.url?.endsWith('/models')) res.end('{}');
@@ -485,9 +509,10 @@ describe('real JevRouter SDK + pi loop with mock HTTP providers', () => {
     });
     f.config.models.capable.contextTokens = 16384;
     const result = await runHost(f.config, { cwd: f.cwd, prompt: 'x!'.repeat(6000) }, { approve: async () => false });
-    expect(result.status).toBe('context_limit');
-    expect(result.text).toContain('ran out of context');
-    expect(result.text).toContain('/convo clear clears the conversation history');
+    expect(result.status).toBe('partial');
+    expect(result.success).toBe(false);
+    expect(result.checkpoint?.reason).toBe('context_pressure');
+    expect(result.text).toContain('work is partial, not complete');
   });
 
   it('asks the first routing call which teachat identity fits and returns the answer', async () => {

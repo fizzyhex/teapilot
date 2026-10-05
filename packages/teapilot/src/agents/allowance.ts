@@ -56,6 +56,33 @@ export class RequestAllowance {
     return Math.max(0, Math.min(this.granted - this.instructorCalls, remaining));
   }
   get instructorGranted(): number { return this.task?.toolBudget()?.instructorGranted ?? this.granted; }
+  get instructorCallsUsed(): number { return this.task?.toolBudget()?.instructorCalls ?? this.instructorCalls; }
+  resourceUsage(): { callsUsed: number; modelCallsUsed: number; delegationsUsed: number; juniorCalls: Record<string, number> } {
+    const request = this.task?.snapshot().request;
+    return {
+      callsUsed: request?.calls ?? this.calls,
+      modelCallsUsed: request?.modelCalls ?? this.models,
+      delegationsUsed: request?.delegations ?? this.delegations,
+      juniorCalls: request?.juniorCalls ? { ...request.juniorCalls } : Object.fromEntries(this.juniorCalls),
+    };
+  }
+  get continuationBatchesUsed(): number { return this.task?.toolBudget()?.continuationBatches ?? this.batches; }
+  /** A checkpoint renewal is a bounded lease inside the original request envelope, never a reset. */
+  grantCheckpointBatch(): number {
+    if (this.denied || this.continuationBatchesUsed >= this.maxContinuationBatches || this.remaining().ms <= 0) return 0;
+    const capacity = Math.min(this.instructorBatchCalls, this.remaining().calls);
+    if (capacity <= 0) return 0;
+    if (this.task?.toolBudget()) {
+      const before = this.task.toolBudget()!.instructorGranted;
+      if (!this.task.grantInstructorBatch(this.continuationBatchesUsed)) return 0;
+      this.granted = this.task.toolBudget()!.instructorGranted;
+      return this.granted - before;
+    }
+    if (this.batches >= this.maxContinuationBatches) return 0;
+    this.granted += capacity;
+    this.batches++;
+    return capacity;
+  }
   /** Reserve only calls already present in a completed assistant response. */
   reserveQueuedTools(calls: QueuedToolCall[]): void {
     this.releaseReservations();

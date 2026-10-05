@@ -31,6 +31,8 @@ import { skillCache } from './skills/cache.js';
 import { SkillStore } from './skills/store.js';
 import type { SkillPreferences } from './skills/settings.js';
 import type { SkillCatalog } from './workspace/skills.js';
+import type { CheckpointHandler } from './agents/checkpoint.js';
+import type { Checkpoint } from './agents/checkpoint.js';
 
 export interface HostRequest { prompt: string; cwd: string; workload?: Workload; web?: boolean; correction?: string; signal?: AbortSignal; history?: ConversationTurn[]; context?: TextContext[]; mode?: Mode; conversational?: boolean; authorization?: SessionGrants; access?: AccessAdmin; play?: PlayContext; workspace?: ConversationWorkspace; tier?: TierPreference; relatedTier?: Tier; sessionId?: string; taskId?: string;
   /** A side question (/btw): it sees the conversation but only reads, and its turn is not kept. */
@@ -67,6 +69,8 @@ export interface HostResult {
   casual?: boolean;
   /** What the tools did before the final reply; kept with the turn so later turns can replay it. */
   steps?: Message[];
+  /** Present only when the request stopped at a request-local checkpoint; not durable or complete. */
+  checkpoint?: Checkpoint;
 }
 export interface HostDependencies {
   approve: Approve;
@@ -79,6 +83,8 @@ export interface HostDependencies {
   onReasoning?: (text: string) => void;
   /** Asked when search is granted mid-request but unusable; without it the request goes on without search. */
   continueWithoutSearch?: (message: string) => Promise<boolean>;
+  /** Optional explicit user decision at request-local checkpoints. Missing handler means stop safely. */
+  onCheckpoint?: CheckpointHandler;
 }
 
 export async function runHost(config: Config, request: HostRequest, dependencies: HostDependencies): Promise<HostResult> {
@@ -215,12 +221,15 @@ export async function runHost(config: Config, request: HostRequest, dependencies
   };
   let previous: AttemptResult | undefined;
   let previousTier: Tier | undefined;
+  const sanitizeStructured = (value: unknown): unknown => typeof value === 'string' ? telemetry.redact(value).slice(0, 4000)
+    : Array.isArray(value) ? value.map(sanitizeStructured)
+    : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([key, child]) => [key, sanitizeStructured(child)])) : value;
   const finish = async (success: boolean, status: string, text: string): Promise<HostResult> => {
     if (!success && request.signal?.aborted) status = 'cancelled';
     // All abort exits use the same acknowledgement, including stops between attempts.
     if (status === 'cancelled') text = incomplete({ ...previous, success: false, text: previous?.text ?? '', turns: 0, toolCalls: 0, stopped: 'cancelled', check });
     dependencies.onActivity?.({ kind: 'waiting', label: 'Finalising request...' });
-    const result = { requestId, success, status, ...(previous?.steps?.length ? { steps: redactSteps(previous.steps, telemetry.redact.bind(telemetry)) } : {}), text: telemetry.redact((searchUnverified && success ? 'Web search was unavailable. This answer is unverified against current sources.\n\n' : '') + text), capability: selected, tier: selected?.split('.')[1] as Tier | undefined, spentUsd: budget.spent().request, receipts, attempts, check, models, ...(teachatIdentity && { teachatIdentity }), ...(casual && { casual }),
+    const result = { requestId, success, status, ...(previous?.checkpoint ? { checkpoint: sanitizeStructured(previous.checkpoint) as Checkpoint } : {}), ...(previous?.steps?.length ? { steps: redactSteps(previous.steps, telemetry.redact.bind(telemetry)) } : {}), text: telemetry.redact((searchUnverified && success ? 'Web search was unavailable. This answer is unverified against current sources.\n\n' : '') + text), capability: selected, tier: selected?.split('.')[1] as Tier | undefined, spentUsd: budget.spent().request, receipts, attempts, check, models, ...(teachatIdentity && { teachatIdentity }), ...(casual && { casual }),
       ...(!success && interruption ? { interruption: { ...interruption,
         edits: interruption.edits.map(edit => ({ ...edit, path: telemetry.redact(edit.path) })),
         advice: interruption.advice && telemetry.redact(interruption.advice), detail: interruption.detail && telemetry.redact(interruption.detail),
@@ -426,6 +435,7 @@ export async function runHost(config: Config, request: HostRequest, dependencies
           return approved;
         },
         signal: request.signal, resume, images,
+        onCheckpoint: dependencies.onCheckpoint,
         prompt: resume ? resumeNotice(config, previousTier!, tier, previous!.reason)
           : basePrompt + (previous ? `\nPrevious attempt stopped: ${previous.reason}. ${previous.changedFiles?.length || previous.shellRan ? 'Existing edits are still in the repository; inspect them before proceeding. Do not restart blindly.' : 'It changed no files; continue the task from the context below.'}\nRecent execution context:\n${previous.handoff ?? previous.text.slice(-6000)}` : ''),
       });
@@ -442,6 +452,22 @@ export async function runHost(config: Config, request: HostRequest, dependencies
       }
       if (accessFailure) return await finish(false, 'approval_denied', incomplete(previous, accessFailure));
       await telemetry.event('attempt_end', { decisionId: decision?.decision_id, capability: selected, success: previous.success, reason: previous.reason, stopped: previous.stopped, turns: previous.turns, toolCalls: previous.toolCalls, check: previous.check, ...(previous.success ? {} : { ending: previous.ending }) });
+      if (request.signal?.aborted) return await finish(false, 'cancelled', 'Request cancelled.');
+      if (previous.stopped === 'timeout' || task && task.remaining().ms <= 0) {
+        const aggregateExpired = Boolean(task && task.remaining().ms <= 0);
+        const timeoutPartial = previous.checkpoint ? `${incomplete(previous)}\n\nA checkpoint was reached, but the ${aggregateExpired ? 'aggregate request deadline' : 'attempt active-time deadline'} expired before a decision could be applied.` : incomplete({ ...previous, stopped: 'timeout' });
+        return await finish(false, 'timeout', timeoutPartial);
+      }
+      if (previous.checkpoint) {
+        let checkpoint: Checkpoint = { ...previous.checkpoint, snapshot: { ...previous.checkpoint.snapshot, artifacts: [...previous.checkpoint.snapshot.artifacts] } };
+        const refs = new Set(checkpoint.snapshot.artifacts.map(item => item.ref));
+        for (const path of changedFiles) if (!refs.has(`file:${path}`)) checkpoint.snapshot.artifacts.push({ ref: `file:${path}`, summary: `host-observed changed file${fileSizes.has(path) ? ` (${fileSizes.get(path)} bytes)` : ''}` });
+        checkpoint = sanitizeStructured({ ...checkpoint, snapshot: { ...checkpoint.snapshot, artifacts: checkpoint.snapshot.artifacts.slice(-8) } }) as Checkpoint;
+        previous = { ...previous, checkpoint };
+        const facts = [...checkpoint.summary, ...checkpoint.snapshot.artifacts.map(item => `artifact ${item.ref}${item.summary ? ` — ${item.summary}` : ''}`), ...checkpoint.snapshot.checks.map(item => `check ${item.ref}: ${item.status ?? 'status unknown'}`), ...checkpoint.snapshot.results.map(item => `result ${item.ref}${item.summary ? ` — ${item.summary}` : ''}`), ...checkpoint.snapshot.workers.map(item => `worker ${item.ref}${item.summary ? ` — ${item.summary}` : ''}`), ...(checkpoint.snapshot.failures ?? []).map(item => `failure ${item.ref}: ${item.summary}`), ...checkpoint.snapshot.pendingUncertain.map(item => `uncertain: ${item}`)].slice(0, 24);
+        const text = `checkpoint reached (${checkpoint.reason.replaceAll('_', ' ')}). work is partial, not complete.\n\n${facts.map(item => `- ${item}`).join('\n')}${checkpoint.modelHandoff ? `\n\nmodel handoff (unverified): ${checkpoint.modelHandoff.slice(0, 1200)}` : ''}`;
+        return await finish(false, 'partial', text);
+      }
       if (previous.success) return await finish(true, 'completed', previous.text);
       if (task && (!task.remaining().calls || !task.remaining().modelCalls || !task.remaining().ms)) {
         const status = !task.remaining().ms ? 'timeout' : !task.remaining().calls ? 'tool_limit' : 'turn_limit';

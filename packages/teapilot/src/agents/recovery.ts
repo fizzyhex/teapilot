@@ -4,6 +4,13 @@ import type { RequestAllowance } from './allowance.js';
 /** Host-owned, request-local recovery evidence. Attempts and instruction refreshes do not reset it. */
 export class RequestRecovery {
   allowance?: RequestAllowance;
+  checkpointSequence = 0;
+  readonly checkpointAmendments: string[] = [];
+  readonly checkpointResults: Array<{ ref: string; summary: string }> = [];
+  readonly checkpointWorkers = new Map<string, string>();
+  readonly checkpointChecks = new Map<string, { command: string; status: 'passed' | 'failed'; sourceEpoch: number }>();
+  checkpointSourceEpoch = 0;
+  freshContextUsed = false;
   readonly paging = new Map<string, { source: string; offset: number; count: number; warned: boolean }>();
   readonly repeated = new Map<string, number>();
   readonly commands = new Map<string, string>();
