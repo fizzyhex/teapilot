@@ -50,7 +50,7 @@ globalThis.__play = ${awaitResult ? 'async ' : ''}(method, input, discord) => {
   Math.random = ctx.random;
   if (discord) ctx.discord = discord;
   let value;
-  if (method === 'meta') value = { participants: definition.participants === undefined ? null : definition.participants };
+  if (method === 'meta') value = { participants: definition.participants === undefined ? null : definition.participants, keys: Object.keys(definition) };
   else if (method === 'init') value = definition.init(ctx);
   else if (method === 'update') value = definition.update(state, action, ctx);
   else value = definition.view(state, ctx);

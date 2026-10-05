@@ -16,7 +16,7 @@ export default app<State>({
 it('runs a TypeScript app against the SDK with JSON in and out', async () => {
   const engine = await sandbox(counter);
   try {
-    expect((await engine.call('meta', { ctx })).value).toEqual({ participants: 'invoker' });
+    expect((await engine.call('meta', { ctx })).value).toEqual({ participants: 'invoker', keys: ['participants', 'init', 'update', 'view'] });
     const start = await engine.call('init', { ctx });
     expect(start.value).toEqual({ count: 0 });
     const next = await engine.call('update', { state: { count: 2 }, action: { kind: 'button', id: 'add', user: { id: '1' } }, ctx });

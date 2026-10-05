@@ -670,6 +670,10 @@ it('turns away an app no one can do anything with', async () => {
   const stuck = `import { app } from '@teapilot/discord-play';
 export default app({ init: () => ({ current: null }), update: state => state, view: () => ({ content: 'Waiting for a player to act...' }) });`;
   await expect(start(runtime, { code: stuck })).rejects.toThrow(/its view has no controls, and no timer or consult is on its way/);
+  // Controls written where nothing reads them are named.
+  const misplaced = `import { app, button } from '@teapilot/discord-play';
+export default app({ init: () => ({}), update: state => state, view: () => ({ content: 'board', controls: [button('left', 'Left')] }), controls: [button('right', 'Right')] });`;
+  await expect(start(runtime, { code: misplaced })).rejects.toThrow(/It ignores `controls`: a view is .* Controls go in view\(\)'s rows, not on app\(\)\./);
   expect(posts).toEqual([]);
 });
 

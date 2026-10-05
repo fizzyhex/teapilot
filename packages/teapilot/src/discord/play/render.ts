@@ -128,6 +128,8 @@ function media(value: unknown, what: string, pictures?: PictureSpec[]): string |
 
 function renderEmbed(value: unknown, index: number, pictures?: PictureSpec[]): { json: Record<string, unknown>; size: number } {
   if (!isRecord(value)) throw new PlayError(`Embed ${index + 1} must be built with embed().`);
+  // embed("text") spreads the string into numbered keys.
+  if ('0' in value) throw new PlayError(`Embed ${index + 1}: embed() takes options, as in embed({ description: text }), not a string.`);
   const title = string(value.title, 'Embed title', limits.title);
   const description = string(value.description, 'Embed description', limits.description);
   const footer = string(unwrap(value.footer, 'text'), 'Embed footer', limits.footer);
@@ -151,6 +153,7 @@ export function renderEmbeds(value: unknown, pictures?: PictureSpec[]): Array<Re
 function renderControl(playId: string, control: unknown, disabled: boolean, seen: Set<string>): Record<string, unknown> {
   if (!isRecord(control)) throw new PlayError(`Rows hold controls built with button() or select(), not ${shown(control)}.`);
   if (control.type === 'button') {
+    if (isRecord(control.id)) throw new PlayError('button() takes positional arguments, as in button("left", "◀", { style: "primary" }), not one object.');
     // Discord rejects blank labels; an emoji-only button often arrives with a space as its label.
     const label = string(control.label, 'Button label', limits.label)?.trim() ? control.label as string : undefined;
     const icon = emoji(control.emoji);
@@ -213,6 +216,13 @@ export function normalizeView(value: unknown): unknown {
   return view;
 }
 
+const viewKeys = new Set(['content', 'embeds', 'rows']);
+/** Names keys a view was given that nothing reads, such as `controls` or `text`, for errors about what it lacks. */
+export function ignoredKeys(view: unknown): string {
+  const keys = isRecord(view) ? Object.keys(view).filter(key => !viewKeys.has(key)) : [];
+  return keys.length ? ` It ignores ${keys.map(key => `\`${key}\``).join(', ')}: a view is { content?, embeds?, rows? }, with controls as rows: [row(button(id, label))].` : '';
+}
+
 /** Checks a view against Discord's limits and renders it; `disabled` greys out every control, for a finished app. */
 export function renderView(playId: string, view: unknown, disabled = false): MessagePayload {
   if (!isRecord(view) || view.type !== undefined) throw new PlayError(`view() must return a message object { content?, embeds?, rows? }${isRecord(view) && typeof view.type === 'string' ? `, not a bare ${view.type}; wrap it, as in { ${view.type === 'embed' ? 'embeds' : 'rows'}: [...] }` : Array.isArray(view) ? ', not an array' : ''}.`);
@@ -229,7 +239,7 @@ export function renderView(playId: string, view: unknown, disabled = false): Mes
     if (controls.some(control => isRecord(control) && control.type === 'select') && controls.length > 1) throw new PlayError(`Row ${index + 1}: a select must be alone in its row.`);
     return { type: 1 as const, components: controls.map(control => renderControl(playId, control, disabled, seen)) };
   });
-  if (!content && !embeds.length && !components.length) throw new PlayError('view() returned nothing to show.');
+  if (!content && !embeds.length && !components.length) throw new PlayError(`view() returned nothing to show.${ignoredKeys(view)}`);
   return { content, embeds, components, allowedMentions: { parse: [] }, ...(pictures.length ? { pictures } : {}) };
 }
 
