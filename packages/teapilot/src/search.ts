@@ -62,6 +62,9 @@ export async function checkSearch(config: Config, signal?: AbortSignal): Promise
   try { await searchQuery(config.searchUrl, 'teapilot connectivity check', signal); }
   catch (error) {
     if (!(error instanceof SearchSetupError)) throw error;
+    // Loaded on failure only: it asks Docker, and setup/searxng.ts imports this module.
+    const { followManagedSearch } = await import('./setup/searxng.js');
+    if (await followManagedSearch(config, signal)) return;
     throw new SearchSetupError(`${error.message} ${searchRepair(config)}`);
   }
 }

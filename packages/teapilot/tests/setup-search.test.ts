@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { configureSearch } from '../src/setup/search.js';
-import { ManagedSearch, searchIdentity } from '../src/setup/searxng.js';
+import { followManagedSearch, ManagedSearch, searchIdentity } from '../src/setup/searxng.js';
 import type { SetupUI } from '../src/setup/terminal.js';
 import { fixture, mockServer } from './helpers.js';
 import { readFile } from 'node:fs/promises';
@@ -99,4 +99,28 @@ it('creates localhost-only search with JSON enabled and reuses the owned contain
   expect(run.mock.calls.some(([, args]) => args[0] === 'rm')).toBe(false);
   await service.manage('stop', ui());
   expect(run.mock.calls.some(([, args]) => args[0] === 'stop' && args[1] === 'id')).toBe(true);
+});
+
+it('follows a managed container to its new port after a restart, and leaves other search alone', async () => {
+  const f = await fixture(); cleanup.push(f.cleanup);
+  const server = await mockServer((_body, _req, res) => { res.end('{"results":[]}'); }); cleanup.push(server.close);
+  f.config.source = { directory: f.cwd, reason: 'test', overrides: [] };
+  f.config.policy.permissions.push('web.search');
+  const identity = searchIdentity(f.cwd);
+  const port = new URL(server.url).port;
+  const run = vi.fn(async (_exe: string, args: string[]) => {
+    if (args[0] === 'ps') return 'id';
+    if (args[0] === 'inspect') return JSON.stringify([{ Id: 'id', Config: { Labels: { 'org.teapilot.search-profile': identity.owner } }, State: { Running: true }, NetworkSettings: { Ports: { '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: port }] } } }]);
+    return '';
+  });
+  f.config.searchUrl = 'http://127.0.0.1:1';
+  expect(await followManagedSearch(f.config, signal(), run)).toBe(true);
+  expect(f.config.searchUrl).toBe(`http://127.0.0.1:${port}`);
+  // Already there: nothing to follow.
+  expect(await followManagedSearch(f.config, signal(), run)).toBe(false);
+  run.mockClear();
+  f.config.searchUrl = 'https://search.example';
+  expect(await followManagedSearch(f.config, signal(), run)).toBe(false);
+  expect(f.config.searchUrl).toBe('https://search.example');
+  expect(run).not.toHaveBeenCalled();
 });

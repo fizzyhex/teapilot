@@ -3,6 +3,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import type { Config } from '../config.js';
 import { command } from '../runtime/process.js';
 import { searchQuery } from '../search.js';
 import type { SetupUI } from './terminal.js';
@@ -14,6 +15,20 @@ export function searchIdentity(directory: string) {
   return { owner, name: `teapilot-search-${owner.slice(0, 12)}`, directory: join(path, 'searxng') };
 }
 export type DockerCommand = typeof command;
+/**
+ * Moves a profile's local search URL to where its managed container answers now, after a restart gave it a new port.
+ * Returns whether the URL changed. Search elsewhere, or not managed by this profile, is left alone.
+ */
+export async function followManagedSearch(config: Config, signal?: AbortSignal, run: DockerCommand = command): Promise<boolean> {
+  if (!config.source || !config.searchUrl || new URL(config.searchUrl).hostname !== '127.0.0.1') return false;
+  try {
+    const url = await new ManagedSearch(config.source.directory, signal ?? new AbortController().signal, run).running();
+    if (!url || url === config.searchUrl) return false;
+    await searchQuery(url, 'teapilot connectivity check', signal);
+    config.searchUrl = url;
+    return true;
+  } catch { signal?.throwIfAborted(); return false; }
+}
 interface Container { Id: string; Config: { Labels?: Record<string, string> }; State: { Running: boolean }; NetworkSettings: { Ports: Record<string, Array<{ HostIp: string; HostPort: string }> | null> } }
 
 export class ManagedSearch {
@@ -39,6 +54,11 @@ export class ManagedSearch {
     const ports = container.NetworkSettings.Ports['8080/tcp'];
     if (ports?.length !== 1 || ports[0]?.HostIp !== '127.0.0.1' || !/^\d+$/.test(ports[0].HostPort)) throw new Error('Managed search must publish only on 127.0.0.1.');
     return `http://127.0.0.1:${ports[0].HostPort}`;
+  }
+  /** Where this profile's search answers now, if it is running. Its host port changes every time the container starts. */
+  async running(): Promise<string | undefined> {
+    const container = await this.inspect();
+    return container?.State.Running ? this.url(container) : undefined;
   }
   async start(log: (message: string) => void): Promise<string> {
     await this.available();
