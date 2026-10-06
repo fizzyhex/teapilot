@@ -133,7 +133,7 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
   const { tier, telemetry } = input;
   const config = input.readOnly && !input.junior ? { ...input.config, policy: { ...input.config.policy, limits: { ...input.config.policy.limits, maxToolCalls: Math.min(input.config.policy.limits.maxToolCalls, input.config.policy.limits.planningToolCalls ?? planningCallLimit) } } } : input.config;
   const recovery = input.recovery ?? new RequestRecovery();
-  const task = input.task, actor = input.taskActor ?? instructor;
+  const task = input.task, actor = input.taskActor ?? (input.junior ? { name: input.junior.name } : instructor);
   const allowance = input.allowance ?? (recovery.allowance ??= new RequestAllowance({ calls: config.policy.limits.maxToolCalls, modelCalls: config.policy.limits.maxTurns * (config.policy.escalation.maxEscalations + 1), timeoutMs: config.policy.limits.attemptTimeoutMs * (config.policy.escalation.maxEscalations + 1), delegations: config.policy.limits.maxJuniorTurns ?? 6 }, task, resolveToolBudget(config, { readOnly: input.readOnly, casual: input.casual, side: input.side, junior: input.junior !== undefined })));
   task?.restoreRecovery(recovery);
   const receipts = new Map<string, string>();

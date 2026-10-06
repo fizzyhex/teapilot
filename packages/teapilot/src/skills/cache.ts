@@ -6,14 +6,15 @@ import { pipeline } from 'node:stream/promises';
 import { createGunzip } from 'node:zlib';
 import { extract } from 'tar-stream';
 import { z } from 'zod';
+import { parseFrontmatter } from '@earendil-works/pi-coding-agent';
 import { replaceFileSync } from '../replace.js';
-import { catalogSkillText, discoverSkills, relativeSkillPath, type SkillCatalog } from '../workspace/skills.js';
+import { catalogSkillText, discoverSkills, relativeSkillPath, skillFlags, skillText, type SkillCatalog } from '../workspace/skills.js';
 import { defaultSkillSets, normalizeSets, repositorySource, type RepositorySource, type SkillPreferences, type SkillSettings } from './settings.js';
 
 const sha = (bytes: Uint8Array | string) => createHash('sha256').update(bytes).digest('hex');
 export const skillCacheLimits = { downloadBytes: 32 * 1024 * 1024, expandedBytes: 128 * 1024 * 1024, fileBytes: 8 * 1024 * 1024, entries: 10000, cacheBytes: 512 * 1024 * 1024 };
 const refreshMs = 6 * 60 * 60_000;
-const snapshotSchema = z.object({ source: z.string().max(600), revision: z.string().regex(/^[\da-f]{40}$/), bytes: z.number().int().nonnegative(), skills: z.array(z.object({ id: z.string().refine(relativeSkillPath), name: z.string().min(1).max(200), description: z.string().min(1).max(2000) }).strict()).max(200), files: z.record(z.string().refine(relativeSkillPath), z.string().regex(/^[\da-f]{64}$/)) }).strict();
+const snapshotSchema = z.object({ source: z.string().max(600), revision: z.string().regex(/^[\da-f]{40}$/), bytes: z.number().int().nonnegative(), skills: z.array(z.object({ id: z.string().refine(relativeSkillPath), name: z.string().min(1).max(200), description: z.string().min(1).max(2000), flags: z.array(z.string()).optional() }).strict()).max(200), files: z.record(z.string().refine(relativeSkillPath), z.string().regex(/^[\da-f]{64}$/)) }).strict();
 type Snapshot = z.infer<typeof snapshotSchema>;
 const pointerSchema = z.object({ revision: z.string().regex(/^[\da-f]{40}$/).optional(), checkedAt: z.number(), failures: z.number().int().nonnegative().default(0), error: z.string().optional() }).strict();
 type Pointer = z.infer<typeof pointerSchema>;
@@ -145,6 +146,12 @@ export class SkillCache {
     if ((await stat(file)).size > 4 * 1024 * 1024) throw new Error('oversized skill index');
     const value = snapshotSchema.parse(JSON.parse(await readFile(file, 'utf8')));
     if (value.source !== source.id || value.revision !== revision) throw new Error('skill snapshot identity mismatch');
+    // Older indexes omitted flags; recover them from the integrity-checked immutable source.
+    for (const skill of value.skills) if (skill.flags === undefined) {
+      const text = await skillText(join(this.base(source), revision, 'files'), skill.id);
+      if (value.files[`${skill.id}/SKILL.md`] !== sha(Buffer.from(text))) throw new Error('cached skill file failed its integrity check');
+      skill.flags = skillFlags(parseFrontmatter(text.replace(/^\uFEFF/, '')).frontmatter.flags);
+    }
     this.indexes.set(key, value); return value;
   }
   /** Serialized across processes, separate from the inference state lock. No active snapshot is deleted. */
@@ -196,7 +203,7 @@ export class SkillCache {
           }
         }
         if (used + extracted.bytes > skillCacheLimits.cacheBytes) throw new Error('skill cache is full; free cache space while teapilot is stopped');
-        const snapshot: Snapshot = { source: source.id, revision, skills: catalog.skills, ...extracted };
+        const snapshot: Snapshot = { source: source.id, revision, skills: catalog.skills.map(skill => ({ ...skill, flags: skill.flags ?? [] })), ...extracted };
         const index = JSON.stringify(snapshot);
         if (used + extracted.bytes + Buffer.byteLength(index) > skillCacheLimits.cacheBytes) throw new Error('skill cache is full; free cache space while teapilot is stopped');
         await writeFile(join(temporary, 'index.json'), index, { mode: 0o600 });
@@ -238,7 +245,8 @@ export class SkillCache {
         for (const metadata of snapshot.skills) {
           if ((set.include && !set.include.includes(metadata.id)) || set.exclude?.includes(metadata.id)) continue;
           const id = `${source.id}::${metadata.id}`;
-          catalog.skills.push({ ...metadata, id, set: source.id, revision: pointer.revision });
+          const { flags, ...rest } = metadata;
+          catalog.skills.push({ ...rest, ...(flags?.length ? { flags } : {}), id, set: source.id, revision: pointer.revision });
           catalog.locations![id] = { root, folder: metadata.id, hashes: snapshot.files };
         }
         if (pointer.error) catalog.warnings.push(`${source.id}: using cached ${pointer.revision.slice(0, 8)}; ${pointer.error}`);

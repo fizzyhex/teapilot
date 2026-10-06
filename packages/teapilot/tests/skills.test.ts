@@ -73,6 +73,26 @@ it('bounds instruction loading, saves the complete source once, and supports tar
   expect(skills.references()).not.toContain('instruction 0');
 });
 
+it.each(['orchestrator-only', '[other, orchestrator-only]', '\n  - other\n  - orchestrator-only'])('withholds skills flagged %s from junior metadata and retrieval', async flags => {
+  const f = await setup();
+  await mkdir(join(f.root, 'planner'));
+  await writeFile(join(f.root, 'planner', 'SKILL.md'), `---\nname: Planner\ndescription: Orchestrator guidance\nflags: ${flags}\n---\nPRIVATE-PLANNING-INSTRUCTIONS\n`);
+  await writeFile(join(f.root, 'planner', 'support.md'), 'private support');
+  const catalog = await discoverSkills(f.root);
+  expect(catalog.skills.find(skill => skill.id === 'planner')?.flags).toContain('orchestrator-only');
+  const orchestrator = skillTools(catalog);
+  expect(orchestrator.prompt).toContain('Orchestrator guidance');
+  expect(textOf(await orchestrator.tools[0]!.execute('a', { id: 'planner' }))).toContain('PRIVATE-PLANNING-INSTRUCTIONS');
+  const junior = skillTools(catalog, undefined, undefined, { name: 'junior-reader' });
+  expect(junior.prompt).not.toContain('Orchestrator guidance');
+  const page = JSON.parse(textOf(await junior.tools[0]!.execute('b', {})));
+  expect(page.skills.map((skill: { id: string }) => skill.id)).toEqual(['example']);
+  expect(page.total).toBe(1);
+  for (const file of ['SKILL.md', 'support.md']) await expect(junior.tools[0]!.execute('c', { id: 'planner', file })).rejects.toThrow('unknown skill ID');
+  expect(skillTools({ ...catalog, skills: catalog.skills.filter(skill => skill.id === 'planner') }, undefined, undefined, { name: 'junior-reader' }).tools).toEqual([]);
+  expect(catalog.skills).toHaveLength(2);
+});
+
 it('retrieves supporting text without executing it and still works without scratch storage', async () => {
   const f = await setup();
   await mkdir(join(f.root, 'example', 'utils'));
@@ -137,6 +157,9 @@ it('reuses indexed artifacts after task reload and respects junior artifact auth
   expect(skillTools(f.catalog, undefined, task, { name: 'junior-reader' }).references()).toBe('');
   expect(skillTools(f.catalog, undefined, task, { name: 'junior-reader', artifacts: [artifact] }).references()).toContain(artifact);
   expect(await task.artifact({ name: 'junior-reader', artifacts: [artifact] }, artifact, { search: 'LATE-MARKER' })).toContain('LATE-MARKER');
+  const restricted = { ...f.catalog, skills: f.catalog.skills.map(skill => ({ ...skill, flags: ['orchestrator-only'] })) };
+  expect(skillTools(restricted, undefined, task, { name: 'junior-reader', artifacts: [artifact] }).references()).toBe('');
+  expect(skillTools(restricted, undefined, task).references()).toContain(artifact);
 });
 
 it('does not reuse a changed artifact and degrades gracefully when storage fails', async () => {
@@ -159,6 +182,8 @@ it('does not reuse a changed artifact and degrades gracefully when storage fails
 
 it.each(['normal', 'planning', 'side', 'junior', 'disabled', 'casual'] as const)('integrates skill declarations with %s attempts without preloading instructions', async scope => {
   const f = await setup(), bodies: any[] = [];
+  await mkdir(join(f.root, 'planner'));
+  await writeFile(join(f.root, 'planner', 'SKILL.md'), '---\nname: Planner\ndescription: ORCHESTRATOR-METADATA\nflags: orchestrator-only\n---\nprivate instructions\n');
   const server = await mockServer((body, _request, response) => { bodies.push(body); completion(response, { text: 'done' }); }); cleanups.push(server.close);
   Object.assign(f.config.models.capable, { provider: 'ollama', baseUrl: server.url });
   f.config.skills = { enabled: scope !== 'disabled', directory: f.root };
@@ -168,6 +193,7 @@ it.each(['normal', 'planning', 'side', 'junior', 'disabled', 'casual'] as const)
     ...(scope === 'junior' ? { junior: { name: 'junior-test', description: 'Inspect', agent_type: 'research' as const, assignment: 'inspect', artifacts: [], turn: 1, onReport() {} } } : {}) });
   expect(bodies[0].tools?.some((tool: any) => tool.function.name === 'skill') ?? false).toBe(!['disabled', 'casual'].includes(scope));
   expect(JSON.stringify(bodies[0].messages)).not.toContain('instruction 0');
+  expect(JSON.stringify(bodies[0].messages).includes('ORCHESTRATOR-METADATA')).toBe(!['junior', 'disabled', 'casual'].includes(scope));
 });
 
 it('loads and retrieves skills within an 8k model context without requiring artifact storage', async () => {
