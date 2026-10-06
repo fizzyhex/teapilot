@@ -20,7 +20,7 @@ const sourceSchema = z.object({ path: z.string().max(2048).optional(), url: z.st
 const artifactSchema = z.object({ id, sha256: z.string().regex(/^[a-f0-9]{64}$/), path: z.string().max(2048), bytes: z.number().int().nonnegative().max(8 * 1024 * 1024), lines: z.number().int().nonnegative(), complete: z.boolean(), kind: z.enum(['logs', 'pages', 'outputs']), actor: id, producer: id, producerTool: z.string().max(80).optional(), request: z.string().max(100).optional(), origin: z.enum(['file', 'inventory', 'saved-output', 'transcript']).optional(), source: sourceSchema.optional(), sourceEpoch: z.number().int().nonnegative().optional(), at: z.number() }).strict();
 const receiptSchema = z.object({ id, request: z.string().max(100), actor: id, tool: z.string().max(80), call: z.string().max(2000).optional(), argsSha256: z.string(), summary: z.string().max(240), excerpt: z.string().max(400), origin: z.enum(['file', 'inventory', 'saved-output', 'transcript']).optional(), source: sourceSchema.optional(), sourceEpoch: z.number().int().nonnegative().optional(), stale: z.boolean().optional(), uncertainSource: z.boolean().optional(), status: z.enum(['pending', 'succeeded', 'failed', 'uncertain']), artifacts: z.array(id).max(8), at: z.number() }).strict();
 const toolBudgetSchema = z.object({ instructorCalls: z.number().int().nonnegative(), instructorGranted: z.number().int().nonnegative(), continuationBatches: z.number().int().nonnegative(), instructorBatchCalls: z.number().int().nonnegative(), juniorMaxCalls: z.number().int().positive(), maxContinuationBatches: z.number().int().nonnegative() }).strict();
-const requestSchema = z.object({ id: z.string().max(100), calls: z.number().int().nonnegative(), modelCalls: z.number().int().nonnegative(), maxCalls: z.number().int().nonnegative(), maxModelCalls: z.number().int().nonnegative(), deadline: z.number(), status: z.string().max(80), delegations: z.number().int().nonnegative(), maxDelegations: z.number().int().nonnegative(), readOnly: z.boolean().optional(), continuationDenied: z.boolean().default(false), juniorCalls: z.record(id, z.number().int().nonnegative()).default({}), toolBudget: toolBudgetSchema.optional() }).strict();
+const requestSchema = z.object({ id: z.string().max(100), calls: z.number().int().nonnegative(), modelCalls: z.number().int().nonnegative(), maxCalls: z.number().int().nonnegative(), maxModelCalls: z.number().int().nonnegative(), deadline: z.number(), status: z.string().max(80), delegations: z.number().int().nonnegative(), maxDelegations: z.number().int().nonnegative(), readOnly: z.boolean().optional(), continuationDenied: z.boolean().default(false), juniorCalls: z.record(id, z.number().int().nonnegative()).default({}), juniorPoolCalls: z.number().int().nonnegative().default(0), maxJuniorPoolCalls: z.number().int().nonnegative().optional(), toolBudget: toolBudgetSchema.optional() }).strict();
 const juniorSchema = z.object({ name: id, type: z.enum(['research', 'plan', 'implement', 'review']).optional(), agent_type: z.enum(['research', 'write', 'test']).optional(), description: z.string().max(500).optional(), assignment: z.string().max(24_000).optional(), artifacts: z.array(z.string().min(1).max(2048)).max(16).optional(), scratch: z.string().max(2048), turn: z.number().int().nonnegative(), turns: z.array(z.object({ user: z.string().max(24_000), assistant: z.string().max(4000) })).max(6) }).strict();
 const stateSchema = z.object({
   version: z.literal(1), id, scope: z.string().max(4096), scratch: z.string().max(2048), revision: z.number().int().nonnegative(), objective: z.string().max(24_000),
@@ -226,11 +226,11 @@ export class TaskStore {
       yield record;
     }
   }
-  startRequest(request: string, limits: { calls: number; modelCalls: number; timeoutMs: number; delegations?: number; readOnly?: boolean; instructorCalls?: number; juniorCalls?: number; maxContinuationBatches?: number }): void {
+  startRequest(request: string, limits: { calls: number; modelCalls: number; timeoutMs: number; delegations?: number; readOnly?: boolean; instructorCalls?: number; juniorCalls?: number; juniorPool?: number; maxContinuationBatches?: number }): void {
     if (this.state.request?.id === request) return;
     this.change(next => {
       next.status = 'active';
-      next.request = { id: request, calls: 0, modelCalls: 0, maxCalls: limits.calls, maxModelCalls: limits.modelCalls, deadline: Date.now() + limits.timeoutMs, status: 'active', delegations: 0, maxDelegations: limits.delegations ?? 6, readOnly: limits.readOnly ?? false, continuationDenied: false, juniorCalls: {}, ...(limits.instructorCalls !== undefined && limits.juniorCalls !== undefined && limits.maxContinuationBatches !== undefined ? { toolBudget: { instructorCalls: 0, instructorGranted: Math.min(limits.calls, limits.instructorCalls), continuationBatches: 0, instructorBatchCalls: limits.instructorCalls, juniorMaxCalls: limits.juniorCalls, maxContinuationBatches: limits.maxContinuationBatches } } : {}) };
+      next.request = { id: request, calls: 0, modelCalls: 0, maxCalls: limits.calls, maxModelCalls: limits.modelCalls, deadline: Date.now() + limits.timeoutMs, status: 'active', delegations: 0, maxDelegations: limits.delegations ?? 6, readOnly: limits.readOnly ?? false, continuationDenied: false, juniorCalls: {}, juniorPoolCalls: 0, ...(limits.juniorPool !== undefined ? { maxJuniorPoolCalls: limits.juniorPool } : {}), ...(limits.instructorCalls !== undefined && limits.juniorCalls !== undefined && limits.maxContinuationBatches !== undefined ? { toolBudget: { instructorCalls: 0, instructorGranted: Math.min(limits.calls, limits.instructorCalls), continuationBatches: 0, instructorBatchCalls: limits.instructorCalls, juniorMaxCalls: limits.juniorCalls, maxContinuationBatches: limits.maxContinuationBatches } } : {}) };
     });
   }
   remaining(): { calls: number; modelCalls: number; ms: number } {
@@ -245,6 +245,12 @@ export class TaskStore {
     return true;
   }
   get delegationExhausted(): boolean { return !this.state.request || this.state.request.delegations >= this.state.request.maxDelegations; }
+  /** Calls left for all juniors together; state saved before the junior pool existed shares the instructor's. */
+  juniorPoolRemaining(): number {
+    const request = this.state.request;
+    if (!request) throw new Error('task request has not started');
+    return request.maxJuniorPoolCalls === undefined ? this.remaining().calls : Math.max(0, request.maxJuniorPoolCalls - request.juniorPoolCalls);
+  }
   juniorCalls(name: string): number { return this.state.request?.juniorCalls[name] ?? 0; }
   consumeJunior(name: string): void { this.change(next => { next.request!.juniorCalls[name] = (next.request!.juniorCalls[name] ?? 0) + 1; }); }
   toolBudget() { return this.state.request?.toolBudget && structuredClone(this.state.request.toolBudget); }
@@ -302,7 +308,8 @@ export class TaskStore {
   }
   admit(actor: TaskActor, tool: string, args: unknown, call?: string): string | undefined {
     const request = this.state.request, remaining = this.remaining();
-    if (!request || !remaining.calls || !remaining.ms) return undefined;
+    const pooled = actor.name !== instructor.name && request?.maxJuniorPoolCalls !== undefined;
+    if (!request || !(pooled ? this.juniorPoolRemaining() : remaining.calls) || !remaining.ms) return undefined;
     const budget = request.toolBudget;
     if (request.continuationDenied || (actor.name === instructor.name ? Boolean(budget && budget.instructorCalls >= budget.instructorGranted)
       : Boolean(budget && (request.juniorCalls[actor.name] ?? 0) >= budget.juniorMaxCalls))) return undefined;
@@ -311,7 +318,7 @@ export class TaskStore {
     const search = data.pattern ?? data.query;
     const summary = String(data.path ?? data.command ?? data.url ?? '') + (search === undefined ? '' : `; ${String(search)}`);
     this.change(next => {
-      const req = next.request!; req.calls++;
+      const req = next.request!; if (pooled) req.juniorPoolCalls++; else req.calls++;
       if (req.toolBudget) {
         if (actor.name === instructor.name) req.toolBudget.instructorCalls++;
         else req.juniorCalls[actor.name] = (req.juniorCalls[actor.name] ?? 0) + 1;

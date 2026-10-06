@@ -12,14 +12,11 @@ import { Telemetry } from '../src/telemetry/outcome.js';
 import { describeTool } from '../src/presentation.js';
 
 const cleanups: Array<() => Promise<unknown>> = [];
-it('caps each junior at twenty calls while reserving four shared calls for the instructor', () => {
+it('caps each junior at twenty calls from the junior pool', () => {
   expect(juniorAllowance(38, 40)).toBe(20);
-  expect(juniorAllowance(38, 20)).toBe(20);
-  expect(juniorAllowance(3, 40)).toBe(0);
-  expect(juniorAllowance(4, 40)).toBe(0);
-  expect(juniorAllowance(5, 40)).toBe(1);
-  expect(juniorAllowance(6, 40)).toBe(2);
-  expect(juniorAllowance(10, 40)).toBe(6);
+  expect(juniorAllowance(38, 12)).toBe(12);
+  expect(juniorAllowance(6, 40)).toBe(6);
+  expect(juniorAllowance(0, 40)).toBe(0);
   expect(juniorAllowance(38, 0)).toBe(0);
 });
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -235,8 +232,8 @@ it('tells a junior to report before the tool limit stops it', async () => {
   const delegated = (await events(f.config)).find(event => event.type === 'delegate');
   expect(delegated).toMatchObject({ status: 'stuck' });
   expect(delegated?.stopped).toBeUndefined();
-  expect(delegated?.allocation).toBe(5);
-  expect(juniorCalls).toBe(3);
+  expect(delegated?.allocation).toBe(10);
+  expect(juniorCalls).toBe(8);
 });
 
 it('requires the complete schema on every call and retains a junior assignment across follow-ups', async () => {
@@ -300,13 +297,14 @@ it('inherits parent read-only safety for every agent_type and accepts legacy sav
   expect(children[0].config.policy.limits.maxToolCalls).toBe(20);
 });
 
-it('allocates a uniform cumulative cap, capped by policy and shared request room with four calls reserved', async () => {
+it('allocates a uniform cumulative cap from the junior pool, capped by policy, and refuses too few to work', async () => {
   const f = await setup((_body, _req, res) => completion(res, { text: 'unused' }));
   const children: any[] = [];
   const parent = { ...f, tier: 'normal' as const, workload: 'coder' as const, web: false, prompt: 'parent', approve: async () => true };
-  for (const [policy, shared, expected] of [[40, 40, 20], [5, 40, 5], [40, 9, 5], [40, 5, undefined], [40, 6, 2]] as const) {
+  for (const [policy, pool, expected] of [[40, 40, 20], [12, 40, 12], [40, 9, 9], [40, 7, undefined], [5, 40, undefined]] as const) {
     f.config.policy.limits.maxToolCalls = policy;
-    const allowance = new RequestAllowance({ calls: shared, modelCalls: 50, timeoutMs: 10_000, delegations: 6 });
+    // The instructor has spent its own calls: juniors draw from their pool regardless.
+    const allowance = new RequestAllowance({ calls: 1, modelCalls: 50, timeoutMs: 10_000, delegations: 1 }, undefined, { juniorPool: pool });
     const delegated = delegateTool(parent, f.scratch, f.cwd, { pause() {}, resume() {} }, async child => {
       children.push(child);
       return { success: true, text: 'findings', turns: 1, toolCalls: 0 };
@@ -315,12 +313,36 @@ it('allocates a uniform cumulative cap, capped by policy and shared request room
     const result = await delegated.tool.execute('a', { label: 'Complete assigned checks', prompt: 'complete the assigned task', agent_type: 'research', artifacts: [] });
     if (expected === undefined) {
       expect(children).toHaveLength(0);
-      expect(result.content[0]).toMatchObject({ text: expect.stringContaining('too little room') });
+      expect(result.content[0]).toMatchObject({ text: expect.stringContaining('too few to work and report') });
+      // A refusal starts no junior and spends no delegation.
+      expect(allowance.consumeDelegation()).toBe(true);
     } else {
       expect(children).toHaveLength(1);
       expect(children[0].config.policy.limits.maxToolCalls).toBe(expected);
     }
   }
+});
+
+it('points a spent junior at a new one, and a starved request at a checkpoint', async () => {
+  const f = await setup((_body, _req, res) => completion(res, { text: 'unused' }));
+  const parent = { ...f, tier: 'normal' as const, workload: 'coder' as const, web: false, prompt: 'parent', approve: async () => true };
+  const allowance = new RequestAllowance({ calls: 40, modelCalls: 50, timeoutMs: 10_000, delegations: 6 }, undefined, { juniorPool: 40 });
+  const delegated = delegateTool(parent, f.scratch, f.cwd, { pause() {}, resume() {} }, async () => {
+    for (let index = 0; index < 15; index++) allowance.consumeTool('junior-alfa');
+    return { success: true, text: 'findings', turns: 1, toolCalls: 15 };
+  }, allowance);
+  const args = { label: 'Complete assigned checks', prompt: 'complete the assigned task', agent_type: 'research', artifacts: [] };
+  const first = await delegated.tool.execute('a', args);
+  const name = (first.details as { junior: string }).junior;
+  const again = await delegated.tool.execute('b', { ...args, junior: name });
+  expect(again.content[0]).toMatchObject({ text: expect.stringContaining(`${name} has 5 tool calls left`) });
+  expect(again.content[0]).toMatchObject({ text: expect.stringContaining('start a new junior') });
+
+  const starved = new RequestAllowance({ calls: 40, modelCalls: 50, timeoutMs: 10_000, delegations: 6 }, undefined, { juniorPool: 4 });
+  const workflow = { canCheckpoint: true, juniors: new Map(), taskOf: () => undefined } as any;
+  const handoff = delegateTool({ ...parent, workflow }, f.scratch, f.cwd, { pause() {}, resume() {} }, async () => { throw new Error('not started'); }, starved);
+  expect((await handoff.tool.execute('c', args)).content[0]).toMatchObject({ text: expect.stringContaining('call checkpoint') });
+  expect(handoff.exhausted).toBe(true);
 });
 
 it('publishes bounded required arguments without imposing a description word-count rule', async () => {

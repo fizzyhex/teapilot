@@ -2,7 +2,9 @@ import type { TaskStore } from '../workspace/task.js';
 import type { Approve } from '../execution/policy.js';
 import type { Config } from '../config.js';
 
-export interface ToolBudgetLimits { instructorCalls?: number; juniorCalls?: number; maxContinuationBatches?: number }
+export interface ToolBudgetLimits { instructorCalls?: number; juniorCalls?: number; juniorPool?: number; maxContinuationBatches?: number }
+/** Fewer calls than this cannot work and still report, so a junior is not started with them. */
+export const juniorMinCalls = 8;
 export interface QueuedToolCall { id: string; name: string; junior?: string }
 interface Reservation { pendingCall: boolean; junior?: string; juniorCalls: number }
 /** The one policy resolver used when durable request state and the runtime allowance are created. */
@@ -12,6 +14,8 @@ export function resolveToolBudget(config: Config, scope: { readOnly?: boolean; c
   return {
     instructorCalls: excluded ? limits.maxToolCalls : Math.min(limits.maxToolCalls, limits.instructorToolCalls ?? 20),
     juniorCalls: limits.juniorToolCalls ?? 20,
+    // Juniors draw from a pool of their own, so an instructor's work never starves the next junior.
+    juniorPool: Math.min(limits.juniorPoolCalls ?? limits.maxToolCalls, scope.readOnly ? limits.planningToolCalls ?? planningCallLimit : Infinity),
     maxContinuationBatches: excluded ? 0 : limits.maxContinuationBatches ?? 2,
   };
 }
@@ -25,6 +29,7 @@ export class RequestAllowance {
   private granted: number;
   private batches = 0;
   private juniorCalls = new Map<string, number>();
+  private juniorPoolUsed = 0;
   private renewal?: Promise<'ready' | 'denied' | 'exhausted'>;
   private refused = false;
   private reservations = new Map<string, Reservation>();
@@ -32,6 +37,7 @@ export class RequestAllowance {
   readonly deadline: number;
   readonly instructorBatchCalls: number;
   readonly juniorMaxCalls: number;
+  readonly juniorPool: number;
   readonly maxContinuationBatches: number;
   explorationCompactions = new Map<string, number>();
   constructor(readonly limits: { calls: number; modelCalls: number; timeoutMs: number; delegations: number }, readonly task?: TaskStore, budget: ToolBudgetLimits = {}) {
@@ -39,6 +45,7 @@ export class RequestAllowance {
     const saved = task?.toolBudget();
     this.instructorBatchCalls = saved?.instructorBatchCalls ?? (task && !saved ? limits.calls : budget.instructorCalls ?? limits.calls);
     this.juniorMaxCalls = saved?.juniorMaxCalls ?? budget.juniorCalls ?? 20;
+    this.juniorPool = budget.juniorPool ?? limits.calls;
     this.maxContinuationBatches = saved?.maxContinuationBatches ?? budget.maxContinuationBatches ?? 0;
     this.granted = saved?.instructorGranted ?? (task && !saved ? limits.calls : Math.min(limits.calls, this.instructorBatchCalls));
     this.instructorCalls = saved?.instructorCalls ?? 0;
@@ -47,9 +54,13 @@ export class RequestAllowance {
   remaining() {
     return this.task?.remaining() ?? { calls: Math.max(0, this.limits.calls - this.calls), modelCalls: Math.max(0, this.limits.modelCalls - this.models), ms: Math.max(0, this.deadline - Date.now()) };
   }
+  /** Calls left for all juniors together. */
+  juniorRemaining(): number { return this.task?.juniorPoolRemaining() ?? Math.max(0, this.juniorPool - this.juniorPoolUsed); }
+  /** The pool an actor's calls come from: the junior pool for juniors, the request's for the instructor. */
+  poolRemaining(actor?: string): number { return actor ? this.juniorRemaining() : this.remaining().calls; }
   callsRemainingFor(actor?: string): number {
+    if (actor) return Math.max(0, Math.min(this.juniorMaxCalls - this.usedBy(actor), this.juniorRemaining()));
     const remaining = this.remaining().calls;
-    if (actor) return Math.max(0, Math.min(this.juniorMaxCalls - this.usedBy(actor), remaining));
     const saved = this.task?.toolBudget();
     if (this.task && !saved) return remaining;
     if (saved) return Math.max(0, Math.min(saved.instructorGranted - saved.instructorCalls, remaining));
@@ -63,16 +74,16 @@ export class RequestAllowance {
     for (const call of calls) this.reservations.set(call.id, { pendingCall: true, ...(call.name === 'delegate_task' ? { junior: call.junior } : {}), juniorCalls: 0 });
     const slots = calls.length;
     this.finishingReserve = Math.min(4, Math.max(0, capacity - slots));
-    let pool = Math.max(0, capacity - slots - this.finishingReserve);
+    let pool = this.juniorRemaining();
     const delegates = calls.filter(call => call.name === 'delegate_task');
     for (let index = 0; index < delegates.length; index++) {
       const call = delegates[index]!;
       const countLeft = delegates.length - index;
-      const fairShare = pool >= 2 ? Math.max(2, Math.floor(pool / countLeft)) : 0;
+      const fairShare = pool >= juniorMinCalls ? Math.max(juniorMinCalls, Math.floor(pool / countLeft)) : 0;
       const reservedForName = call.junior ? [...this.reservations.values()].filter(item => item.junior === call.junior).reduce((sum, item) => sum + item.juniorCalls, 0) : 0;
       const maximum = Math.max(0, this.juniorMaxCalls - (call.junior ? this.usedBy(call.junior) : 0) - reservedForName);
       const allocation = Math.min(fairShare, maximum);
-      if (allocation < 2) break; // This ID and the suffix are refused deterministically.
+      if (allocation < juniorMinCalls) break; // This ID and the suffix are refused deterministically.
       this.reservations.get(call.id)!.juniorCalls = allocation;
       pool -= allocation;
     }
@@ -86,10 +97,10 @@ export class RequestAllowance {
     held.junior = junior;
     const available = Math.max(0, this.juniorMaxCalls - this.usedBy(junior) - otherHeld);
     held.juniorCalls = Math.min(held.juniorCalls, available);
-    return held.juniorCalls >= 2;
+    return held.juniorCalls >= juniorMinCalls;
   }
   canAdmitTool(callId: string, actor?: string, reservationId?: string): boolean {
-    if (!this.remaining().calls || !this.remaining().ms) return false;
+    if (!this.poolRemaining(actor) || !this.remaining().ms) return false;
     if (actor) {
       const held = reservationId ? this.reservations.get(reservationId) : undefined;
       return Boolean(held && held.junior === actor && held.juniorCalls > 0 && this.usedBy(actor) < this.juniorMaxCalls);
@@ -110,9 +121,14 @@ export class RequestAllowance {
   releaseReservation(id: string): void { this.reservations.delete(id); }
   releaseReservations(): void { this.reservations.clear(); this.finishingReserve = 0; }
   private reservedCalls(): number {
-    return this.finishingReserve + [...this.reservations.values()].reduce((sum, item) => sum + (item.pendingCall ? 1 : 0) + item.juniorCalls, 0);
+    return this.finishingReserve + [...this.reservations.values()].reduce((sum, item) => sum + (item.pendingCall ? 1 : 0), 0);
   }
-  availableDelegationCapacity(): number { return Math.max(0, Math.min(this.juniorMaxCalls, this.remaining().calls - this.reservedCalls() - 1 - 4)); }
+  private juniorCallsHeld(): number { return [...this.reservations.values()].reduce((sum, item) => sum + item.juniorCalls, 0); }
+  /** What a new junior could get now; none when the instructor has no call left to delegate with. */
+  availableDelegationCapacity(): number {
+    if (this.remaining().calls <= this.reservedCalls()) return 0;
+    return Math.max(0, Math.min(this.juniorMaxCalls, this.juniorRemaining() - this.juniorCallsHeld()));
+  }
   /** Reclaim unused capacity after a response batch so skipped calls cannot strand the request. */
   finishQueuedBatch(): void { this.releaseReservations(); }
   async ensureInstructor(signal?: AbortSignal, approve?: Approve): Promise<'ready' | 'denied' | 'exhausted'> {
@@ -144,17 +160,16 @@ export class RequestAllowance {
     return 'ready';
   }
   consumeTool(actor?: string): boolean {
-    if (this.denied || !this.remaining().calls || !this.remaining().ms || (actor ? this.usedBy(actor) >= this.juniorMaxCalls : this.callsRemainingFor() <= 0)) return false;
-    if (!this.task) this.calls++;
+    if (this.denied || !this.poolRemaining(actor) || !this.remaining().ms || (actor ? this.usedBy(actor) >= this.juniorMaxCalls : this.callsRemainingFor() <= 0)) return false;
+    if (!this.task) { if (actor) this.juniorPoolUsed++; else this.calls++; }
     if (actor) { this.juniorCalls.set(actor, this.usedBy(actor) + 1); this.task?.consumeJunior(actor); }
     else this.instructorCalls++;
     return true;
   }
   recordAdmitted(actor?: string): void {
     if (this.task) return;
-    this.calls++;
-    if (actor) this.juniorCalls.set(actor, this.usedBy(actor) + 1);
-    else this.instructorCalls++;
+    if (actor) { this.juniorPoolUsed++; this.juniorCalls.set(actor, this.usedBy(actor) + 1); }
+    else { this.calls++; this.instructorCalls++; }
   }
   consumeModel(): boolean {
     if (this.task) return this.task.consumeModel();

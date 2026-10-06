@@ -195,7 +195,8 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
   const durableExecution = task?.execution(actor);
   const durableChecks = durableExecution?.unresolvedChecks ?? [];
   const callerChecks = (input.unresolvedChecks ?? []).filter(check => !durableChecks.includes(check));
-  const evidence = new Evidence(config.policy.escalation, callerChecks, scratchFolder ? path => within(scratchFolder, activePathPolicy().resolve(path), true) : undefined, recovery, input.readOnly);
+  const evidence = new Evidence(config.policy.escalation, callerChecks, scratchFolder ? path => within(scratchFolder, activePathPolicy().resolve(path), true) : undefined, recovery, input.readOnly,
+    input.junior ? `${input.junior.name}#${input.junior.turn}` : `instructor#${input.workflow?.generation ?? 0}`);
   const localUnresolvedChecks = new Map<string, string>();
   if (durableExecution) evidence.syncUnresolvedChecks(durableChecks);
   const syncTaskChecks = () => { if (task) evidence.syncUnresolvedChecks([...task.execution(actor).unresolvedChecks, ...localUnresolvedChecks.values()]); };
@@ -574,7 +575,7 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
     toolExecution: 'sequential',
     // Before every request, the first included, so an attempt carrying on from another starts within the limit too.
     prepareRequest: async ({ context: given }) => {
-      if (!input.readOnly && allowance.remaining().calls <= 0 && !windowClosed()) toolLimit = true;
+      if (!input.readOnly && allowance.poolRemaining(input.junior?.name) <= 0 && !windowClosed()) toolLimit = true;
       const canRenew = !input.junior && !input.readOnly && !input.side && !input.casual && !evidence.answerNow && !toolLimit && !timeout && !evidence.reason && !capabilityDenied && !policy.denied;
       let budgetState = canRenew ? await gateInstructor() : allowance.denied ? 'denied' : 'ready';
       if (budgetState === 'exhausted' && windowClosed()) budgetState = 'ready';
@@ -626,7 +627,7 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
       }
       // The last turn of a discord.play attempt answers about what is live rather than ending mid-call at the limit.
       if (playing && !evidence.answerNow && inference.turns >= config.policy.limits.maxTurns - 1) { evidence.answerNow = true; evidence.answerWhy = 'This is the last turn'; }
-      if ((input.readOnly || input.junior) && !evidence.answerNow && (Math.min(config.policy.limits.maxToolCalls - evidence.toolCalls, allowance.remaining().calls) <= (input.junior ? 1 : 2) || inference.turns >= config.policy.limits.maxTurns - 1)) {
+      if ((input.readOnly || input.junior) && !evidence.answerNow && (Math.min(config.policy.limits.maxToolCalls - evidence.toolCalls, allowance.poolRemaining(input.junior?.name)) <= (input.junior ? 1 : 2) || inference.turns >= config.policy.limits.maxTurns - 1)) {
         evidence.answerNow = true;
         evidence.answerWhy = 'the exploration allowance is nearly spent';
       }
@@ -650,7 +651,7 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
       if (evidence.answerNow && (!input.junior || toolCall.name !== 'report')) return { block: true, reason: 'exploration finished; synthesize from existing evidence' };
       if (evidence.searchExhausted && toolCall.name === 'web_search') return { block: true, reason: 'Search refused: search is unavailable or repeated searches found no new evidence. Continue without it, clearly stating any gaps.' };
       if (evidence.readsExhausted && toolCall.name === 'web_read') return { block: true, reason: 'Reading refused: the page budget is spent or reads kept returning the same page. Continue without it, clearly stating any gaps.' };
-      if (input.readOnly && (evidence.toolCalls >= config.policy.limits.maxToolCalls || allowance.remaining().calls <= 0)) {
+      if (input.readOnly && (evidence.toolCalls >= config.policy.limits.maxToolCalls || allowance.poolRemaining(input.junior?.name) <= 0)) {
         evidence.answerNow = true; evidence.answerWhy = 'the exploration allowance is spent';
         return { block: true, reason: 'exploration allowance spent; synthesize the proposal from available evidence, stating gaps' };
       }
@@ -788,7 +789,7 @@ export async function runAttempt(input: AttemptInput): Promise<AttemptResult> {
       if (tip) { tipsShown.add(tipText(tip)); tipFor.set(toolCall.id, tip.name); }
       // A junior stopped by the limit ends without a report, and its instructor learns nothing of what it found.
       let lastCalls: string | undefined;
-      const callsLeft = Math.min(config.policy.limits.maxToolCalls - evidence.toolCalls, allowance.remaining().calls);
+      const callsLeft = Math.min(config.policy.limits.maxToolCalls - evidence.toolCalls, allowance.poolRemaining(input.junior?.name));
       if (input.junior && !limitWarned && callsLeft <= juniorReportMargin) {
         limitWarned = true;
         lastCalls = `[notice] ${Math.max(0, callsLeft)} tool calls left: call report now (stuck if unfinished), with what you found and the files it is saved in.`;

@@ -59,6 +59,41 @@ it('keeps inspection-loop warnings across attempts and does not clear them for n
   expect(resumed.reason).toBe('ineffective_calls');
 });
 
+it('counts repeats per context: a fresh context may redo what an earlier one did, but not loop itself', () => {
+  const recovery = new RequestRecovery();
+  const thresholds = { repeatedToolCalls: 3, consecutiveFailures: 2, maxEscalations: 2 };
+  const skill = { id: 'gh:fizzyhex/tea-skills::discord-play' };
+  new Evidence(thresholds, [], undefined, recovery, false, 'instructor#0').observe('skill', skill, false, 'loaded');
+  new Evidence(thresholds, [], undefined, recovery, false, 'junior-alfa#1').observe('skill', skill, false, 'loaded');
+  const second = new Evidence(thresholds, [], undefined, recovery, false, 'junior-alfa#2');
+  second.observe('skill', skill, false, 'loaded');
+  expect(second.reason).toBeUndefined();
+  second.observe('skill', skill, false, 'loaded');
+  second.observe('skill', skill, false, 'loaded');
+  expect(second.reason).toBe('ineffective_calls');
+  // A checkpoint's successor starts its own count; an escalation in the same generation does not.
+  const successor = new Evidence(thresholds, [], undefined, recovery, false, 'instructor#1');
+  successor.observe('skill', skill, false, 'loaded');
+  expect(successor.reason).toBeUndefined();
+});
+
+it('keeps repeated failures request-wide, and lets an edit in one context clear stale reads in another', () => {
+  const recovery = new RequestRecovery();
+  const thresholds = { repeatedToolCalls: 2, consecutiveFailures: 5, maxEscalations: 2 };
+  new Evidence(thresholds, [], undefined, recovery, false, 'instructor#0').observe('bash', { command: 'npm test' }, true, 'missing module');
+  const junior = new Evidence(thresholds, [], undefined, recovery, false, 'junior-alfa#1');
+  junior.observe('bash', { command: 'npm test' }, true, 'missing module');
+  expect(junior.reason).toBe('tool_failures');
+
+  const reader = new Evidence(thresholds, [], undefined, recovery, false, 'instructor#0');
+  reader.observe('read', { path: 'a.ts' }, false, 'same');
+  reader.observe('read', { path: 'a.ts' }, false, 'same');
+  expect(reader.warning).toContain('Change approach');
+  new Evidence(thresholds, [], undefined, recovery, false, 'junior-alfa#1').observe('edit', { path: 'a.ts' }, false);
+  reader.observe('read', { path: 'a.ts' }, false, 'same');
+  expect(reader.reason).toBeUndefined();
+});
+
 it('keeps command failure evidence for unrelated scratch notes and clears it for relevant script edits', () => {
   const evidence = new Evidence({ repeatedToolCalls: 2, consecutiveFailures: 2, maxEscalations: 2 }, [], path => path.startsWith('/s/'));
   evidence.observe('bash', { command: 'python /s/helper.py' }, true, 'missing dependency');

@@ -47,9 +47,13 @@ export class Evidence {
   answerNow = false;
   /** Why tools are withdrawn when answerNow is set, for the notice that asks for the answer. */
   answerWhy = 'Those calls could not run';
-  /** `scratch` tells the agent's own scratchpad files apart: writing them changes nothing in the project. */
+  /**
+   * `scratch` tells the agent's own scratchpad files apart: writing them changes nothing in the project.
+   * `context` names the context this attempt works in (a junior's turn, an orchestrator's checkpoint generation): a fresh
+   * context does not see what an earlier one read or loaded, so doing it again is not a repeat. Repeated failures stay request-wide.
+   */
   constructor(private readonly thresholds: Policy['escalation'], unresolvedChecks: string[] = [], private readonly scratch?: (path: string) => boolean,
-    private readonly recovery = new RequestRecovery(), private readonly readOnly = false) {
+    private readonly recovery = new RequestRecovery(), private readonly readOnly = false, private readonly context = '') {
     this.explicitUnresolvedChecks = new Set(unresolvedChecks);
     this.unresolvedChecks = new Set(this.explicitUnresolvedChecks);
   }
@@ -146,7 +150,7 @@ export class Evidence {
     const byResult = inspection || play;
     // Fresh handles are storage metadata, not progress. A full result/image identity distinguishes changes hidden by a preview.
     const observed = identity ?? result?.replace(savedLine, '').trim();
-    const signature = `${name}:${['read', 'edit', 'write'].includes(name) ? data.path ?? '' : ''}:${createHash('sha256').update(JSON.stringify(byResult && observed !== undefined ? [name, observed] : [name, args])).digest('hex')}`;
+    const signature = `${name}:${['read', 'edit', 'write'].includes(name) ? data.path ?? '' : ''}:${createHash('sha256').update(JSON.stringify(byResult && observed !== undefined ? [name, observed] : [name, args])).digest('hex')}${this.context && `:${this.context}`}`;
     if (name === 'bash') this.recovery.commands.set(signature, String(data.command ?? ''));
     const count = (this.recovery.repeated.get(signature) ?? 0) + 1;
     this.recovery.repeated.set(signature, count);

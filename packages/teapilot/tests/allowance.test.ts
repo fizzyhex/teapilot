@@ -8,14 +8,32 @@ it('shares tool, model, delegation and junior accounting without durable task st
   expect(allowance.consumeTool('junior-alfa')).toBe(true);
   expect(allowance.consumeTool('junior-alfa')).toBe(true);
   expect(allowance.usedBy('junior-alfa')).toBe(2);
-  expect(allowance.remaining().calls).toBe(9);
+  // Juniors draw from their own pool, the request's size unless set.
+  expect(allowance.remaining().calls).toBe(11);
+  expect(allowance.juniorRemaining()).toBe(10);
   expect(allowance.consumeDelegation()).toBe(true);
   expect(allowance.consumeDelegation()).toBe(true);
   expect(allowance.consumeDelegation()).toBe(false);
   for (let index = 0; index < 8; index++) expect(allowance.consumeModel()).toBe(true);
   expect(allowance.consumeModel()).toBe(false);
-  for (let index = 0; index < 9; index++) expect(allowance.consumeTool()).toBe(true);
+  for (let index = 0; index < 11; index++) expect(allowance.consumeTool()).toBe(true);
   expect(allowance.consumeTool()).toBe(false);
+  expect(allowance.consumeTool('junior-alfa')).toBe(true);
+});
+
+it('keeps the junior pool apart from the instructor pool, so neither starves the other', () => {
+  const allowance = new RequestAllowance({ calls: 4, modelCalls: 8, timeoutMs: 1000, delegations: 6 }, undefined, { juniorPool: 3 });
+  for (let index = 0; index < 4; index++) expect(allowance.consumeTool()).toBe(true);
+  expect(allowance.consumeTool()).toBe(false);
+  expect(allowance.callsRemainingFor('junior-alfa')).toBe(3);
+  for (let index = 0; index < 3; index++) expect(allowance.consumeTool('junior-alfa')).toBe(true);
+  expect(allowance.consumeTool('junior-bravo')).toBe(false);
+  expect(allowance.poolRemaining('junior-bravo')).toBe(0);
+  expect(allowance.remaining().calls).toBe(0);
+  const config = { policy: { limits: { maxToolCalls: 40, planningToolCalls: 24 } } } as any;
+  expect(resolveToolBudget(config).juniorPool).toBe(40);
+  expect(resolveToolBudget(config, { readOnly: true }).juniorPool).toBe(24);
+  expect(resolveToolBudget({ policy: { limits: { ...config.policy.limits, juniorPoolCalls: 60 } } } as any).juniorPool).toBe(60);
 });
 it('does not pause the shared deadline for juniors or compaction', () => {
   vi.useFakeTimers();
@@ -29,7 +47,7 @@ it('does not pause the shared deadline for juniors or compaction', () => {
 });
 
 it('renews only instructor grants, with two bounded batches and a request-local denial latch', async () => {
-  const allowance = new RequestAllowance({ calls: 7, modelCalls: 8, timeoutMs: 1000, delegations: 6 }, undefined,
+  const allowance = new RequestAllowance({ calls: 5, modelCalls: 8, timeoutMs: 1000, delegations: 6 }, undefined,
     { instructorCalls: 2, juniorCalls: 2, maxContinuationBatches: 2 });
   const approve = vi.fn(async () => true);
   expect(allowance.consumeTool()).toBe(true);
@@ -73,7 +91,7 @@ it('keeps aggregate hard capacity and planning initial grants separate from inst
   expect(resolveToolBudget(config, { side: true })).toMatchObject({ instructorCalls: 24, maxContinuationBatches: 0 });
 });
 
-it('fairly reserves queued delegations, keeps sibling capacity unavailable, shares duplicate names, and releases suffixes', () => {
+it('fairly reserves queued delegations, keeps sibling capacity unavailable, refuses a duplicate name past its cap, and releases suffixes', () => {
   const allowance = new RequestAllowance({ calls: 60, modelCalls: 20, timeoutMs: 1000, delegations: 4 }, undefined,
     { instructorCalls: 60, juniorCalls: 20, maxContinuationBatches: 0 });
   allowance.reserveQueuedTools([
@@ -96,12 +114,14 @@ it('fairly reserves queued delegations, keeps sibling capacity unavailable, shar
     { id: 'same-a', name: 'delegate_task', junior: 'junior-x' },
     { id: 'same-b', name: 'delegate_task', junior: 'junior-x' },
   ]);
-  expect(allowance.reservedJuniorCalls('same-a') + allowance.reservedJuniorCalls('same-b')).toBe(20);
-  expect(allowance.reservedJuniorCalls('same-b')).toBeGreaterThanOrEqual(2);
+  // One junior's cap is not split into shares too small to work: the duplicate is refused.
+  expect(allowance.reservedJuniorCalls('same-a')).toBe(20);
+  expect(allowance.reservedJuniorCalls('same-b')).toBe(0);
 
   const tight = new RequestAllowance({ calls: 9, modelCalls: 20, timeoutMs: 1000, delegations: 4 }, undefined,
     { instructorCalls: 9, juniorCalls: 20, maxContinuationBatches: 0 });
   tight.reserveQueuedTools([{ id: 'first', name: 'delegate_task' }, { id: 'suffix', name: 'delegate_task' }]);
-  expect(tight.reservedJuniorCalls('first')).toBe(2);
+  // Too few for two juniors to work: the first gets a workable share, the suffix is refused.
+  expect(tight.reservedJuniorCalls('first')).toBe(8);
   expect(tight.reservedJuniorCalls('suffix')).toBe(0);
 });

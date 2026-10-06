@@ -5,7 +5,7 @@ import { Type } from '@earendil-works/pi-ai';
 import type { Config } from '../config.js';
 import type { AttemptInput, AttemptResult } from './run.js';
 import { instructor } from '../workspace/task.js';
-import type { RequestAllowance } from './allowance.js';
+import { juniorMinCalls, type RequestAllowance } from './allowance.js';
 import type { SavedJunior } from './checkpoint.js';
 
 export const juniorTypes = ['research', 'write', 'test'] as const;
@@ -95,9 +95,9 @@ export function reportTool(role: JuniorRole): AgentTool {
 }
 
 type Junior = SavedJunior;
-/** Allocate the junior's remaining allowance, leaving the instructor room to review or continue another junior. */
+/** Allocate the junior's share of the junior pool. */
 export function juniorAllowance(remaining: number, maximum: number): number {
-  return Math.max(0, Math.min(juniorProfiles.calls, maximum, remaining - 4));
+  return Math.max(0, Math.min(juniorProfiles.calls, maximum, remaining));
 }
 /** The instructor's attempt clock, paused while a junior works on its own. */
 export interface Clock { pause(): void; resume(): void }
@@ -137,8 +137,14 @@ export function delegateTool(parent: AttemptInput, scratch: string, root: string
       const suppliedArtifacts = [...new Set([...(existing?.artifacts ?? []), ...references])];
       if (suppliedArtifacts.length > 16) return { content: [{ type: 'text', text: 'this junior already has the maximum 16 context references; start a new assignment.' }], details: {} };
       const available = Math.min(juniorProfiles.calls, allowance.juniorMaxCalls) - (named ? allowance.usedBy(named) : 0);
-      const allocation = allowance.hasReservation(callId) ? allowance.reservedJuniorCalls(callId) : juniorAllowance(allowance.remaining().calls, Math.min(parent.config.policy.limits.maxToolCalls, available));
-      if (allocation < 2) { allowance.releaseReservation(callId); return { content: [{ type: 'text', text: 'junior allowance spent or too little room reserved to work and report; finish from existing evidence.' }], details: {} }; }
+      const allocation = allowance.hasReservation(callId) ? allowance.reservedJuniorCalls(callId) : juniorAllowance(allowance.juniorRemaining(), Math.min(parent.config.policy.limits.maxToolCalls, available));
+      if (allocation < juniorMinCalls) {
+        allowance.releaseReservation(callId);
+        // A starved junior ends stuck: say what would give the work enough room instead.
+        const text = named && available < juniorMinCalls ? `${named} has ${Math.max(0, available)} tool calls left, too few to work and report. start a new junior, or finish from existing evidence.`
+          : `only ${allocation} junior tool calls are left, too few to work and report. ${flow?.canCheckpoint && !parent.task ? 'call checkpoint to hand off with renewed limits, or finish' : 'finish'} from existing evidence.`;
+        return { content: [{ type: 'text', text }], details: {} };
+      }
       if (sent >= limit) return { content: [{ type: 'text', text: `Delegation limit reached (${limit} messages). Finish the work yourself.` }], details: {} };
       const artifactIds = suppliedArtifacts.filter(reference => /^a-[\da-f-]{36}$/i.test(reference));
       if (artifactIds.length && !parent.task) throw new Error('cannot authorize artifact IDs without task state');
@@ -210,5 +216,5 @@ export function delegateTool(parent: AttemptInput, scratch: string, root: string
       return { content: [{ type: 'text', text: lines.join('\n') }], details: { junior: name, artifacts, ...(work ? { task: work.id } : {}) } };
     },
   };
-  return { tool, get exhausted() { return sent >= limit || allowance.delegationExhausted || allowance.availableDelegationCapacity() < 2; } };
+  return { tool, get exhausted() { return sent >= limit || allowance.delegationExhausted || allowance.availableDelegationCapacity() < juniorMinCalls; } };
 }

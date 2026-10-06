@@ -75,7 +75,7 @@ it('reserves known sibling delegations before the first junior can spend their c
   expect(juniorCount).toBe(2);
   const delegated = (await events(f.config)).filter(event => event.type === 'delegate');
   expect(delegated).toHaveLength(2);
-  expect(delegated[0]).toMatchObject({ allocation: 7, toolCalls: 7 });
+  expect(delegated[0]).toMatchObject({ allocation: 10, toolCalls: 7 });
   expect(delegated[1].toolCalls).toBeGreaterThanOrEqual(1);
 });
 
