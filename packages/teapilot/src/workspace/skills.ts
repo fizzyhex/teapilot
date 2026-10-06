@@ -4,10 +4,13 @@ import { parseFrontmatter } from '@earendil-works/pi-coding-agent';
 import { within } from '../execution/policy.js';
 import { scratchLimits } from './scratch.js';
 
-export interface SkillMetadata { id: string; name: string; description: string; set?: string; revision?: string }
+export interface SkillMetadata { id: string; name: string; description: string; flags?: string[]; set?: string; revision?: string }
 export interface SkillLocation { root: string; folder: string; hashes?: Record<string, string> }
 export interface SkillCatalog { root: string; skills: SkillMetadata[]; warnings: string[]; locations?: Record<string, SkillLocation> }
 export const skillIdLimit = 800;
+export function skillFlags(value: unknown): string[] {
+  return [...new Set((Array.isArray(value) ? value : [value]).flatMap(flag => typeof flag === 'string' ? flag.split(/[\s,]+/).filter(Boolean) : []))];
+}
 export function relativeSkillPath(path: string): boolean {
   return path.length > 0 && path.length <= 240 && !/[\\:\x00-\x1f<>"|?*]/.test(path) && !path.startsWith('/') && !path.split('/').some(part => !part || part === '.' || part === '..' || /[. ]$/.test(part));
 }
@@ -52,7 +55,8 @@ export async function discoverSkills(root: string): Promise<SkillCatalog> {
       const { name, description } = frontmatter;
       if (typeof name !== 'string' || !name.trim() || name.length > 200 || typeof description !== 'string' || !description.trim() || description.length > 2000) throw new Error('frontmatter needs bounded name and description strings');
       if (frontmatter['disable-model-invocation'] === true) continue;
-      catalog.skills.push({ id: entry.name, name, description });
+      const flags = skillFlags(frontmatter.flags);
+      catalog.skills.push({ id: entry.name, name, description, ...(flags.length ? { flags } : {}) });
     } catch (error) { catalog.warnings.push(`${entry.name}: ${error instanceof Error ? error.message : String(error)}`); }
   }
   return catalog;

@@ -14,6 +14,7 @@ export const skillQuery = (source: string) => `skill-${createHash('sha256').upda
 
 /** Selected instructions stay in ordinary evidence; only a small retrieval manifest stays hot. */
 export function skillTools(catalog: SkillCatalog, scratch?: Scratch, task?: TaskStore, actor: TaskActor = instructor) {
+  if (actor.name !== instructor.name) catalog = { ...catalog, skills: catalog.skills.filter(skill => !skill.flags?.includes('orchestrator-only')) };
   const savedFiles = new Map<string, Saved>();
   const selected = new Map<string, { id: string; file: string; artifact?: string }>();
   let inactiveReferences = false;

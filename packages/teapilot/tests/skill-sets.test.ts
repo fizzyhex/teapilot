@@ -71,6 +71,33 @@ it('reuses validated snapshots after restart with all networking disabled', asyn
   expect(unavailable.revision).not.toHaveBeenCalled(); expect(unavailable.archive).not.toHaveBeenCalled();
 });
 
+it.each([false, true])('preserves orchestrator-only flags in hosted snapshots (legacy index: %s)', async legacy => {
+  const f = await setup();
+  f.archive(await archive([
+    { name: 'repo/skills/example/SKILL.md', body: skill() },
+    { name: 'repo/skills/planner/SKILL.md', body: skill('private instructions').replace('description:', 'flags: orchestrator-only\ndescription:') },
+  ]));
+  const initial = await f.cache.catalog(f.settings);
+  expect(initial.skills.find(skill => skill.id.endsWith('::planner'))?.flags).toEqual(['orchestrator-only']);
+  if (legacy) {
+    const root = initial.locations![initial.skills[0]!.id]!.root;
+    const indexFile = join(root, '..', 'index.json');
+    const index = JSON.parse(await readFile(indexFile, 'utf8'));
+    for (const metadata of index.skills) delete metadata.flags;
+    await writeFile(indexFile, JSON.stringify(index));
+  }
+  const restarted = new SkillCache(f.config.stateDir, f.transport);
+  const catalog = await restarted.catalog({ enabled: true, offline: true });
+  expect(catalog.warnings).toEqual([]);
+  const planner = catalog.skills.find(skill => skill.id.endsWith('::planner'))!;
+  expect(planner.flags).toEqual(['orchestrator-only']);
+  const junior = skillTools(catalog, undefined, undefined, { name: 'junior-reader' });
+  expect(junior.prompt).not.toContain(planner.id);
+  await expect(junior.tools[0]!.execute('a', { id: planner.id })).rejects.toThrow('unknown skill ID');
+  await expect(skillTools(catalog).tools[0]!.execute('b', { id: planner.id })).resolves.toBeDefined();
+  expect(f.transport.archive).toHaveBeenCalledTimes(1);
+});
+
 it('continues without skills on an offline first install and preserves local-directory provisioning', async () => {
   const f = await setup(), catalog = await f.cache.catalog({ enabled: true, offline: true });
   expect(catalog.skills).toEqual([]); expect(catalog.warnings.join(' ')).toContain('unavailable offline');
