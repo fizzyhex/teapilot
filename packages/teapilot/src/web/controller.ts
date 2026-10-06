@@ -17,9 +17,11 @@ const CACHE_ENTRIES = 32, CACHE_MS = 10 * 60 * 1000;
 // Whether agent-browser was found, per state directory and setting, so it is looked up once per process.
 const located = new Map<string, Promise<string | undefined>>();
 
-/** Scheme, fragment and a trailing slash don't make a different page for the seen-URL rule. */
-const key = (url: URL) => `${url.host}${url.pathname.replace(/(.)\/$/, '$1')}${url.search}`;
-const urlsIn = (text: string) => [...text.matchAll(/https?:\/\/[^\s<>()\[\]{}"'`|\\^]+/g)].map(match => match[0].replace(/[.,;:!?*_~]+$/, ''));
+/** Scheme, fragment, a trailing slash and percent-encoding don't make a different page for the seen-URL rule. */
+const key = (url: URL) => `${url.host}${unescaped(url.pathname).replace(/(.)\/$/, '$1')}${url.search}`;
+const unescaped = (path: string) => { try { return decodeURI(path); } catch { return path; } };
+// Balanced parentheses belong to a URL (wiki titles such as World_1-1_(Super_Mario_Bros.)); an unmatched one ends it.
+const urlsIn = (text: string) => [...text.matchAll(/https?:\/\/(?:[^\s<>()\[\]{}"'`|\\^]|\([^\s<>()\[\]{}"'`|\\^]*\))+/g)].map(match => match[0].replace(/[.,;:!?*_~]+$/, ''));
 
 export interface WebControllerOptions extends AddressPolicy {
   event?: (type: string, fields: Record<string, unknown>) => Promise<void>;
@@ -40,12 +42,14 @@ export class WebController {
 
   /** Records URLs found in text the user wrote or a tool returned, so they may be read. */
   remember(text: string): void {
-    for (const found of urlsIn(text)) { try { this.seen.add(key(new URL(found))); } catch { /* not a URL */ } }
+    for (const found of urlsIn(text)) this.rememberUrl(found);
   }
+  /** Records one URL as given, such as a search result's, with no surrounding text to cut it short. */
+  private rememberUrl(url: string): void { try { this.seen.add(key(new URL(url))); } catch { /* not a URL */ } }
 
   async search(base: string, query: string, signal?: AbortSignal): ReturnType<typeof searchQuery> {
     const results = await searchQuery(base, query, signal);
-    for (const result of results) this.remember(result.url);
+    for (const result of results) this.rememberUrl(result.url);
     return results;
   }
 
@@ -73,8 +77,8 @@ export class WebController {
       if (typeof fetched === 'string') return refuse(fetched, { host });
       store(url, document = fetched);
     }
-    this.remember(document.url);
-    for (const link of document.links) this.remember(link);
+    this.rememberUrl(document.url);
+    for (const link of document.links) this.rememberUrl(link);
     const body = bound(document.text, maxChars);
     // agent-browser's text drops link targets; list the page's own links so the model can follow them.
     const links = document.via === 'agent-browser' && document.links.length ? `\nLinks on the page:\n${document.links.slice(0, 20).join('\n')}` : '';
@@ -89,7 +93,7 @@ export class WebController {
   private async fetch(url: URL, signal?: AbortSignal): Promise<Document | string> {
     const page = await guardedGet(url.href, { ...this.options, signal, types: [...htmlTypes, ...textTypes] });
     if (page.status < 200 || page.status >= 300) return `${url.host} answered HTTP ${page.status}.`;
-    this.remember(page.url);
+    this.rememberUrl(page.url);
     if (!htmlTypes.includes(page.contentType)) return { ...extractText(decode(page.body, page.charset)), url: page.url, via: 'built-in' };
     const html = decode(page.body, page.charset, true);
     const builtin = extractHtml(html, page.url);

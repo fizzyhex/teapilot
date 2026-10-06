@@ -185,6 +185,17 @@ describe('web controller', () => {
     expect(events.every(([, fields]) => !JSON.stringify(fields).includes('data=abc'))).toBe(true);
   });
 
+  it('keeps parentheses that belong to a URL, written plainly or percent-encoded', async () => {
+    const { base, web } = await site();
+    web.remember(`see ${base}/World_1-1_(Super_Mario_Bros.) for the layout`);
+    expect((await web.read(`${base}/World_1-1_(Super_Mario_Bros.)`, 4000)).text).toContain('Source:');
+    expect((await web.read(`${base}/World_1-1_%28Super_Mario_Bros.%29`, 4000)).text).toContain('Source:');
+    // An unmatched parenthesis still ends a URL, as in prose: (see https://host/page).
+    web.remember(`(see ${base}/aside)`);
+    expect((await web.read(`${base}/aside`, 4000)).text).toContain('Source:');
+    expect((await web.read(`${base}/World_1-1_`, 4000)).text).toMatch(/^Not read: that URL has not appeared/);
+  });
+
   it('allows search results, caches pages and stops at the read budget', async () => {
     const { base, hits, web, server } = await site();
     await web.search(server.url, 'kessel');
