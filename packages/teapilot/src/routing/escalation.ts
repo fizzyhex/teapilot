@@ -41,9 +41,10 @@ export class Evidence {
   // Set once page reads are spent or keep returning the same page: web_read is withdrawn like search.
   readsExhausted = false;
   // Calls refused before execution (unknown tool, invalid arguments, host refusal) never reach observe().
-  // A streak of them first withdraws tools so the model answers, then stops the attempt.
-  get refused(): number { return this.recovery.refused; }
-  set refused(value: number) { this.recovery.refused = value; }
+  // A streak of them first withdraws tools so the model answers, then stops the attempt. Both are per attempt: the next
+  // attempt may be offered other tools (search withdrawn, say), so its first streak earns its own warning.
+  refused = 0;
+  private refusalWarned = false;
   answerNow = false;
   /** Why tools are withdrawn when answerNow is set, for the notice that asks for the answer. */
   answerWhy = 'Those calls could not run';
@@ -63,8 +64,8 @@ export class Evidence {
   }
   refuse(): void {
     if (++this.refused < this.thresholds.repeatedToolCalls) return;
-    if (this.answerNow || this.recovery.refusalWarned) this.reason = 'ineffective_calls';
-    else { this.answerNow = true; this.refused = 0; this.recovery.refusalWarned = true; }
+    if (this.answerNow || this.refusalWarned) this.reason = 'ineffective_calls';
+    else { this.answerNow = true; this.refused = 0; this.refusalWarned = true; }
   }
   /** Observe sequential paging, not semantic relevance: different slices may still be useful evidence. */
   observePaging(name: string, args: unknown, failed: boolean, pressure: boolean, actor = 'instructor'): string | undefined {
@@ -87,7 +88,7 @@ export class Evidence {
     return undefined;
   }
   observe(name: string, args: unknown, failed: boolean, result?: string, saved?: string, changed?: boolean, identity?: string): void {
-    this.warning = undefined; this.refused = 0; this.recovery.refusalWarned = false;
+    this.warning = undefined; this.refused = 0; this.refusalWarned = false;
     const data = args as { path?: string; command?: string };
     const asked = args && typeof args === 'object' ? ['command', 'path', 'url', 'query'].map(key => (args as Record<string, unknown>)[key]).find(value => typeof value === 'string') as string | undefined : undefined;
     this.observations.push({ tool: name, ...(asked ? { args: asked.slice(0, 200) } : {}), failed, detail: (result ?? '').slice(0, 700), ...(saved ? { saved } : {}) });

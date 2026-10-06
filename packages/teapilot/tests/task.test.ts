@@ -51,6 +51,25 @@ it('restores state without replenishing the same request or replacing its object
   expect(restored.snapshot().steps).toHaveLength(1);
 });
 
+it('renews the same request\'s counts, grant and deadline for a checkpoint\'s successor', async () => {
+  const f = await setup();
+  const limits = { calls: 10, modelCalls: 10, timeoutMs: 60_000, delegations: 1, instructorCalls: 4, juniorCalls: 8, juniorPool: 8, maxContinuationBatches: 0 };
+  f.task.startRequest('renewed', limits);
+  for (let index = 0; index < 4; index++) f.task.settle(f.task.admit(instructor, 'read', {}, `i-${index}`)!, false);
+  f.task.settle(f.task.admit({ name: 'junior-alfa' }, 'read', {}, 'j')!, false);
+  f.task.consumeModel(); f.task.consumeDelegation();
+  expect(f.task.admit(instructor, 'read', {}, 'over')).toBeUndefined();
+  expect(f.task.delegationExhausted).toBe(true);
+  f.task.startRequest('renewed', limits);
+  expect(f.task.toolBudget()).toMatchObject({ instructorCalls: 4 });
+  f.task.renewRequest('renewed', limits);
+  expect(f.task.remaining()).toMatchObject({ calls: 10, modelCalls: 10 });
+  expect(f.task.toolBudget()).toMatchObject({ instructorCalls: 0, instructorGranted: 4 });
+  expect(f.task.juniorPoolRemaining()).toBe(8);
+  expect(f.task.juniorCalls('junior-alfa')).toBe(0);
+  expect(f.task.delegationExhausted).toBe(false);
+});
+
 it('persists instructor grants, counters, limits, and denial across reopen, resetting them only for a new request', async () => {
   const f = await setup();
   f.task.startRequest('budget-request', { calls: 40, modelCalls: 80, timeoutMs: 60_000, delegations: 6, instructorCalls: 20, juniorCalls: 7, maxContinuationBatches: 2 });

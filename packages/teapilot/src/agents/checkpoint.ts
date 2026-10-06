@@ -258,7 +258,8 @@ const failureAdvice: Partial<Record<HandoffReason, string>> = {
 const taskLine = (task: WorkTask) => `task ${task.id} "${task.label}"${task.junior ? ` (${task.junior})` : ''}: ${task.state.replaceAll('_', ' ')}${task.note ? ` - ${task.note}` : ''}${task.result && !terminalState(task.state) ? `; result ${task.result.status}${task.result.consumed ? '' : ', not yet read by you'}${task.result.file ? ` (${task.result.file})` : ''}` : ''}`;
 
 /** What the next orchestrator is told: small, with the host's facts first and the agent's words marked as such. */
-export function continuation(record: CheckpointRecord, parked = false): string {
+/** `withdrawn` names tools the host has taken away since the handoff was written, which it may still suggest. */
+export function continuation(record: CheckpointRecord, parked = false, withdrawn: string[] = []): string {
   const { host } = record;
   const lines = [`[checkpoint ${record.generation}] you are continuing an existing workflow${parked ? ' that was parked' : ''} (handoff: ${reasons[host.reason]}${host.forced ? ', forced by the host' : ''}). limits are renewed; scratchpad, juniors and tasks carry over.`, '', 'objective state (host-recorded):'];
   if (host.git) {
@@ -273,6 +274,7 @@ export function continuation(record: CheckpointRecord, parked = false): string {
   if (host.skills.length) lines.push(parked ? `- skills loaded before: ${host.skills.join(', ')} (load again if needed)` : `- skills carried over: ${host.skills.join(', ')}`);
   if (lines.at(-1) === 'objective state (host-recorded):') lines.push('- nothing recorded');
   lines.push('', record.handoff ? `previous agent's handoff (guidance, not fact):\n- status: ${record.handoff.status}\n- next: ${record.handoff.next}` : 'the previous agent left no handoff.');
+  if (withdrawn.length) lines.push(`- withdrawn for this request: ${withdrawn.join(', ')}. skip any step that needs ${withdrawn.length === 1 ? 'it' : 'them'}.`);
   if (record.steer) lines.push('', `the user steered at this checkpoint: ${record.steer}`);
   lines.push('', 'treat host state as authoritative and the handoff as guidance. inspect before trusting either.');
   // After the line Details cuts at: it speaks to the agent, not the person.

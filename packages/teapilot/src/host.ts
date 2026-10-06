@@ -134,6 +134,10 @@ export async function runHost(config: Config, request: HostRequest, dependencies
     for (const task of workflow.tasks.values()) workflow.onTask(task);
   }
   let task: TaskStore | undefined;
+  const taskLimits = () => {
+    const multiplier = config.policy.escalation.maxEscalations + 1;
+    return { calls: request.readOnly ? Math.min(config.policy.limits.maxToolCalls, config.policy.limits.planningToolCalls ?? planningCallLimit) : config.policy.limits.maxToolCalls, modelCalls: config.policy.limits.maxTurns * multiplier, timeoutMs: config.policy.limits.attemptTimeoutMs * multiplier, delegations: config.policy.limits.maxJuniorTurns, readOnly: request.readOnly, ...resolveToolBudget(config, { readOnly: request.readOnly, casual, side: request.side }) };
+  };
   let skillCatalog: SkillCatalog | undefined;
   let taskId = request.taskId ?? requestId;
   web.remember(currentPrompt);
@@ -406,8 +410,7 @@ export async function runHost(config: Config, request: HostRequest, dependencies
         task = TaskStore.open(config.stateDir, scope, request.taskObjective ?? prompt, request.scratch, text => telemetry.redact(text), request.constraints);
         if (currentPlan) task.setPlan(currentPlan);
         task.configure({ currentRequest: userRequest, ...(request.planAction === 'new' ? { objective: request.taskObjective ?? prompt } : {}), ...(request.constraints ? { constraints: request.constraints } : {}) });
-        const multiplier = config.policy.escalation.maxEscalations + 1;
-        task.startRequest(requestId, { calls: request.readOnly ? Math.min(config.policy.limits.maxToolCalls, config.policy.limits.planningToolCalls ?? planningCallLimit) : config.policy.limits.maxToolCalls, modelCalls: config.policy.limits.maxTurns * multiplier, timeoutMs: config.policy.limits.attemptTimeoutMs * multiplier, delegations: config.policy.limits.maxJuniorTurns, readOnly: request.readOnly, ...resolveToolBudget(config, { readOnly: request.readOnly, casual, side: request.side }) });
+        task.startRequest(requestId, taskLimits());
         await telemetry.event('task_start', { task: task.snapshot().id, resumed: Boolean(request.taskId), revision: task.snapshot().revision });
       }
       if (!skillCatalog && !casual && modelFor(config, tier).toolCalling && config.skills?.enabled !== false) {
@@ -491,10 +494,11 @@ export async function runHost(config: Config, request: HostRequest, dependencies
           }
           if (decision.action === 'steer') { record.steer = decision.text.trim().slice(0, 2000); flow!.save(record); }
           recovery.allowance = undefined;
+          task?.renewRequest(requestId, taskLimits());
           attempts++;
           models.push(modelFor(config, tier).id);
           dependencies.onEvent?.({ type: 'attempt_start', attempt: attempts, model: modelFor(config, tier).id, tier, checkpoint: record.generation });
-          previous = await attempt(continuation(record), undefined, record.host.skills);
+          previous = await attempt(continuation(record, false, searchDisabled ? ['web_search'] : []), undefined, record.host.skills);
         }
         if (accessFailure) { const ended = await ending('approval_denied', accessFailure); if (ended) return ended; continue; }
         await telemetry.event('attempt_end', { decisionId: decision?.decision_id, capability: selected, success: previous.success, reason: previous.reason, stopped: previous.stopped, turns: previous.turns, toolCalls: previous.toolCalls, check: previous.check, ...(previous.success ? {} : { ending: previous.ending }) });

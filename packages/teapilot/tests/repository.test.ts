@@ -77,6 +77,20 @@ it('counts repeats per context: a fresh context may redo what an earlier one did
   expect(successor.reason).toBeUndefined();
 });
 
+it('gives each attempt its own warning for a streak of refused calls', () => {
+  const recovery = new RequestRecovery();
+  const thresholds = { repeatedToolCalls: 2, consecutiveFailures: 2, maxEscalations: 2 };
+  const first = new Evidence(thresholds, [], undefined, recovery);
+  first.refuse(); first.refuse();
+  expect(first).toMatchObject({ answerNow: true, reason: undefined });
+  first.refuse(); first.refuse();
+  expect(first.reason).toBe('ineffective_calls');
+  // The next attempt may be offered other tools, such as search withdrawn: its first streak is warned, not ended.
+  const next = new Evidence(thresholds, [], undefined, recovery);
+  next.refuse(); next.refuse();
+  expect(next).toMatchObject({ answerNow: true, reason: undefined });
+});
+
 it('keeps repeated failures request-wide, and lets an edit in one context clear stale reads in another', () => {
   const recovery = new RequestRecovery();
   const thresholds = { repeatedToolCalls: 2, consecutiveFailures: 5, maxEscalations: 2 };

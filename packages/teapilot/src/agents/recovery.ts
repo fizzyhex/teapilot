@@ -13,8 +13,6 @@ export class RequestRecovery {
   readonly rejectedApps = new Set<string>();
   readonly failedTests = new Set<string>();
   playTests = 0;
-  refused = 0;
-  refusalWarned = false;
 }
 
 /** Stable argument identity without normalizing shell grammar or case-sensitive data. */

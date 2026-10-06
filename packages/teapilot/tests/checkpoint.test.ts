@@ -90,6 +90,9 @@ describe('workflow state', () => {
     const text = continuation(record);
     // Host facts come before the agent's words, which are labelled as guidance.
     expect(text.indexOf('objective state (host-recorded)')).toBeLessThan(text.indexOf("previous agent's handoff (guidance, not fact)"));
+    // A tool withdrawn since is named beside the handoff that may still suggest it.
+    expect(text).not.toContain('withdrawn');
+    expect(continuation(record, false, ['web_search'])).toContain("- next: controls\n- withdrawn for this request: web_search. skip any step that needs it.");
     // The next checkpoint shows only what was committed after this one, on its card too.
     git('add', '-A'); git('commit', '-qm', 'add controls');
     const second = await flow.checkpoint({ reason: 'tool_calls', forced: true, attempts: 0 });
