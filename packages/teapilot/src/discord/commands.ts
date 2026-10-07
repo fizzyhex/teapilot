@@ -29,6 +29,9 @@ export const treeOption = 'dir';
 export const replyMenu = 'Reply';
 export const browserMenu = 'Open In Browser';
 export const resendMenu = 'repost this!';
+/** Copies an answer or an app, which /paste then posts in another channel. */
+export const shareMenu = 'Share';
+export const pasteCommand = 'paste';
 
 const value = (description: string, values: readonly string[]): Option =>
   ({ type: 3, name: 'value', description, required: true, choices: values.map(item => ({ name: item, value: item })) });
@@ -88,6 +91,8 @@ export const commandDefinitions: CommandDefinition[] = [
   { type: 3, name: replyMenu, ...everywhere },
   { type: 3, name: browserMenu, ...everywhere },
   { type: 3, name: resendMenu, ...everywhere },
+  { type: 3, name: shareMenu, ...everywhere },
+  { name: pasteCommand, description: 'Paste what you copied with Apps → Share', ...everywhere },
   // Also where teapilot is not invited, where they act on the conversation /reply or /prompt keeps there.
   { name: 'convo', description: 'Your conversation with teapilot here', options: [
     subcommand('clear', 'Clear its context; the workspace keeps its files'),
@@ -114,7 +119,7 @@ export const withoutUserInstall = (definitions: CommandDefinition[]): CommandDef
 /** The session text equivalent to an invocation, or undefined for anything teapilot does not define. */
 export function commandText(name: string, subcommandName?: string | null, argument?: string | null, scope?: string | null): string | undefined {
   const definition = commandDefinitions.find(candidate => candidate.name === name);
-  if (!definition || !('description' in definition) || [replyCommand, promptCommand].includes(name)) return undefined;
+  if (!definition || !('description' in definition) || [replyCommand, promptCommand, pasteCommand].includes(name)) return undefined;
   if (name === 'permissions') {
     if (subcommandName === 'list') return '/permissions';
     return (subcommandName === 'grant' || subcommandName === 'revoke') && argument ? `/${subcommandName} ${argument}` : undefined;

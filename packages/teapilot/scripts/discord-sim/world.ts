@@ -13,8 +13,9 @@ import { planButtons, planModal, type PlanAction, type PlanControls } from '../.
 import { parseCustomId, type ModalPayload } from '../../src/discord/play/render.js';
 import type { PlayInteraction } from '../../src/discord/play/runtime.js';
 import type { DiscordSettings } from '../../src/discord/settings.js';
-import { viewSource } from 'pretty-send';
+import { viewSource, type Message as AnswerMessage } from 'pretty-send';
 import { MESSAGE_LIMIT, viewSourcePrefix } from '../../src/discord/render.js';
+import { emptyClipboard, expandPrefix } from '../../src/discord/share.js';
 import { checkFiles, checkMessage, checkModal, componentsV2, DiscordRejected } from './validate.js';
 import type { CheckpointDecision } from '../../src/agents/checkpoint.js';
 import { checkpointDetailsText, checkpointModal, checkpointWaitMs, checkpointModalPrefix, checkpointPrefix, checkpointRow, checkpointVerdict, checkpointWaiting, steerHoldMs, type CheckpointButton } from '../../src/discord/checkpoint.js';
@@ -97,6 +98,8 @@ export interface Warning {
 const styles: Record<number, string> = { 1: 'primary', 3: 'success', 4: 'danger' };
 const settle = (text: string, verdict: string) => `${text.slice(0, 2000 - verdict.length - 2)}\n\n${verdict}`;
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const answerPayload = ({ content, embeds, components, flags, files }: AnswerMessage): Payload =>
+  ({ content, embeds: embeds as unknown as Json[], components: components as Row[], flags, files });
 
 export class World {
   readonly messages: Message[] = [];
@@ -265,7 +268,7 @@ export class World {
     return {
       send: async (text, options) => this.post(channel, bot.name, { content: text, ...(options?.silent ? { flags: 1 << 12 } : {}) }, undefined, reply()).id,
       sendFiles: async (text, files) => this.post(channel, bot.name, { content: text, files }, undefined, reply()).id,
-      answer: async ({ embeds, components, flags, files }) => this.post(channel, bot.name, { embeds: embeds as unknown as Json[], components: components as Row[], flags, files }, undefined, reply()).id,
+      answer: async message => this.post(channel, bot.name, answerPayload(message), undefined, reply()).id,
       edit: async (id, text) => this.update(this.find(id), { content: text }),
       card: async (text, controls, id) => {
         const payload = { content: text, components: [{ type: 1, components: [
@@ -421,6 +424,7 @@ export class World {
     if (custom.startsWith(grantPrefix)) return this.pressGrant(person, message, custom.slice(grantPrefix.length) as Permission);
     if (custom.startsWith('teapilot-card:')) return this.pressCard(person, message, custom.slice('teapilot-card:'.length) as CardButton);
     if (custom.startsWith(viewSourcePrefix)) return this.pressViewSource(person, message, custom);
+    if (custom.startsWith(expandPrefix)) return this.pressExpand(person, message, custom.slice(expandPrefix.length).split(':')[0]!);
     return this.interact(person, message, 'button', custom, `clicked [${this.label(control)}]`);
   }
 
@@ -433,6 +437,52 @@ export class World {
     const playId = this.handlers?.resendTarget?.(message.channel.id, message.id);
     if (!playId) return this.render(this.post(message.channel, bot.name, { content: 'this message is not an available card or app.' }, person.name));
     return this.interact(person, message, 'resend', `play:${playId}:resend`, 'used Apps → repost this!');
+  }
+
+  /** The Apps → Share message context menu: copies an answer or an app for /paste. */
+  share(name: string, ref: string): string {
+    const person = this.person(name);
+    const message = this.visible(ref, person);
+    const note = this.handlers?.share?.(message.channel.id, message.id, person) ?? 'sharing is not available.';
+    return `${person.name} used Apps → Share on ${message.id}.\n${this.render(this.post(message.channel, bot.name, { content: note }, person.name))}`;
+  }
+
+  /** Like the real gateway: an answer posts as replies to the command, and an app moves here through a follow-up. */
+  private async paste(person: Person, channel: Channel): Promise<string> {
+    const handlers = this.handlers!;
+    const seen = [`${person.name} ran /paste in #${channel.name}.`];
+    const note = (content: string) => seen.push(this.render(this.post(channel, bot.name, { content }, person.name)));
+    const clip = handlers.paste?.(person.id) ?? { note: emptyClipboard };
+    if ('note' in clip) note(clip.note);
+    else if ('messages' in clip) for (const message of clip.messages) seen.push(this.render(this.post(channel, bot.name, answerPayload(message))));
+    else {
+      let settled = false;
+      handlers.component({
+        playId: clip.playId, controlId: '', kind: 'paste', channelId: channel.id, user: { id: person.id, name: person.name },
+        defer: async () => {},
+        reply: async content => { note(content); settled = true; },
+        followUp: async content => { note(content); settled = true; },
+        openModal: async () => { throw new Error('this cannot open a form.'); },
+        update: async () => {},
+        post: async payload => {
+          const posted = this.post(channel, bot.name, payload as Payload);
+          seen.push(this.render(posted));
+          settled = true;
+          return { id: posted.id, edit: async next => this.update(posted, next as Payload) };
+        },
+      });
+      for (const deadline = Date.now() + 15_000; !settled && Date.now() < deadline;) await pause(20);
+      if (!settled) seen.push('(no response after 15 s; check screen later)');
+    }
+    await this.quiet(150, 1000);
+    return seen.join('\n');
+  }
+
+  /** Like the real gateway: anyone may press, and the whole answer shows to them alone. */
+  private pressExpand(person: Person, message: Message, id: string): string {
+    const messages = this.handlers?.expand?.(id);
+    const shown = messages ? messages.map(answerPayload) : [{ content: 'this answer is no longer available.' }];
+    return [`${person.name} clicked [click to expand] on ${message.id}.`, ...shown.map(payload => this.render(this.post(message.channel, bot.name, payload, person.name)))].join('\n');
   }
 
   /** Like the real gateway: operators may answer approvals, and whitelisted users the ones that allow them. */
@@ -621,6 +671,8 @@ ${this.render(this.post(form.message.channel, bot.name, { content: note }, perso
     const handlers = this.handlers;
     if (!handlers) throw new SimError('teapilot is not connected.');
     const channel = where ? this.channel(where) : this.dm(person);
+    // The gateway answers /paste itself rather than as a session command.
+    if (text.trim() === '/paste') return this.paste(person, channel);
     const thread = channel.kind === 'thread' ? channel : undefined;
     const seen: string[] = [`${person.name} ran ${text} in #${channel.name}.`];
     const note = (content: string, components: Row[] = []) => seen.push(this.render(this.post(channel, bot.name, { content, components }, person.name)));

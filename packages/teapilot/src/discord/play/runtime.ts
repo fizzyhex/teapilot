@@ -26,9 +26,11 @@ export interface PlaySurface {
 export interface HostedMessage { id: string; edit(payload: MessagePayload): Promise<void> }
 /** One click, selection or form submission on an app's message. */
 export interface PlayInteraction {
-  playId: string; controlId: string; kind: 'button' | 'select' | 'modal' | 'resend'; user: User;
-  /** The repost context menu can post publicly even where the bot has no channel posting permission. */
+  playId: string; controlId: string; kind: 'button' | 'select' | 'modal' | 'resend' | 'paste'; user: User;
+  /** Repost and /paste can post publicly even where the bot has no channel posting permission. */
   post?: StartOptions['post'];
+  /** /paste: the channel the app moves to. */
+  channelId?: string;
   /** The message that was used; a copy the app has since moved away from is turned away. */
   messageId?: string;
   values?: string[]; fields?: Record<string, string>;
@@ -104,6 +106,7 @@ export const hashFile = async (path: string) => createHash('sha256').update(awai
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const clip = (text: string, max: number) => text.length > max ? `${text.slice(0, max - 1)}…` : text;
 const moved = 'This app moved to a newer message below.';
+const movedAway = 'This app moved to another channel.';
 const withNote = (payload: MessagePayload, note?: string): MessagePayload => note ? { ...payload, content: clip(`${payload.content}${payload.content ? '\n' : ''}-# ${note}`, 2000) } : payload;
 
 function normalize(value: unknown): { state: unknown; effects: unknown[] } {
@@ -740,6 +743,8 @@ export class PlayRuntime {
       const { record } = live;
       const ended = record.status !== 'running';
       if (target.messageId && record.messageId !== target.messageId) throw new PlayError(moved);
+      const away = target.channelId !== record.channelId;
+      if (away && this.running(target.channelId).length >= playLimits.perChannel) throw new PlayError(`That channel already has ${playLimits.perChannel} apps running; stop one first.`);
       if (record.viaInteraction && target.edit) live.reach = { edit: target.edit, until: this.now() + interactionLifetimeMs };
       const payload = await this.attach(record, withNote(renderView(record.id, record.view, ended), ended ? record.note : undefined));
       const old = { messageId: record.messageId, channelId: record.channelId, viaInteraction: record.viaInteraction, reach: this.reachable(live) ? live.reach : undefined };
@@ -762,7 +767,7 @@ export class PlayRuntime {
       // Timers a hibernating app was holding run again now that it has been brought back.
       this.wake(live);
       if (old.messageId) {
-        const stub: MessagePayload = { content: `-# ${moved}`, embeds: [], components: [], allowedMentions: { parse: [] } };
+        const stub: MessagePayload = { content: `-# ${away ? movedAway : moved}`, embeds: [], components: [], allowedMentions: { parse: [] } };
         const delivery = retired ?? new PlayDelivery(this.clock, this.options.discordEditMs ?? 2000,
           error => this.options.log(`play ${record.id}: could not retire its old message: ${errorText(error)}`));
         this.deliveries.add(delivery);
@@ -791,11 +796,14 @@ export class PlayRuntime {
     const live = this.live.get(interaction.playId);
     const record = live?.record;
     if (live && record?.messageId && interaction.messageId && interaction.messageId !== record.messageId) { await interaction.reply(moved); return; }
-    if (interaction.kind === 'resend') {
+    if (interaction.kind === 'resend' || interaction.kind === 'paste') {
       if (!live || !record) { await interaction.reply('this app is no longer available.'); return; }
       await interaction.defer();
-      try { await this.resend(record.id, record.conversation, { channelId: record.channelId, post: interaction.post, messageId: interaction.messageId, edit: payload => interaction.update(payload) }); }
-      catch (error) { await interaction.followUp(`could not repost this app: ${clip(errorText(error), 300)}`); }
+      // A paste moves the app wherever it is now; its interaction cannot reach the old copy.
+      const target = interaction.kind === 'paste' ? { channelId: interaction.channelId ?? record.channelId, post: interaction.post }
+        : { channelId: record.channelId, post: interaction.post, messageId: interaction.messageId, edit: (payload: MessagePayload) => interaction.update(payload) };
+      try { await this.resend(record.id, record.conversation, target); }
+      catch (error) { await interaction.followUp(`could not ${interaction.kind === 'paste' ? 'paste' : 'repost'} this app: ${clip(errorText(error), 300)}`); }
       return;
     }
     if (!live || !record || record.status !== 'running') { await interaction.reply(record?.status === 'paused' ? `This app is paused. ${record.note ?? ''}`.trim() : 'This app has ended.'); return; }

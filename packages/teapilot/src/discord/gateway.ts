@@ -5,7 +5,7 @@ import type { IncomingMessage } from './access.js';
 import type { SideAnswer } from './aside-store.js';
 import type { CardButton, CardControls, DiscordTransport } from './bridge.js';
 import { browseGone, browseModal, browseModalPrefix, browsePrefix, browseRows, browseSubmit, type BrowseAction, type BrowseSession, type WorkspaceBrowser } from './browse.js';
-import { attachmentOption, commandDefinitions, commandText, interactionLifetimeMs, promptAttachments, promptCommand, promptSetup, replyCommand, replyMenu, resendMenu, treeOption, withoutUserInstall, type PromptSetup } from './commands.js';
+import { attachmentOption, commandDefinitions, commandText, interactionLifetimeMs, pasteCommand, promptAttachments, promptCommand, promptSetup, replyCommand, replyMenu, resendMenu, shareMenu, treeOption, withoutUserInstall, type PromptSetup } from './commands.js';
 import { isAside } from '../chat.js';
 import type { Permission } from '../execution/grants.js';
 import { grantPrefix, grantsGone, grantView, type GrantPanel } from './grants-panel.js';
@@ -16,6 +16,7 @@ import { chunk, MESSAGE_LIMIT, quoteMessage, viewSourcePrefix, type QuotedMessag
 import { browserLink, parseCustomId, playPrefix, type MessagePayload } from './play/render.js';
 import type { PlayInteraction, PlaySurface } from './play/runtime.js';
 import type { DiscordSettings } from './settings.js';
+import { emptyClipboard, expandPrefix, type Paste } from './share.js';
 import type { CheckpointDecision } from '../agents/checkpoint.js';
 import { checkpointDetailsText, checkpointModal, checkpointWaitMs, checkpointModalPrefix, checkpointPrefix, checkpointRow, checkpointVerdict, checkpointWaiting, steerHoldMs } from './checkpoint.js';
 import { browserMenu } from './commands.js';
@@ -111,6 +112,12 @@ export interface GatewayHandlers {
   reply(reply: GatewayReply): void;
   /** A click, selection or form on a discord.play app, from anyone; the runtime decides who may act. */
   component(interaction: PlayInteraction): void;
+  /** Apps → Share on a message teapilot posted: copies it for /paste, and returns the note the sharer sees. */
+  share?(channelId: string, messageId: string, user: { id: string; name: string }): string;
+  /** /paste: what this person copied last. */
+  paste?(userId: string): Paste;
+  /** The answer behind a compact paste's expand button. */
+  expand?(id: string): AnswerMessage[] | undefined;
   /** Whether a person may use teapilot at all: an operator, or a whitelisted user. Defaults to the operators. */
   allowed?(userId: string): boolean;
   /** Side answers (/btw) posted compactly or summarised. */
@@ -182,8 +189,8 @@ const incoming = (file: Attachment): IncomingFile => ({ name: file.name, size: f
   } });
 const attachments = (files: Array<{ name: string; data: Buffer }>) => files.map(file => ({ attachment: file.data, name: file.name }));
 /** A pretty-send message as discord.js takes it: raw embeds and components, which it accepts in place of builders. */
-const answerPayload = ({ embeds, components, flags, files }: AnswerMessage) =>
-  ({ ...(embeds ? { embeds } : {}), components, ...(flags ? { flags } : {}), files: attachments(files ?? []), ...quiet }) as unknown as BaseMessageOptions & { flags?: number };
+const answerPayload = ({ content, embeds, components, flags, files }: AnswerMessage) =>
+  ({ ...(content !== undefined ? { content } : {}), ...(embeds ? { embeds } : {}), components, ...(flags ? { flags } : {}), files: attachments(files ?? []), ...quiet }) as unknown as BaseMessageOptions & { flags?: number };
 
 /**
  * A dispatcher from the undici discord.js itself loads. Its REST client otherwise uses undici's process-wide
@@ -569,6 +576,38 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
   };
 
   /**
+   * Repost (of the copy that was used, `messageId`) and /paste: the app posts publicly as a follow-up, after a private
+   * acknowledgement, so it cannot inherit ephemeral visibility. A follow-up needs no permission to post in the channel.
+   */
+  const moveApp = async (interaction: MessageContextMenuCommandInteraction | ChatInputCommandInteraction, playId: string, messageId?: string) => {
+    const [doing, done] = messageId ? ['reposting…', 'reposted!'] : ['pasting…', 'pasted!'];
+    await interaction.reply({ content: doing, flags: MessageFlags.Ephemeral, ...quiet });
+    handlers.component({
+      playId, controlId: '', messageId, kind: messageId ? 'resend' : 'paste', channelId: interaction.channelId, user: { id: interaction.user.id, name: interaction.user.username },
+      defer: async () => {},
+      reply: async content => { await interaction.editReply({ content, ...quiet }); },
+      followUp: async content => { await interaction.editReply({ content, ...quiet }); },
+      openModal: async () => { throw new Error('this cannot open a form.'); },
+      update: async payload => { if (messageId) await interaction.webhook.editMessage(messageId, raw(payload, true)); },
+      post: async payload => {
+        const posted = await interaction.followUp(raw(payload));
+        await interaction.editReply({ content: done, ...quiet }).catch(noop);
+        return { id: posted.id, edit: async next => { await interaction.webhook.editMessage(posted.id, raw(next, true)); } };
+      },
+    });
+  };
+
+  /** Posts what the invoker copied with Apps → Share: an answer as replies to the command, or an app, moved here. */
+  const paste = async (interaction: ChatInputCommandInteraction) => {
+    const clip = handlers.paste?.(interaction.user.id) ?? { note: emptyClipboard };
+    if ('note' in clip) { await interaction.reply({ content: clip.note, flags: MessageFlags.Ephemeral, ...quiet }); return; }
+    if ('playId' in clip) { await moveApp(interaction, clip.playId); return; }
+    await interaction.deferReply();
+    const link = webhookLink(interaction, false);
+    for (const message of clip.messages) await link.post(answerPayload(message) as CardMessage);
+  };
+
+  /**
    * The messages `message` replies to, oldest first, for mentions and the Reply menu. Discord drops an
    * interaction unless it is answered within 3 seconds, so the walk stops at a depth and time budget,
    * and at anything it cannot fetch.
@@ -687,27 +726,24 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
         await interaction.reply({ content: 'this message is not an available card or app.', flags: MessageFlags.Ephemeral, ...quiet }).catch(noop);
         return;
       }
-      // Finish the private acknowledgement before any public follow-up, so it cannot inherit ephemeral visibility.
+      if (!resend) { await moveApp(interaction, playId!, message.id); return; }
       await interaction.reply({ content: 'reposting…', flags: MessageFlags.Ephemeral, ...quiet });
-      if (resend) {
-        await resend(interaction).then(() => interaction.editReply({ content: 'reposted!', ...quiet })).catch(async error => {
-          await interaction.editReply({ content: `could not repost this card: ${failure(error)}`, ...quiet }).catch(noop);
-        });
-      } else {
-        handlers.component({
-          playId: playId!, controlId: '', messageId: message.id, kind: 'resend', user: { id: interaction.user.id, name: interaction.user.username },
-          defer: async () => {},
-          reply: async content => { await interaction.editReply({ content, ...quiet }); },
-          followUp: async content => { await interaction.editReply({ content, ...quiet }); },
-          openModal: async () => { throw new Error('a repost cannot open a form.'); },
-          update: async payload => { await interaction.webhook.editMessage(message.id, raw(payload, true)); },
-          post: async payload => {
-            const posted = await interaction.followUp(raw(payload));
-            await interaction.editReply({ content: 'reposted!', ...quiet }).catch(noop);
-            return { id: posted.id, edit: async next => { await interaction.webhook.editMessage(posted.id, raw(next, true)); } };
-          },
-        });
-      }
+      await resend(interaction).then(() => interaction.editReply({ content: 'reposted!', ...quiet })).catch(async error => {
+        await interaction.editReply({ content: `could not repost this card: ${failure(error)}`, ...quiet }).catch(noop);
+      });
+      return;
+    }
+    if (interaction.isMessageContextMenuCommand() && interaction.commandName === shareMenu) {
+      interactionReplies.delete(interaction.id);
+      const note = handlers.share?.(interaction.channelId, interaction.targetMessage.id, { id: interaction.user.id, name: interaction.user.username }) ?? 'sharing is not available.';
+      await interaction.reply({ content: note, flags: MessageFlags.Ephemeral, ...quiet }).catch(noop);
+      return;
+    }
+    if (interaction.isChatInputCommand() && interaction.commandName === pasteCommand) {
+      await paste(interaction).catch(async error => {
+        log(`Discord: could not paste: ${failure(error)}`);
+        await interaction.followUp({ content: 'that couldn\'t be pasted here.', flags: MessageFlags.Ephemeral, ...quiet }).catch(noop);
+      });
       return;
     }
     if (interaction.isMessageContextMenuCommand() && interaction.commandName === browserMenu) {
@@ -907,6 +943,20 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       const note = await panel.press(interaction.customId.slice(grantPrefix.length) as Permission, interaction.user.id).catch(error => `that didn't work: ${failure(error)}`);
       await interaction.editReply({ ...grantView(panel) as unknown as BaseMessageOptions, ...quiet }).catch(noop);
       if (note) await interaction.followUp({ content: note, flags: MessageFlags.Ephemeral, ...quiet }).catch(noop);
+      return;
+    }
+    if (interaction.customId.startsWith(expandPrefix)) {
+      // Anyone may look; the answer shows to them alone, so the button keeps working for everyone else.
+      const messages = handlers.expand?.(interaction.customId.slice(expandPrefix.length).split(':')[0]!);
+      if (!messages) { await interaction.reply({ content: 'this answer is no longer available.', flags: MessageFlags.Ephemeral, ...quiet }).catch(noop); return; }
+      try {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        for (const [index, message] of messages.entries()) {
+          const payload = answerPayload(message);
+          if (index) await interaction.followUp({ ...payload, flags: (payload.flags ?? 0) | MessageFlags.Ephemeral });
+          else await interaction.editReply(payload);
+        }
+      } catch (error) { log(`Discord: pasted answer not shown: ${failure(error)}`); }
       return;
     }
     if (interaction.customId.startsWith(showPrefix)) {

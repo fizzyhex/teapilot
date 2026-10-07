@@ -18,6 +18,7 @@ import type { MessagePayload } from './play/render.js';
 import type { HostedMessage, PlayRuntime, StartOptions } from './play/runtime.js';
 import { approvePrompt, changePrompt, extractPlan, juniorsPrompt, planMessages, type PlanAction, type PlanControls, type PlanEmbed } from './plan.js';
 import { chunk, StatusCard, throttle, viewSourcePrefix, type CardReply } from './render.js';
+import type { Posted } from './share.js';
 import type { SkillPreferences } from '../skills/settings.js';
 
 export type CardButton = 'stop' | 'details';
@@ -92,6 +93,8 @@ export interface ConversationOptions {
   skills?: { preferences(userId?: string): SkillPreferences; command(args: string, userId?: string): Promise<string> };
   /** Receives the conversation's turns after each change, so they survive a restart. */
   onHistory?: (history: ConversationTurn[]) => void;
+  /** Receives each answer's messages once they are posted, so sharing one of them copies the whole answer. */
+  onAnswer?: (trail: Posted[]) => void;
   /** Receives completion after the answer and any status card have been sent. */
   onTurnEnd?: (result: Pick<HostResult, 'status' | 'requestId'>) => void;
   /**
@@ -168,10 +171,15 @@ export class Conversation {
 
   get active(): boolean { return !this.ended; }
 
-  /** `direct` text always goes to Discord; anything else stays in the terminal during an answer-only turn. */
-  private async say(text: string, direct = false): Promise<void> {
-    if ((this.answerOnly || this.quiet) && !direct) { this.options.log(`${this.options.key}: ${this.options.redact(text)}`); return; }
-    for (const part of chunk(this.options.redact(text))) await this.options.transport.send(part).catch(error => this.options.log(`${this.options.key}: send failed: ${error instanceof Error ? error.message : error}`));
+  /** `direct` text always goes to Discord; anything else stays in the terminal during an answer-only turn. Resolves with what was posted. */
+  private async say(text: string, direct = false): Promise<Posted[]> {
+    if ((this.answerOnly || this.quiet) && !direct) { this.options.log(`${this.options.key}: ${this.options.redact(text)}`); return []; }
+    const posted: Posted[] = [];
+    for (const part of chunk(this.options.redact(text))) {
+      const id = await this.options.transport.send(part).catch(error => { this.options.log(`${this.options.key}: send failed: ${error instanceof Error ? error.message : error}`); });
+      if (id) posted.push({ id, message: { content: part, source: part } });
+    }
+    return posted;
   }
 
   /**
@@ -180,7 +188,7 @@ export class Conversation {
    */
   private async answer(text: string): Promise<void> {
     const { transport, files, key, log } = this.options;
-    if (!transport.answer) return this.say(text, true);
+    if (!transport.answer) { const posted = await this.say(text, true); this.options.onAnswer?.(posted); return; }
     const conversation = this.options.play?.conversation ?? key;
     const failed = (what: string, error: unknown) => log(`${key}: ${what}: ${error instanceof Error ? error.message : String(error)}`);
     let reconciled: Promise<unknown> | undefined;
@@ -191,10 +199,12 @@ export class Conversation {
       if (!stored || stored.data.length > maxFileBytes) return undefined;
       return { name: stored.file.name, data: stored.data, image: Boolean(stored.file.width) && shown.has(stored.file.type) };
     });
+    const trail: Posted[] = [];
     for (const message of await layout(this.options.redact(text), { resolve, viewSourcePrefix })) {
-      if (message.content !== undefined) await this.say(message.content, true);
-      else await transport.answer(message).catch(async error => { failed('answer part not posted', error); await this.say(message.source, true); });
+      if (message.content !== undefined) trail.push(...await this.say(message.content, true));
+      else trail.push(...await transport.answer(message).then(id => [{ id, message }], async error => { failed('answer part not posted', error); return this.say(message.source, true); }));
     }
+    this.options.onAnswer?.(trail);
   }
 
   private input = (): Promise<string> => {
@@ -444,8 +454,10 @@ export class Conversation {
     const lines = result.casual && result.success ? casualLines(this.options.redact(result.text)) : undefined;
     if (lines) {
       const { transport } = this.options;
-      await paceLines(lines, line => transport.send(line).catch(error => this.options.log(`${this.options.key}: send failed: ${error instanceof Error ? error.message : error}`)),
+      const trail: Posted[] = [];
+      await paceLines(lines, line => transport.send(line).then(id => { trail.push({ id, message: { content: line, source: line } }); }, error => this.options.log(`${this.options.key}: send failed: ${error instanceof Error ? error.message : error}`)),
         { typing: () => transport.typing(), delayMs: this.options.lineDelayMs, signal: this.options.request.signal });
+      this.options.onAnswer?.(trail);
     } else {
       const found = !side && result.success && this.options.transport.plan ? extractPlan(this.options.redact(result.text)) : undefined;
       if (found) {

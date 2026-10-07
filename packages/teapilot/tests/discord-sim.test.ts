@@ -295,6 +295,72 @@ it('delivers rich answers through the service and keeps both table buttons worki
   expect(world.logs.filter(line => line.startsWith('⚠'))).toEqual([]);
 }, 60_000);
 
+/** `teapilot discord start` on the simulator, with models from `models()`. */
+async function service(f: Awaited<ReturnType<typeof models>>, world: World) {
+  const settings = { token: 'simulated-discord-token', allowedUserIds: [people.op.id], channelIds: [channelId], root: f.cwd, startMode: 'ask' as const };
+  const controller = new AbortController();
+  const done = serveDiscord({ config: f.config, settings, log: world.log, signal: controller.signal, connect: world.connect, stateDir: join(f.cwd, 'discord'), teachat: false });
+  cleanups.push(async () => { controller.abort(); await done; });
+  await vi.waitFor(() => expect(world.connected).toBe(true));
+}
+
+it('shares a whole answer from any of its messages and pastes it, tables and all, in another channel', async () => {
+  const f = await models('here it is\n\n| item | a | b |\n|---|---|---|\n| tea | 1 | 2 |\n\nbye');
+  const world = new World();
+  await service(f, world);
+  expect(await world.slash('op', '/paste', 'channel')).toContain('nothing is on the clipboard');
+  world.say('op', 'show me a table');
+  await vi.waitFor(() => expect(world.screen('dm-op')).toContain('Result: completed'), { timeout: 20_000 });
+  const bye = world.messages.find(message => message.content === 'bye')!;
+  expect(world.share('stranger', bye.id)).toContain('You are not allowed to use teapilot.');
+  expect(world.share('op', bye.id)).toContain('copied!');
+  const before = world.messages.length;
+  await world.slash('op', '/paste', 'channel');
+  const pasted = world.messages.slice(before);
+  expect(pasted.map(message => [message.channel.name, message.content, message.embeds.length])).toEqual([['channel', 'here it is', 0], ['channel', '', 1], ['channel', 'bye', 0]]);
+  expect(await world.click('stranger', pasted[1]!.id, 'columns')).toContain('| tea | 1 | 2 |');
+  const card = world.messages.find(message => message.content.startsWith('-# Result: completed'))!;
+  expect(world.share('op', card.id)).toContain('can\'t be shared');
+  expect(world.logs.filter(line => line.startsWith('⚠'))).toEqual([]);
+}, 60_000);
+
+it('pastes a long answer behind a button that shows the whole answer to whoever presses it', async () => {
+  const f = await models(Array.from({ length: 40 }, (_, index) => `${index + 1}. a point worth making`).join('\n'));
+  const world = new World();
+  await service(f, world);
+  world.say('op', 'list everything');
+  await vi.waitFor(() => expect(world.screen('dm-op')).toContain('Result: completed'), { timeout: 20_000 });
+  world.share('op', world.messages.find(message => message.content.startsWith('1. '))!.id);
+  const before = world.messages.length;
+  await world.slash('op', '/paste', 'channel');
+  const [compact, ...rest] = world.messages.slice(before);
+  expect(rest).toEqual([]);
+  expect(compact!.content).toMatch(/^1\\\. a point worth making 2\. a point .*…$/);
+  const shown = await world.click('stranger', compact!.id, 'expand');
+  expect(shown).toContain('(only stranger sees this)');
+  expect(shown).toContain('40. a point worth making');
+  expect(world.logs.filter(line => line.startsWith('⚠'))).toEqual([]);
+}, 60_000);
+
+it('moves a shared app into the channel it is pasted in, for its players only', async () => {
+  const f = await models();
+  const world = new World();
+  await service(f, world);
+  world.say('op', 'make me a counter');
+  await vi.waitFor(() => expect(world.screen('dm-op')).toContain('Result: completed'), { timeout: 20_000 });
+  const app = world.messages.find(message => message.content.startsWith('Count 0'))!;
+  await world.click('op', app.id, 'add');
+  expect(world.share('op', app.id)).toContain('move this game there');
+  const before = world.messages.length;
+  expect(await world.slash('op', '/paste', 'channel')).toContain('Count 1');
+  const moved = world.messages.slice(before).find(message => message.content.startsWith('Count 1'))!;
+  expect(moved.channel.name).toBe('channel');
+  // The old copy is retired after the edits already queued for it.
+  await vi.waitFor(() => expect(world.find(app.id)).toMatchObject({ content: '-# This app moved to another channel.', components: [] }), { timeout: 5000 });
+  expect(await world.click('op', moved.id, 'add')).toContain('Count 2');
+  expect(world.logs.filter(line => line.startsWith('⚠'))).toEqual([]);
+}, 60_000);
+
 it('runs teapilot discord start against the simulator: a model builds an app, people use it, and it survives a restart', async () => {
   const f = await models();
   const world = new World();

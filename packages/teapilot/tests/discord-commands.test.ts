@@ -34,6 +34,12 @@ it('registers repost this! in the Apps context menu for server and user installa
   expect(commandDefinitions).toContainEqual({ type: 3, name: 'repost this!', integration_types: [0, 1], contexts: [0, 1, 2] });
 });
 
+it('registers Share and /paste everywhere, and handles /paste in the gateway rather than as a session command', () => {
+  expect(commandDefinitions).toContainEqual({ type: 3, name: 'Share', integration_types: [0, 1], contexts: [0, 1, 2] });
+  expect(commandDefinitions).toContainEqual(expect.objectContaining({ name: 'paste', integration_types: [0, 1], contexts: [0, 1, 2] }));
+  expect(commandText('paste')).toBeUndefined();
+});
+
 it('offers reply in user-installed contexts and can drop that for server-only registration', () => {
   const reply = commandDefinitions.filter(command => command.name.toLowerCase() === 'reply');
   expect(reply).toHaveLength(2);

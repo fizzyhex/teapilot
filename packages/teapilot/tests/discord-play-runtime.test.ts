@@ -35,6 +35,24 @@ it('repost clicks preserve state, bypass player restrictions, and retire interac
   expect(record.state).toMatchObject({ count: 2 });
 });
 
+it('pastes an app into another channel, retires the old copy, and respects that channel\'s app limit', async () => {
+  const { runtime, surface, edits } = await setup();
+  const { record } = await start(runtime);
+  await runtime.interact(act(record.id, 'add', owner.id, { messageId: 'message-1' }).interaction);
+  const paste = act(record.id, '', owner.id, { kind: 'paste', channelId: 'channel-2' });
+  await runtime.interact(paste.interaction);
+  expect(paste.seen.followUps).toEqual([]);
+  expect(record.channelId).toBe('channel-2');
+  expect(record.state).toMatchObject({ count: 1 });
+  expect(surface.post).toHaveBeenLastCalledWith('channel-2', expect.objectContaining({ content: expect.stringContaining('1') }));
+  await vi.waitFor(() => expect(edits.at(-1)).toMatchObject({ content: '-# This app moved to another channel.', components: [] }));
+  for (let index = 0; index < 5; index++) await runtime.start({ title: 'Full', channelId: 'channel-3', conversation: 'dm:1', owner, source: { kind: 'sandbox', code: counter } });
+  const refused = act(record.id, '', owner.id, { kind: 'paste', channelId: 'channel-3' });
+  await runtime.interact(refused.interaction);
+  expect(refused.seen.followUps.join('')).toContain('could not paste this app: That channel already has 5 apps running');
+  expect(record.channelId).toBe('channel-2');
+});
+
 it('reports fresh/live state, idle and skipped actions without claiming correctness', async () => {
   const { runtime } = await setup();
   const source = { kind: 'sandbox' as const, code: counter };

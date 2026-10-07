@@ -9,6 +9,8 @@ import type { SetupUI } from '../setup/terminal.js';
 import { route, routeReply } from './access.js';
 import { AccessStore } from './access-store.js';
 import { AsideStore } from './aside-store.js';
+import { PasteStore } from './paste-store.js';
+import { Clipboard } from './share.js';
 import { HistoryStore } from './history-store.js';
 import { GrantStore } from './grant-store.js';
 import { grantControls, type GrantPanel } from './grants-panel.js';
@@ -107,6 +109,9 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
   const forgetGrants = (historyKey: string) => { sessions.delete(historyKey); grantStore.save(historyKey, undefined); };
   /** Side answers posted compactly, which their buttons show for as long as the post stays up. */
   const asides = AsideStore.at(stateDir);
+  /** Answers and apps copied with Apps → Share, and the compact pastes their buttons expand. */
+  const pastes = PasteStore.at(stateDir);
+  const clipboard = new Clipboard(pastes);
   /**
    * The bot's custom status: the games running, the requests answered and the rounds gossipped, this session only.
    * It is bound to the gateway once connected, and each count feeds it from where that count changes.
@@ -197,6 +202,7 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
       maxPromptChars: config.policy.limits.maxPromptChars,
       run: runTurn,
       onTurnEnd: options.onTurnEnd,
+      onAnswer: trail => clipboard.keep(trail),
       extension: teachat && headlessTeachat(teachat, key),
       skills: {
         preferences: userId => skillStore.effective({ conversation: historyKey.startsWith('btw:') ? undefined : historyKey, userId, operator: !!userId && access.roleOf(userId) === 'operator' }),
@@ -521,6 +527,15 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
     component: interaction => void (surface ? play.interact(interaction) : interaction.reply('teapilot is still starting; try again in a moment.')).catch(failed('App interaction')),
     openBrowser: (channelId, messageId, user) => browser?.launch(channelId, messageId, user),
     resendTarget: (channelId, messageId) => play.resendTarget(channelId, messageId),
+    // Only someone who may play an app can move it away from the others.
+    share: (channelId, messageId, user) => {
+      if (!allowed(user.id)) return 'You are not allowed to use teapilot.';
+      const app = play.resendTarget(channelId, messageId);
+      if (!app) return clipboard.copyAnswer(user.id, messageId);
+      return play.browserTarget(channelId, messageId, user) ? clipboard.copyApp(user.id, app) : 'only its players can share this game.';
+    },
+    paste: userId => allowed(userId) ? clipboard.paste(userId) : { note: 'You are not allowed to use teapilot.' },
+    expand: id => pastes.find(id),
     openEditorForMessage: (messageId, user) => browserHost?.editFileMessage(messageId, user.id),
     bindFileReply: (messageId, conversation, path, user) => browserHost?.bindFileReply(messageId, conversation, path, user.id),
     asides: { keep: answer => asides.keep(answer), find: id => asides.find(id), summarise: summariser({ config, root, access, queue, run, signal, skills: userId => skillStore.effective({ userId, operator: access.roleOf(userId) === 'operator' }) }) },

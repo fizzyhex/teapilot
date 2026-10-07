@@ -43,7 +43,7 @@ const line = (step: { tool: string } | { note: string }) => 'tool' in step ? ste
 
 /** Literal text inside Discord markdown: nothing in it formats, links or mentions. */
 export function escapeMarkdown(text: string): string {
-  return text.replace(/[\\*_~`|>#[\]<]/g, '\\$&').replace(/^([-+]|\d+\.) /, '\\$1 ');
+  return text.replace(/[\\*_~`|>#[\]<]/g, '\\$&').replace(/^([-+]) /, '\\$1 ').replace(/^(\d+)\. /, '$1\\. ');
 }
 /** The last `max` characters of `text` on one line, starting at a word where one is near. */
 export function tail(text: string, max: number): string {
