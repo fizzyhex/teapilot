@@ -23,9 +23,9 @@ import { checkpointDetailsText, checkpointModal, checkpointWaitMs, checkpointMod
 type Json = Record<string, unknown>;
 type Row = { type: number; components: Json[] };
 interface Upload { name: string; data: Buffer }
-interface Payload { content?: string; embeds?: Json[]; components?: Row[]; files?: Upload[]; flags?: number }
+interface Payload { content?: string; embeds?: Json[]; components?: Row[]; files?: Upload[]; flags?: number; keep?: string[] }
 /** An attachment as the simulator keeps it: on disk, so whoever drives it can open the file. */
-export interface Attachment { name: string; size: number; path: string }
+export interface Attachment { id: string; name: string; size: number; path: string }
 
 /** One control as `click`/`select` address it, and as Discord received it. */
 export interface SnapshotControl {
@@ -111,7 +111,7 @@ export class World {
   private readonly listeners = new Set<(text: string) => void>();
   private handlers?: GatewayHandlers;
   private operators: readonly string[] = [];
-  private counters = { message: 0, thread: 0, approval: 0, browse: 0 };
+  private counters = { message: 0, thread: 0, approval: 0, browse: 0, attachment: 0 };
   /** Status cards by message id, as the gateway keeps them; a restart forgets them. */
   private cards = new Map<string, CardControls['press']>();
   private cardResenders = new Map<string, () => Message>();
@@ -134,7 +134,7 @@ export class World {
     return uploads.map((upload, index) => {
       const path = join(this.files, `${message}-${Date.now().toString(36)}-${index}-${upload.name.replace(/[^\w.-]+/g, '_')}`);
       writeFileSync(path, upload.data);
-      return { name: upload.name, size: upload.data.length, path };
+      return { id: `a${++this.counters.attachment}`, name: upload.name, size: upload.data.length, path };
     });
   }
 
@@ -175,8 +175,7 @@ export class World {
         edit: async (channel, id, payload) => {
           const message = this.find(id);
           if (message.channel.id !== channel) throw new Error('Unknown Message');
-          // Like the gateway, an app's edit replaces the attachments the message had.
-          this.update(message, { ...payload as Payload, files: (payload as Payload).files ?? [] });
+          return this.appEdit(message, payload as Payload);
         },
         request: async (method, route) => {
           this.warn(`A trusted app called Discord REST ${method} ${route}; the simulator does not emulate REST routes.`);
@@ -248,17 +247,31 @@ export class World {
     return message;
   }
 
-  private update(message: Message, payload: Payload): void {
+  /** Without `files` an edit leaves every attachment in place; with them, only those in `kept` stay beside the new ones. */
+  private update(message: Message, payload: Payload, kept: Attachment[] = []): void {
     // Discord keeps the Components V2 flag once a message has it.
     const next = { content: payload.content ?? message.content, embeds: payload.embeds ?? message.embeds, components: payload.components ?? message.components, flags: (payload.flags ?? 0) | (message.flags ?? 0) || undefined };
     const uploads = payload.files;
+    const stays = uploads ? kept : message.files;
     // Attachments the edit leaves in place still count for attachment:// references.
-    const kept = uploads ?? message.files.map(file => ({ name: file.name, data: Buffer.alloc(file.size) }));
-    this.check(`an edit to ${message.id}`, () => { checkMessage({ ...next, files: kept }); checkFiles({ ...next, files: kept }); });
+    const all = [...stays.map(file => ({ name: file.name, data: Buffer.alloc(file.size) })), ...uploads ?? []];
+    this.check(`an edit to ${message.id}`, () => { checkMessage({ ...next, files: all }); checkFiles({ ...next, files: all }); });
     Object.assign(message, next);
-    if (uploads) message.files = this.store(message.id, uploads);
+    if (uploads) message.files = [...stays, ...this.store(message.id, uploads)];
     message.edits++;
     this.emit(this.render(message));
+  }
+
+  /** An app's edit, as the gateway sends it: attachments it keeps by id stay, and the rest are replaced by its files. */
+  private appEdit(message: Message, payload: Payload): Array<{ id: string; name: string }> {
+    const keep = payload.keep ?? [];
+    const kept = message.files.filter(file => keep.includes(file.id));
+    this.check(`an edit to ${message.id}`, () => {
+      const unknown = keep.filter(id => !kept.some(file => file.id === id));
+      if (unknown.length) throw new DiscordRejected(`attachments: ${unknown.join(', ')} ${unknown.length === 1 ? 'is' : 'are'} not on ${message.id}, so Discord refuses the edit.`);
+    });
+    this.update(message, { ...payload, files: payload.files ?? [] }, kept);
+    return message.files.map(({ id, name }) => ({ id, name }));
   }
 
   /** With `replyTo`, the first message replies to it, as the gateway's reply transport does. */
@@ -468,7 +481,7 @@ export class World {
           const posted = this.post(channel, bot.name, payload as Payload);
           seen.push(this.render(posted));
           settled = true;
-          return { id: posted.id, edit: async next => this.update(posted, next as Payload) };
+          return { id: posted.id, edit: async next => this.appEdit(posted, next as Payload) };
         },
       });
       for (const deadline = Date.now() + 15_000; !settled && Date.now() < deadline;) await pause(20);
@@ -737,7 +750,7 @@ ${this.render(this.post(form.message.channel, bot.name, { content: note }, perso
     if (!target) throw new SimError(`${custom} is not a discord.play control.`);
     const seen: string[] = [`${person.name} ${action} on ${message.id}.`];
     const started = Date.now();
-    let state: 'new' | 'deferred' | 'replied' | 'form' = 'new';
+    let state: 'new' | 'deferred' | 'updated' | 'replied' | 'form' = 'new';
     let updated = false, notes = 0;
     const first = (what: string) => {
       if (state !== 'new') throw new Error(`Interaction has already been acknowledged (${what}).`);
@@ -755,7 +768,7 @@ ${this.render(this.post(form.message.channel, bot.name, { content: note }, perso
         const fresh = this.post(message.channel, bot.name, payload);
         seen.push(this.render(fresh));
         notes++;
-        return { id: fresh.id, edit: async next => this.update(fresh, next) };
+        return { id: fresh.id, edit: async next => this.appEdit(fresh, next as Payload) };
       } : undefined,
       openModal: async payload => {
         if (kind === 'modal') throw new Error('A form cannot open another form.');
@@ -768,10 +781,17 @@ ${this.render(this.post(form.message.channel, bot.name, { content: note }, perso
       },
       reply: async content => { first('reply'); state = 'replied'; note(content); },
       defer: async () => { first('deferUpdate'); state = 'deferred'; },
+      respond: async payload => {
+        first('update');
+        const attached = this.appEdit(message, payload as Payload);
+        state = 'updated'; updated = true;
+        return attached;
+      },
       update: async payload => {
-        if (state !== 'deferred') throw new Error('editReply before deferUpdate.');
-        this.update(message, { ...payload as Payload, files: (payload as Payload).files ?? [] });
+        if (state !== 'deferred' && state !== 'updated') throw new Error('editReply before deferUpdate or update.');
+        const attached = this.appEdit(message, payload as Payload);
         updated = true;
+        return attached;
       },
       followUp: async (content, embeds) => {
         if (state === 'new') throw new Error('followUp before the interaction was acknowledged.');
@@ -780,7 +800,7 @@ ${this.render(this.post(form.message.channel, bot.name, { content: note }, perso
     };
     const unanswered = setTimeout(() => { if (state === 'new') this.warn(`Nothing answered ${person.name}'s ${kind} on ${message.id} within 3 s; Discord shows "This interaction failed".`); }, 3000);
     handlers.component(interaction);
-    const done = () => state === 'form' || state === 'replied' || (state === 'deferred' && (updated || notes > 0));
+    const done = () => state === 'form' || state === 'replied' || state === 'updated' || (state === 'deferred' && (updated || notes > 0));
     for (const deadline = Date.now() + 15_000; !done() && Date.now() < deadline;) await pause(20);
     clearTimeout(unanswered);
     // Notes can follow an update; give them a moment.

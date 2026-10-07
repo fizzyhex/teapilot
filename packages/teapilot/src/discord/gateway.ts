@@ -13,7 +13,7 @@ import { InteractionFeed, type FeedLink } from './feed.js';
 import { planButtons, planModal, type PlanAction, type PlanControls } from './plan.js';
 import { viewSource, type Message as AnswerMessage } from 'pretty-send';
 import { chunk, MESSAGE_LIMIT, quoteMessage, viewSourcePrefix, type QuotedMessage, type ReplyChain } from './render.js';
-import { browserLink, parseCustomId, playPrefix, type MessagePayload } from './play/render.js';
+import { browserLink, parseCustomId, playPrefix, type Attached, type MessagePayload } from './play/render.js';
 import type { PlayInteraction, PlaySurface } from './play/runtime.js';
 import type { DiscordSettings } from './settings.js';
 import { emptyClipboard, expandPrefix, type Paste } from './share.js';
@@ -177,9 +177,12 @@ const quiet = { allowedMentions: { parse: [] as [] } };
  * files; an edit replaces the attachments it had, so an earlier picture never lingers under the new one.
  */
 const raw = (payload: MessagePayload, edit = false) => {
-  const { files, pictures: _, ...rest } = payload;
-  return { ...rest, files: (files ?? []).map(file => ({ attachment: file.data, name: file.name })), ...(edit ? { attachments: [] } : {}) } as unknown as BaseMessageOptions & { content: string };
+  const { files, pictures: _, keep, ...rest } = payload;
+  // An edit keeps only the attachments it names; new files are added to them.
+  return { ...rest, files: (files ?? []).map(file => ({ attachment: file.data, name: file.name })), ...(edit ? { attachments: (keep ?? []).map(id => ({ id })) } : {}) } as unknown as BaseMessageOptions & { content: string };
 };
+/** What an app's message carries after an edit, so the next one can keep unchanged pictures. */
+const attachedTo = (message: { attachments: { values(): Iterable<{ id: string; name: string }> } }): Attached => [...message.attachments.values()].map(({ id, name }) => ({ id, name }));
 /** A Discord attachment, downloaded only when teapilot keeps it. */
 const incoming = (file: Attachment): IncomingFile => ({ name: file.name, size: file.size, contentType: file.contentType ?? undefined,
   async download() {
@@ -588,11 +591,11 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       reply: async content => { await interaction.editReply({ content, ...quiet }); },
       followUp: async content => { await interaction.editReply({ content, ...quiet }); },
       openModal: async () => { throw new Error('this cannot open a form.'); },
-      update: async payload => { if (messageId) await interaction.webhook.editMessage(messageId, raw(payload, true)); },
+      update: async payload => messageId ? attachedTo(await interaction.webhook.editMessage(messageId, raw(payload, true))) : undefined,
       post: async payload => {
         const posted = await interaction.followUp(raw(payload));
         await interaction.editReply({ content: done, ...quiet }).catch(noop);
-        return { id: posted.id, edit: async next => { await interaction.webhook.editMessage(posted.id, raw(next, true)); } };
+        return { id: posted.id, edit: async next => attachedTo(await interaction.webhook.editMessage(posted.id, raw(next, true))) };
       },
     });
   };
@@ -857,7 +860,13 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
         openModal: async payload => { if (interaction.isModalSubmit()) throw new Error('A form cannot open another form.'); await interaction.showModal(payload as unknown as APIModalInteractionResponseCallbackData); },
         reply: async content => { await interaction.reply({ content, flags: MessageFlags.Ephemeral, ...quiet }); },
         defer: async () => { await interaction.deferUpdate(); },
-        update: async payload => { await interaction.editReply(raw(payload, true)); },
+        respond: async payload => {
+          const used = interaction.isModalSubmit() ? interaction.isFromMessage() ? interaction : undefined : interaction;
+          if (!used) throw new Error('This form was not opened from the app message.');
+          const response = await used.update({ ...raw(payload, true), withResponse: true });
+          return response.resource?.message ? attachedTo(response.resource.message) : undefined;
+        },
+        update: async payload => attachedTo(await interaction.editReply(raw(payload, true))),
         followUp: async (content, embeds) => { await interaction.followUp({ content, embeds: embeds as BaseMessageOptions['embeds'], flags: MessageFlags.Ephemeral, ...quiet }); },
       });
       return;
@@ -1140,7 +1149,7 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
     username: id => client.users.fetch(id).then(user => user.username, () => undefined),
     play: {
       async post(channelId, payload) { return (await (await messages(channelId)).send(raw(payload))).id; },
-      async edit(channelId, messageId, payload) { await (await messages(channelId)).messages.edit(messageId, raw(payload, true)); },
+      async edit(channelId, messageId, payload) { return attachedTo(await (await messages(channelId)).messages.edit(messageId, raw(payload, true))); },
       request: (method, route, body) => client.rest.request({ method: method as RequestMethod, fullRoute: route as RouteLike, body }),
     },
     // A custom status carries its text in `state`; the name is required but never shown for this type.

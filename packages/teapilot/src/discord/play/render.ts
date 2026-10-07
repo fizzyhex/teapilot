@@ -19,7 +19,11 @@ export interface MessagePayload {
   /** Conversation images the embeds show as attachment://name; the runtime renders them into `files` before sending. */
   pictures?: PictureSpec[];
   files?: Array<{ name: string; data: Buffer }>;
+  /** Edits only: ids of attachments the message already has that stay, so unchanged pictures are not uploaded again. */
+  keep?: string[];
 }
+/** The attachments a message has after a post or edit, when the transport can tell. */
+export type Attached = Array<{ id: string; name: string }> | void;
 export interface ModalPayload { custom_id: string; title: string; components: Array<{ type: 1; components: Array<Record<string, unknown>> }> }
 
 const limits = { content: 2000, embeds: 10, embedTotal: 6000, title: 256, description: 4096, fields: 25, fieldName: 256, fieldValue: 1024, footer: 2048, rows: 5, buttons: 5, label: 80, options: 25, option: 100, placeholder: 150, modalTitle: 45, modalFields: 5, modalLabel: 45, modalValue: 4000 };

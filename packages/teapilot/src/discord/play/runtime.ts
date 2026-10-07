@@ -5,7 +5,7 @@ import type { Action, Effect, Embed, Participants, User, View } from '@teapilot/
 import { interactionLifetimeMs } from '../commands.js';
 import type { PictureSpec } from '../images.js';
 import { maxOutputChars, type CallInput, type ContextData, type PlayEngine } from './engine.js';
-import { describe, findControl, ignoredKeys, normalizeView, PlayError, renderEmbeds, renderModal, renderView, type MessagePayload, type ModalPayload } from './render.js';
+import { describe, findControl, ignoredKeys, normalizeView, PlayError, renderEmbeds, renderModal, renderView, type Attached, type MessagePayload, type ModalPayload } from './render.js';
 import { sandbox } from './sandbox.js';
 import type { PlayRecord, PlayStore } from './store.js';
 import { trusted, type DiscordRequest } from './trusted.js';
@@ -15,7 +15,7 @@ import { PlayDelivery } from './delivery.js';
 /** Where an app's message lives; the gateway implements it. */
 export interface PlaySurface {
   post(channelId: string, payload: MessagePayload): Promise<string>;
-  edit(channelId: string, messageId: string, payload: MessagePayload): Promise<void>;
+  edit(channelId: string, messageId: string, payload: MessagePayload): Promise<Attached>;
   /** Raw Discord REST, for trusted apps only. */
   request: DiscordRequest;
 }
@@ -23,7 +23,7 @@ export interface PlaySurface {
  * An app posted as the reply to an interaction, where teapilot cannot post in the channel. Discord lets that
  * interaction edit it for 15 minutes; after that only a click on the app, which brings its own 15 minutes, can.
  */
-export interface HostedMessage { id: string; edit(payload: MessagePayload): Promise<void> }
+export interface HostedMessage { id: string; edit(payload: MessagePayload): Promise<Attached> }
 /** One click, selection or form submission on an app's message. */
 export interface PlayInteraction {
   playId: string; controlId: string; kind: 'button' | 'select' | 'modal' | 'resend' | 'paste'; user: User;
@@ -40,8 +40,10 @@ export interface PlayInteraction {
   reply(content: string): Promise<void>;
   /** First response only: acknowledge now and edit the message later. */
   defer(): Promise<void>;
-  /** After defer(): edit the app's message. */
-  update(payload: MessagePayload): Promise<void>;
+  /** First response only: edit the app's message as the answer, in one request. Without it, clicks defer and then update. */
+  respond?(payload: MessagePayload): Promise<Attached>;
+  /** After defer() or respond(): edit the app's message. */
+  update(payload: MessagePayload): Promise<Attached>;
   /** After defer(): a private note to the person who acted. */
   followUp(content: string, embeds?: Array<Record<string, unknown>>): Promise<void>;
 }
@@ -83,6 +85,10 @@ export const playLimits = {
   stateChars: 64_000, log: 20,
 };
 const idPattern = /^[A-Za-z0-9_.-]{1,64}$/;
+/** Spacing between channel edits of one app's message; Discord allows about five a channel every five seconds. */
+const editSpacingMs = 1000;
+/** How long a click waits for its new view before deferring, well inside Discord's three seconds. */
+const answerMs = 1500;
 
 interface Live {
   record: PlayRecord;
@@ -91,7 +97,7 @@ interface Live {
   consulting: boolean;
   chain: Promise<unknown>;
   /** For an app posted through an interaction: the newest interaction that can still edit its message. */
-  reach?: { edit(payload: MessagePayload): Promise<void>; until: number };
+  reach?: { edit(payload: MessagePayload): Promise<Attached>; until: number };
   /** While someone is playing: when the app hibernates unless something happens first. Never stored, so a restart leaves every app asleep. */
   awakeUntil?: number;
   /** Cancels the hibernation that `awakeUntil` is waiting for. */
@@ -99,6 +105,8 @@ interface Live {
   delivery?: PlayDelivery;
   /** Last successfully delivered view, before attachment rendering. */
   delivered?: MessagePayload;
+  /** The pictures the app's message carries now, so an edit keeps the ones that have not changed. */
+  uploads?: { messageId: string; files: Array<{ id: string; name: string; data: Buffer }> };
 }
 interface Advance { state: unknown; seed: number; view: View; payload: MessagePayload; effects: Effect[]; timers: PlayRecord['timers']; finished?: { summary?: string } }
 
@@ -402,31 +410,48 @@ export class PlayRuntime {
 
   private delivery(live: Live): PlayDelivery {
     if (!live.delivery) {
-      live.delivery = new PlayDelivery(this.clock, this.options.discordEditMs ?? 2000,
+      live.delivery = new PlayDelivery(this.clock, this.options.discordEditMs ?? editSpacingMs,
         error => this.options.log(`play ${live.record.id}: could not update its message: ${errorText(error)}`));
       this.deliveries.add(live.delivery);
     }
     return live.delivery;
   }
 
-  /** Snapshot the target and view; coalesce edits outside the state queue. */
-  private show(live: Live, payload: MessagePayload, edit?: (payload: MessagePayload) => Promise<void>): void {
+  /**
+   * Snapshot the target and view; coalesce edits outside the state queue. `edit` answers a click, so it goes
+   * out at once. Resolves once this view is sent, skipped or replaced.
+   */
+  private show(live: Live, payload: MessagePayload, edit?: (payload: MessagePayload) => Promise<Attached>): Promise<void> {
     const record = { ...live.record };
     const originalReach = live.reach;
-    if (!record.messageId) return;
-    this.delivery(live).enqueue(async current => {
+    if (!record.messageId) return Promise.resolve();
+    return this.delivery(live).enqueue(async current => {
       // A picture's source file can change without its spec changing.
       if (!payload.pictures?.length && isDeepStrictEqual(payload, live.delivered)) return false;
       const reach = record.messageId === live.record.messageId ? live.reach : originalReach;
       if (record.viaInteraction && (!reach || reach.until <= this.now())) return false;
-      const ready = await this.attach(record, payload);
+      const rendered = await this.attach(record, payload);
       if (!current()) return false;
-      if (!record.viaInteraction && edit) await edit(ready);
-      else if (!record.viaInteraction) await this.options.surface.edit(record.channelId, record.messageId!, ready);
-      else if (reach!.until > this.now()) await reach!.edit(ready);
+      const ready = this.reuse(live, record.messageId!, rendered);
+      if (!ready.files?.length && isDeepStrictEqual(payload, live.delivered)) return false;
+      let attached: Attached;
+      if (!record.viaInteraction && edit) attached = await edit(ready);
+      else if (!record.viaInteraction) attached = await this.options.surface.edit(record.channelId, record.messageId!, ready);
+      else if (reach!.until > this.now()) attached = await reach!.edit(ready);
       else return false;
-      if (record.messageId === live.record.messageId) live.delivered = payload;
-    });
+      if (record.messageId !== live.record.messageId) return;
+      live.delivered = payload;
+      const files = rendered.files ?? [];
+      live.uploads = attached ? { messageId: record.messageId!, files: files.flatMap(file => attached.filter(entry => entry.name === file.name).map(({ id }) => ({ ...file, id }))) } : undefined;
+    }, Boolean(edit));
+  }
+
+  /** Pictures the message already shows with the same bytes are kept by id instead of uploaded again. */
+  private reuse(live: Live, messageId: string, payload: MessagePayload): MessagePayload {
+    const shown = live.uploads?.messageId === messageId ? live.uploads.files : [];
+    const keep = (payload.files ?? []).flatMap(file => shown.filter(old => old.name === file.name && old.data.equals(file.data)).slice(0, 1));
+    if (!keep.length) return payload;
+    return { ...payload, files: payload.files!.filter(file => !keep.some(old => old.name === file.name)), keep: keep.map(old => old.id) };
   }
 
   /** Whether the app is playing now: posted, used or resent within the last ten minutes. */
@@ -768,7 +793,7 @@ export class PlayRuntime {
       this.wake(live);
       if (old.messageId) {
         const stub: MessagePayload = { content: `-# ${away ? movedAway : moved}`, embeds: [], components: [], allowedMentions: { parse: [] } };
-        const delivery = retired ?? new PlayDelivery(this.clock, this.options.discordEditMs ?? 2000,
+        const delivery = retired ?? new PlayDelivery(this.clock, this.options.discordEditMs ?? editSpacingMs,
           error => this.options.log(`play ${record.id}: could not retire its old message: ${errorText(error)}`));
         this.deliveries.add(delivery);
         delivery.enqueue(async () => {
@@ -820,15 +845,16 @@ export class PlayRuntime {
     if (!current()) { await interaction.reply('That control is no longer available.'); return; }
     const control = interaction.kind === 'button' ? findControl(record.view, interaction.controlId) : undefined;
     if (control?.type === 'button' && control.opens) { this.wake(live); await interaction.openModal(renderModal(record.id, control.opens)); return; }
-    await interaction.defer();
+    const answer = this.answer(interaction, record.id);
     // Each click can edit the message for its own 15 minutes, which keeps an app posted through an interaction alive.
-    if (record.viaInteraction) live.reach = { edit: payload => interaction.update(payload), until: this.now() + interactionLifetimeMs };
+    if (record.viaInteraction) live.reach = { edit: answer.edit, until: this.now() + interactionLifetimeMs };
     // Someone is playing now, so the app runs again, and any clock it was holding starts from here.
     this.wake(live);
     const replies: Promise<void>[] = [];
     const kind = interaction.kind;
+    let shown = Promise.resolve();
     const reply = (content: string, embeds?: Array<Record<string, unknown>>) => {
-      replies.push(Promise.resolve().then(() => interaction.followUp(content, embeds))
+      replies.push(answer.acknowledged.then(() => interaction.followUp(content, embeds))
         .catch(error => this.options.log(`play ${record.id}: private reply failed: ${errorText(error)}`)));
     };
     await this.serial(live, async () => {
@@ -838,14 +864,43 @@ export class PlayRuntime {
       const action = toAction({ kind, id: interaction.controlId, values: interaction.values, fields: interaction.fields }, interaction.user);
       try {
         const { payload, notes } = await this.dispatch(live, action, `${interaction.kind} ${interaction.controlId} by ${interaction.user.id}`);
-        this.show(live, payload, payload => interaction.update(payload));
+        shown = this.show(live, payload, answer.edit);
         for (const note of notes) reply(note.content, note.embeds && renderEmbeds(note.embeds));
       } catch (error) {
         this.options.log(`play ${record.id}: ${errorText(error)}`);
         reply(`The app hit an error, so nothing changed. ${clip(errorText(error), 300)}`);
       }
     });
+    // A view that was unchanged, or overtaken by a newer one, never answered the click.
+    void shown.then(answer.ack);
     await Promise.all(replies);
+  }
+
+  /**
+   * How a click is answered. Its new view goes back as the interaction's response, one request where deferring
+   * and then editing takes two. When no view is ready in time, or none comes, it defers instead.
+   */
+  private answer(interaction: PlayInteraction, playId: string) {
+    let first: Promise<unknown> | undefined;
+    let acknowledge!: () => void;
+    const acknowledged = new Promise<void>(resolve => { acknowledge = resolve; });
+    const settle = (response: Promise<unknown>) => {
+      clearTimeout(timer);
+      first = response;
+      void response.then(acknowledge, error => { this.options.log(`play ${playId}: could not answer a click: ${errorText(error)}`); acknowledge(); });
+      return response;
+    };
+    const ack = () => first ?? settle(interaction.defer());
+    // Discord's three seconds are wall-clock time, whatever the app's clock says.
+    const timer = interaction.respond ? setTimeout(ack, answerMs) : undefined;
+    timer?.unref?.();
+    if (!interaction.respond) void ack();
+    const edit = async (payload: MessagePayload): Promise<Attached> => {
+      if (!first && interaction.respond) return settle(interaction.respond(payload)) as Promise<Attached>;
+      await ack();
+      return interaction.update(payload);
+    };
+    return { edit, ack: () => { void ack(); }, acknowledged };
   }
 
   /**

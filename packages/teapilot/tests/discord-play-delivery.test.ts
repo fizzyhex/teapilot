@@ -111,3 +111,35 @@ it('takes the latest view even before preparation starts', async () => {
   expect(seen).toEqual([2]);
   delivery.close();
 });
+
+it('sends an edit answering a click at once, without spending the channel interval', async () => {
+  const time = clock(), seen: number[] = [];
+  const delivery = new PlayDelivery(time.clock, 2000, vi.fn());
+  delivery.enqueue(async () => { seen.push(1); });
+  await settle();
+  delivery.enqueue(async () => { seen.push(2); });
+  expect(time.timers.size).toBe(1);
+  // The click replaces the waiting channel edit and goes out now.
+  const answered = delivery.enqueue(async () => { seen.push(3); }, true);
+  await answered;
+  expect(seen).toEqual([1, 3]);
+  expect(time.timers.size).toBe(0);
+  delivery.enqueue(async () => { seen.push(4); });
+  time.advance(1999); await settle(); expect(seen).toEqual([1, 3]);
+  time.advance(1); await settle(); expect(seen).toEqual([1, 3, 4]);
+  delivery.close();
+});
+
+it('settles an edit that a newer one replaces before it is sent', async () => {
+  const time = clock(), first = vi.fn(async () => {});
+  let release!: () => void;
+  const delivery = new PlayDelivery(time.clock, 0, vi.fn());
+  delivery.enqueue(() => new Promise<void>(resolve => { release = resolve; }));
+  await settle();
+  const replaced = delivery.enqueue(first, true);
+  delivery.enqueue(async () => {}, true);
+  await replaced;
+  expect(first).not.toHaveBeenCalled();
+  release();
+  delivery.close();
+});

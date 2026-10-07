@@ -187,8 +187,10 @@ it('runs simultaneous clicks one at a time', async () => {
   const { record } = await start(runtime);
   const clicks = Array.from({ length: 5 }, () => act(record.id, 'add'));
   await Promise.all(clicks.map(click => runtime.interact(click.interaction)));
-  expect(clicks.map(click => click.seen.updates[0]!.content).sort()).toEqual(['1 ', '2 ', '3 ', '4 ', '5 ']);
   expect(store.all()[0]!.state).toEqual({ count: 5, said: '' });
+  // Views that a newer one overtakes before they are sent are skipped; every click is still answered.
+  await vi.waitFor(() => expect(clicks.flatMap(click => click.seen.updates).at(-1)!.content).toBe('5 '));
+  expect(clicks.every(click => click.seen.deferred)).toBe(true);
 });
 
 it('keeps browser state processing independent of a blocked Discord interaction edit', async () => {
@@ -275,6 +277,65 @@ it('drops a stale prepared image and sends only the latest state', async () => {
   await vi.waitFor(() => expect(surface.edit).toHaveBeenCalledOnce());
   expect(vi.mocked(surface.edit).mock.calls[0]![2]).toMatchObject({ content: '3', files: [{ data: Buffer.from('image') }] });
   expect(render).toHaveBeenCalledTimes(3); // Initial post, discarded frame, latest frame.
+});
+
+it('keeps pictures the message already shows instead of uploading them again', async () => {
+  let bytes = 'board';
+  const render = vi.fn(async (_conversation: string, spec: { name: string }) => ({ name: spec.name, data: Buffer.from(bytes) }));
+  const { runtime, surface, edits } = await setup({ pictures: { check() {}, render } });
+  let uploaded = 0;
+  vi.mocked(surface.edit).mockImplementation(async (_channel, _message, payload) => {
+    edits.push(payload);
+    return [...(payload.keep ?? []).map(id => ({ id, name: 'board.png' })), ...(payload.files ?? []).map(file => ({ id: `a${++uploaded}`, name: file.name }))];
+  });
+  const { record } = await start(runtime, { code: `
+    import { app, button, row, embed, picture } from '@teapilot/discord-play';
+    export default app({ init: () => 0, update: s => s + 1,
+      view: s => ({ content: String(s), embeds: [embed({ image: picture('board.png') })], rows: [row(button('add', 'add'))] }) });` });
+  await runtime.browserPress(record.id, 'add', owner);
+  await vi.waitFor(() => expect(edits).toHaveLength(1));
+  await runtime.browserPress(record.id, 'add', owner);
+  await vi.waitFor(() => expect(edits).toHaveLength(2));
+  bytes = 'moved';
+  await runtime.browserPress(record.id, 'add', owner);
+  await vi.waitFor(() => expect(edits).toHaveLength(3));
+  expect(edits.map(edit => ({ content: edit.content, files: edit.files?.map(file => file.data.toString()), keep: edit.keep })))
+    .toEqual([{ content: '1', files: ['board'], keep: undefined }, { content: '2', files: [], keep: ['a1'] }, { content: '3', files: ['moved'], keep: undefined }]);
+});
+
+it('answers a click with its new view in one response', async () => {
+  const { runtime } = await setup();
+  const { record } = await start(runtime);
+  const responses: MessagePayload[] = [];
+  const click = act(record.id, 'add', owner.id, { respond: async payload => { responses.push(payload); } });
+  await runtime.interact(click.interaction);
+  await vi.waitFor(() => expect(responses.map(payload => payload.content)).toEqual(['1 ']));
+  expect(click.seen.deferred).toBe(false);
+  expect(click.seen.updates).toEqual([]);
+  // A click that changes nothing on the message is still acknowledged.
+  const hint = act(record.id, 'hint', owner.id, { respond: async payload => { responses.push(payload); } });
+  await runtime.interact(hint.interaction);
+  expect(hint.seen.followUps).toEqual(['psst']);
+  expect(hint.seen.deferred).toBe(true);
+  expect(responses).toHaveLength(1);
+});
+
+it('defers a click when its view cannot be sent in time, then edits', async () => {
+  const { runtime, surface } = await setup();
+  const { record } = await start(runtime);
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  vi.mocked(surface.edit).mockImplementationOnce(async () => { await blocked; });
+  const respond = vi.fn(async () => {});
+  const click = act(record.id, 'add', owner.id, { respond });
+  try {
+    await runtime.browserPress(record.id, 'add', owner);
+    await vi.waitFor(() => expect(surface.edit).toHaveBeenCalledOnce());
+    await runtime.interact(click.interaction);
+    await vi.waitFor(() => expect(click.seen.deferred).toBe(true), { timeout: 3000 });
+  } finally { release(); }
+  await vi.waitFor(() => expect(click.seen.updates.map(payload => payload.content)).toEqual(['2 ']));
+  expect(respond).not.toHaveBeenCalled();
 });
 
 it('does not deduplicate a return to the old view while a different edit is in flight', async () => {
@@ -537,7 +598,7 @@ it('resends a buried app with its state, points the old copy at it, and turns aw
   const { preview } = await runtime.resend(record.id, 'dm:1', { channelId: 'channel-1' });
   expect(preview).toContain('[Add](add)');
   expect(posts.at(-1)!.content).toBe('1 ');
-  expect(edits.at(-1)).toMatchObject({ content: '-# This app moved to a newer message below.', components: [] });
+  await vi.waitFor(() => expect(edits.at(-1)).toMatchObject({ content: '-# This app moved to a newer message below.', components: [] }));
   expect(store.all()[0]).toMatchObject({ id: record.id, messageId: 'message-2', state: { count: 1 } });
   expect(store.all()[0]!.log.at(-1)).toMatchObject({ action: 'resend' });
   expect(log).not.toHaveBeenCalled();

@@ -8,7 +8,7 @@ import { IS_COMPONENTS_V2, layout } from 'pretty-send';
 import { afterEach, expect, it, vi } from 'vitest';
 import { serveDiscord } from '../src/discord/index.js';
 import { viewSourcePrefix } from '../src/discord/render.js';
-import { PlayRuntime } from '../src/discord/play/runtime.js';
+import { PlayRuntime, type Pictures } from '../src/discord/play/runtime.js';
 import { PlayStore } from '../src/discord/play/store.js';
 import { SkippableClock } from '../scripts/discord-sim/clock.js';
 import { checkFiles, checkMessage, checkModal, DiscordRejected } from '../scripts/discord-sim/validate.js';
@@ -76,7 +76,7 @@ it('jumps timers forward in order and still lets them fire on their own', async 
   expect(clock.now() - Date.now()).toBeGreaterThanOrEqual(59_000);
 });
 
-async function playWorld() {
+async function playWorld(options: { code?: string; pictures?: Pictures } = {}) {
   const world = new World();
   const clock = new SkippableClock();
   const directory = await mkdtemp(join(tmpdir(), 'teapilot-sim-'));
@@ -84,11 +84,26 @@ async function playWorld() {
   let runtime!: PlayRuntime;
   const gateway = await world.connect({ token: 't', allowedUserIds: [people.op.id], channelIds: [channelId], root: directory, startMode: 'ask' },
     { message: vi.fn(), command: vi.fn(), reply: vi.fn(), component: interaction => void runtime.interact(interaction), resendTarget: (channel, message) => runtime.resendTarget(channel, message), asides: { keep: vi.fn(), find: vi.fn(), summarise: vi.fn() } }, vi.fn());
-  runtime = new PlayRuntime({ store: new PlayStore(directory), surface: gateway.play, log: world.log, clock });
+  runtime = new PlayRuntime({ store: new PlayStore(directory), surface: gateway.play, log: world.log, clock, pictures: options.pictures });
   cleanups.push(() => runtime.close());
-  const { record } = await runtime.start({ title: 'Counter', channelId, conversation: 'dm:x', owner: { id: people.op.id, name: 'op' }, source: { kind: 'sandbox', code: counter } });
+  const { record } = await runtime.start({ title: 'Counter', channelId, conversation: 'dm:x', owner: { id: people.op.id, name: 'op' }, source: { kind: 'sandbox', code: options.code ?? counter } });
   return { world, clock, runtime, gateway, record, message: record.messageId! };
 }
+
+it('answers clicks with the new view and keeps an unchanged picture on the message', async () => {
+  const { world, message } = await playWorld({
+    pictures: { check() {}, render: async (_conversation, spec) => ({ name: spec.name, data: Buffer.from('board') }) },
+    code: `
+      import { app, button, embed, picture, row } from '@teapilot/discord-play';
+      export default app({ init: () => 0, update: s => s + 1,
+        view: s => ({ content: 'Count ' + s, embeds: [embed({ image: picture('board.png') })], rows: [row(button('add', 'Add'))] }) });`,
+  });
+  expect(await world.click('op', message, 'add')).toContain('Count 1');
+  const [picture] = world.find(message).files;
+  expect(await world.click('op', message, 'add')).toContain('Count 2');
+  expect(world.find(message).files).toEqual([picture]);
+  expect(world.warnings).toEqual([]);
+});
 
 it('routes clicks, selects and forms from simulated people through the real runtime', async () => {
   const { world, message } = await playWorld();

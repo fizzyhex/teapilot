@@ -87,11 +87,14 @@ afterEach(() => { vi.useRealTimers(); });
 it('edits play messages by id without fetching them first', async () => {
   const { gateway, channel } = await setup();
   channel.messages.fetch = vi.fn();
-  channel.messages.edit = vi.fn(async () => undefined);
+  channel.messages.edit = vi.fn(async () => ({ attachments: new Map([['a1', { id: 'a1', name: 'board.png' }]]) }));
   try {
     await gateway.play.edit('channel', 'uncached-message', { content: 'latest', embeds: [], components: [], allowedMentions: { parse: [] } });
     expect(channel.messages.fetch).not.toHaveBeenCalled();
     expect(channel.messages.edit).toHaveBeenCalledWith('uncached-message', expect.objectContaining({ content: 'latest', attachments: [] }));
+    // Pictures the message already has are kept by id, and the edit reports what the message carries now.
+    expect(await gateway.play.edit('channel', 'uncached-message', { content: 'next', embeds: [], components: [], allowedMentions: { parse: [] }, keep: ['a1'] })).toEqual([{ id: 'a1', name: 'board.png' }]);
+    expect(channel.messages.edit).toHaveBeenLastCalledWith('uncached-message', expect.objectContaining({ attachments: [{ id: 'a1' }], files: [] }));
   } finally { await gateway.close(); }
 });
 
