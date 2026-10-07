@@ -36,6 +36,28 @@ const sent = (body: any) => JSON.stringify(body.messages);
 const generation = (body: any) => /\[checkpoint (\d+)\] you are continuing/.exec(sent(body))?.[1];
 
 describe('workflow state', () => {
+  it('keeps actionable blockers through parking, refreshes them, and clears them on resume', async () => {
+    const scratch = await folder();
+    const flow = new Workflow('r1', 3, scratch);
+    const task = flow.openTask('controls', 'junior-alfa');
+    const blocker = { reason: 'missing API credentials', next: 'provide credentials or choose an offline approach', needsInput: true };
+    await taskwriteTool(flow).execute('x', { task: task.id, state: 'blocked', blocker });
+    expect(workflowTasks(flow)).toContain('blocked - missing API credentials; needs your input: provide credentials or choose an offline approach');
+    const record = await flow.checkpoint({ reason: 'time', forced: true, attempts: 0 });
+    flow.save({ ...record, status: 'parked' });
+    const restored = Workflow.open('r2', 3, scratch);
+    expect(restored.tasks.get(task.id)?.blocker).toEqual(blocker);
+    expect(continuation(restored.parked!)).toContain('needs your input: provide credentials');
+    await taskwriteTool(restored).execute('y', { task: task.id, state: 'blocked', note: 'source unavailable' });
+    expect(restored.tasks.get(task.id)?.blocker).toEqual({ reason: 'source unavailable' });
+    restored.move(task.id, 'running');
+    expect(restored.tasks.get(task.id)?.blocker).toBeUndefined();
+    expect(restored.tasks.get(task.id)?.note).toBeUndefined();
+    expect(workflowTasks(restored)).not.toContain('source unavailable');
+    expect(() => restored.move(task.id, 'awaiting_verification', undefined, blocker)).toThrow('a blocker needs the blocked state');
+    expect(restored.tasks.get(task.id)?.state).toBe('running');
+  });
+
   it('projects current task states and lets a repeated state refresh its note', async () => {
     const flow = new Workflow('r', 3);
     const task = flow.openTask('level data', 'junior-alfa');
@@ -171,6 +193,27 @@ describe('workflow state', () => {
 });
 
 describe('checkpoints through the host', () => {
+  it('carries actionable task blockers from the host into the Discord card', async () => {
+    const { StatusCard } = await import('../src/discord/render.js');
+    const card = new StatusCard(text => text, { now: () => 0 });
+    const blocker = { reason: 'missing API credentials', next: 'provide credentials or choose an offline approach', needsInput: true };
+    let turns = 0;
+    const f = await setup((body, req, res) => {
+      if (req.url === '/jev') return jev(res, 'coder.normal');
+      if (req.url?.endsWith('/models')) { res.end('{}'); return; }
+      if (toolNames(body).includes('report')) return completion(res, { tool: { name: 'report', arguments: { status: 'needs_input', summary: 'API access unavailable', question: 'credentials or offline?', blocker } } });
+      turns++;
+      return completion(res, turns === 1 ? { tool: { name: 'delegate_task', arguments: { label: 'Build controls', prompt: 'build controls', agent_type: 'write', artifacts: [] } } } : { text: 'please provide credentials or choose offline mode.' });
+    });
+    const seen: any[] = [];
+    await runHost(f.config, { cwd: f.cwd, prompt: 'Build controls', scratch: f.scratch }, {
+      approve: async () => true, onEvent: event => { seen.push(event); card.push(event); },
+    });
+    expect(seen.find(event => event.type === 'task' && event.state === 'blocked')).toMatchObject({ blocker });
+    expect(card.render()).toContain('blocked... missing API credentials');
+    expect(card.render()).toContain('needs your input: provide credentials or choose an offline approach');
+  });
+
   it('offers a checkpoint when delegation is spent, even with instructor calls remaining', async () => {
     const bodies: any[] = [];
     const f = await setup((body, req, res) => {

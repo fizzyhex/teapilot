@@ -395,6 +395,39 @@ it('returns actionable recovery with a blocked task and its report pointer', asy
   expect(workflow.tasks.get('t1')).toMatchObject({ state: 'blocked', result: { file: expect.stringContaining('turn-1.md') } });
 });
 
+it('captures reported blockers without mistaking instructor questions for user input', async () => {
+  const f = await setup((_body, _req, res) => completion(res, { text: 'unused' }));
+  const workflow = new Workflow('r', 3);
+  const allowance = new RequestAllowance({ calls: 60, modelCalls: 50, timeoutMs: 10_000, delegations: 6 }, undefined, { juniorPool: 60 });
+  const parent = { ...f, workflow, tier: 'normal' as const, workload: 'coder' as const, web: false, prompt: 'parent', approve: async () => true };
+  const blocker = { reason: 'missing API credentials', next: 'provide credentials or choose an offline approach', needsInput: true };
+  let turn = 0;
+  const delegated = delegateTool(parent, f.scratch, f.cwd, { pause() {}, resume() {} }, async child => {
+    turn++;
+    child.junior!.onReport(turn === 1 ? { status: 'needs_input', summary: 'cannot access the API', question: 'which approach?', blocker }
+      : { status: 'needs_input', summary: 'two options remain', question: 'which file should I inspect?' });
+    return { success: true, text: '', turns: 1, toolCalls: 0 };
+  }, allowance);
+  const args = { label: 'Build controls', prompt: 'build controls', agent_type: 'write', artifacts: [] };
+  const first = await delegated.tool.execute('a', args);
+  expect(workflow.tasks.get('t1')?.blocker).toEqual(blocker);
+  await delegated.tool.execute('b', { ...args, junior: (first.details as { junior: string }).junior });
+  expect(workflow.tasks.get('t1')?.blocker).toEqual({ reason: 'waiting for an answer', next: 'which file should I inspect?' });
+});
+
+it('prioritizes observed approval denial over a reported blocker', async () => {
+  const f = await setup((_body, _req, res) => completion(res, { text: 'unused' }));
+  const workflow = new Workflow('r', 3);
+  const allowance = new RequestAllowance({ calls: 40, modelCalls: 50, timeoutMs: 10_000, delegations: 6 }, undefined, { juniorPool: 40 });
+  const parent = { ...f, workflow, tier: 'normal' as const, workload: 'coder' as const, web: false, prompt: 'parent', approve: async () => true };
+  const delegated = delegateTool(parent, f.scratch, f.cwd, { pause() {}, resume() {} }, async child => {
+    child.junior!.onReport({ status: 'stuck', summary: 'retry it', blocker: { reason: 'missing permission', next: 'retry the denied action', needsInput: true } });
+    return { success: false, text: '', stopped: 'approval_denied', turns: 1, toolCalls: 0 };
+  }, allowance);
+  await delegated.tool.execute('a', { label: 'Build controls', prompt: 'build controls', agent_type: 'write', artifacts: [] });
+  expect(workflow.tasks.get('t1')?.blocker).toEqual({ reason: 'action not approved', next: 'choose a different approach; do not retry the denied action' });
+});
+
 it('publishes bounded required arguments without imposing a description word-count rule', async () => {
   const f = await setup((_body, _req, res) => completion(res, { text: 'unused' }));
   const allowance = new RequestAllowance({ calls: 40, modelCalls: 50, timeoutMs: 10_000, delegations: 6 });

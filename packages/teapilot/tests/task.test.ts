@@ -51,6 +51,20 @@ it('restores state without replenishing the same request or replacing its object
   expect(restored.snapshot().steps).toHaveLength(1);
 });
 
+it('persists redacted step blockers in views and catalogs, and drops them once work resumes', async () => {
+  const f = await setup();
+  const blocker = { reason: 'missing private-token', next: 'provide private-token or choose offline mode', needsInput: true };
+  await taskTools(f.task)[0]!.execute('x', { revision: 0, step: { id: 'controls', goal: 'controls', status: 'blocked', blocker } });
+  const expected = { reason: 'missing [REDACTED]', next: 'provide [REDACTED] or choose offline mode', needsInput: true };
+  expect(JSON.parse(f.task.project(instructor)).steps[0].blocker).toEqual(expected);
+  expect(JSON.parse(f.task.catalog(instructor, 'steps')).records[0].blocker).toEqual(expected);
+  const restored = TaskStore.open(f.config.stateDir, 'explicit-scope', 'ignored', f.scratch);
+  expect(JSON.parse(restored.record(instructor, 'controls')).blocker).toEqual(expected);
+  restored.update(instructor, { revision: 1, step: { id: 'controls', goal: 'controls', status: 'working', blocker } });
+  expect(restored.snapshot().steps[0]!.blocker).toBeUndefined();
+  expect(JSON.parse(restored.project(instructor)).steps[0].blocker).toBeUndefined();
+});
+
 it('renews the same request\'s counts, grant and deadline for a checkpoint\'s successor', async () => {
   const f = await setup();
   const limits = { calls: 10, modelCalls: 10, timeoutMs: 60_000, delegations: 1, instructorCalls: 4, juniorCalls: 8, juniorPool: 8, maxContinuationBatches: 0 };

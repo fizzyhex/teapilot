@@ -40,6 +40,50 @@ it('accepts Discord\'s own { text } and { url } shapes for an embed footer and i
   expect(preview(view)).toContain('-- Recipe 1 of 2');
 });
 
+it('moves large emoji boards into content without changing the app view or controls', () => {
+  const board = Array.from({ length: 15 }, (_, r) => (r < 13 ? '⬜' : '🟫').repeat(24)).join('\n');
+  const view = { content: '🍄 mario x:194 y:8', embeds: [embed({ description: board, color: 'red' })], rows: [row(button('left', '◀'))] };
+  const original = structuredClone(view);
+  const payload = renderView('mario', view);
+  expect(payload.content).toBe(`${view.content}\n${board}`);
+  expect(payload.embeds).toEqual([]);
+  expect(payload.components[0]!.components[0]!.custom_id).toBe('play:mario:left');
+  expect(view).toEqual(original);
+  expect(() => checkMessage(payload)).not.toThrow();
+});
+
+it('keeps metadata and media when moving a board, and moves multiple boards in order', () => {
+  const board = `${'🟩'.repeat(51)}\n${'⬜'.repeat(51)}`;
+  const payload = renderView('a1', { embeds: [embed({ title: 'Board', description: board, color: 'red', fields: [{ name: 'Score', value: '1' }], footer: 'round 1', image: 'https://example.com/a.png' }), embed({ description: board })] });
+  expect(payload.content).toBe(`${board}\n${board}`);
+  expect(payload.embeds).toEqual([{ title: 'Board', color: 0xed4245, fields: [{ name: 'Score', value: '1' }], footer: { text: 'round 1' }, image: { url: 'https://example.com/a.png' } }]);
+  expect(() => checkMessage(payload)).not.toThrow();
+});
+
+it('recognizes custom and multi-codepoint emoji boards', () => {
+  const board = `${'1️⃣'.repeat(50)}\n${'👩‍💻'.repeat(50)}\n<:tea:123456789012345678>`;
+  expect(renderView('a1', { embeds: [embed({ description: board })] }).content).toBe(board);
+});
+
+it('leaves small boards, prose and code blocks inside embeds', () => {
+  const small = `${'⬜'.repeat(10)}\n`.repeat(10).trim();
+  const large = `${'⬜'.repeat(24)}\n`.repeat(15).trim();
+  for (const description of [small, `board:\n${large}`, `\`\`\`\n${large}\n\`\`\``, '⬜'.repeat(101)]) {
+    const payload = renderView('a1', { embeds: [embed({ description })] });
+    expect(payload.content).toBe('');
+    expect(payload.embeds[0]!.description).toBe(description);
+  }
+});
+
+it('checks the combined message limit without silently clipping or leaving an oversized board in an embed', () => {
+  const board = `${'⬜'.repeat(24)}\n`.repeat(15).trim();
+  const content = 'x'.repeat(2000 - board.length - 1);
+  const payload = renderView('a1', { content, embeds: [embed({ description: board })] });
+  expect(payload.content).toHaveLength(2000);
+  expect(() => checkMessage(payload)).not.toThrow();
+  expect(() => renderView('a1', { content: `${content}x`, embeds: [embed({ description: board })] })).toThrow(/emoji boards.*2001 characters.*2000/);
+});
+
 it('sends emoji-only buttons without a blank label', () => {
   const payload = renderView('a1', { rows: [row(button('c0', ' ', { emoji: '⬛' }), button('c1', ' ', { emoji: '1️⃣' }), button('c2', ' ', { emoji: '❤' }))] });
   expect(payload.components[0]!.components[0]).toEqual({ type: 2, style: 2, emoji: { name: '⬛' }, custom_id: 'play:a1:c0' });

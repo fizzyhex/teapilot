@@ -135,6 +135,36 @@ it('lists a tip among the steps as a light bulb and its name', () => {
 });
 
 describe('status card tasks', () => {
+  it('shows a blocker and actionable input, redacts it, and clears it on resume', () => {
+    const card = new StatusCard(text => text.replaceAll('private-token', '[REDACTED]'), { now: () => 0 });
+    const task = { type: 'task', id: 't1', label: 'controls', state: 'blocked' };
+    const blocker = { reason: 'missing API credentials', next: 'provide credentials or choose an offline approach', needsInput: true };
+    card.push({ ...task, blocker });
+    expect(card.render()).toContain('⛔ t1 controls · blocked... missing API credentials\n-# needs your input: provide credentials or choose an offline approach');
+    card.summary({ status: 'blocked', spentUsd: 0 });
+    expect(card.details('blocked').text).toContain('needs your input: provide credentials');
+    card.push({ ...task, blocker: { reason: 'private-token **unavailable**', next: 'try private-token' } });
+    expect(card.render()).toContain('blocked... \\[REDACTED\\] \\*\\*unavailable\\*\\*');
+    expect(card.render()).toContain('next: try \\[REDACTED\\]');
+    expect(card.details('blocked').text).not.toContain('private-token');
+    card.push({ ...task, state: 'running', blocker });
+    expect(card.render()).not.toContain('blocked');
+    expect(card.render()).not.toContain('needs your input');
+    expect(card.details('running').text).not.toContain('missing API credentials');
+  });
+
+  it('handles missing reasons and keeps overflowing blocker entries whole', () => {
+    const card = new StatusCard(text => text, { now: () => 0 });
+    card.push({ type: 'task', id: 't0', label: 'controls', state: 'blocked' });
+    expect(card.render()).toContain('blocked... reason not recorded');
+    for (let index = 1; index <= 20; index++) card.push({ type: 'task', id: `t${index}`, label: 'controls', state: 'blocked', blocker: { reason: 'r'.repeat(240), next: 'n'.repeat(240), needsInput: true } });
+    expect(card.render().length).toBeLessThanOrEqual(2000);
+    expect(card.render()).toContain('more tasks (details)');
+    for (const line of card.render().split('\n').filter(line => line.startsWith('-# needs your input:'))) expect(line).toBe(`-# needs your input: …${'n'.repeat(160)}`);
+    const details = card.details('blocked');
+    expect(details.file?.content).toContain('t20 controls · blocked');
+  });
+
   it('lists delegated tasks while they are in progress, and drops them once settled', () => {
     const card = new StatusCard(text => text, { now: () => 0 });
     expect(card.push({ type: 'task', id: 't1', label: 'level data', junior: 'junior-alfa', state: 'running' })).toBe(true);

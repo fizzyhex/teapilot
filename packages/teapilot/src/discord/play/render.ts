@@ -63,6 +63,12 @@ function color(value: unknown): number | undefined {
 }
 // One emoji, including a bare pictograph such as ❤. The v flag is newer than the compile target, not than Node 22.
 const unicodeEmoji = new RegExp('^(?:\\p{RGI_Emoji}|\\p{Extended_Pictographic}\\uFE0F?)$', 'v');
+const boardEmoji = new RegExp('<a?:\\w{2,32}:\\d{17,20}>|\\p{RGI_Emoji}|\\p{Extended_Pictographic}\\uFE0F?', 'gv');
+/** Embed markdown stops rendering after roughly 100 elements; message content can show larger emoji boards. */
+function largeEmojiBoard(value: unknown): value is string {
+  if (typeof value !== 'string' || !value.includes('\n')) return false;
+  return [...value.matchAll(boardEmoji)].length > 100 && !value.replace(boardEmoji, '').trim();
+}
 /** Custom emoji arrive as <:name:id> or <a:name:id>; anything else must be one Unicode emoji, the only other kind Discord accepts. */
 function emoji(value: unknown): Record<string, unknown> | undefined {
   const text = string(value, 'Emoji', 100);
@@ -226,9 +232,17 @@ export function ignoredKeys(view: unknown): string {
 /** Checks a view against Discord's limits and renders it; `disabled` greys out every control, for a finished app. */
 export function renderView(playId: string, view: unknown, disabled = false): MessagePayload {
   if (!isRecord(view) || view.type !== undefined) throw new PlayError(`view() must return a message object { content?, embeds?, rows? }${isRecord(view) && typeof view.type === 'string' ? `, not a bare ${view.type}; wrap it, as in { ${view.type === 'embed' ? 'embeds' : 'rows'}: [...] }` : Array.isArray(view) ? ', not an array' : ''}.`);
-  const content = string(view.content, 'Message content', limits.content) ?? '';
+  let content = string(view.content, 'Message content', limits.content) ?? '';
   const pictures: PictureSpec[] = [];
-  const embeds = renderEmbeds(view.embeds, pictures);
+  const embeds = renderEmbeds(view.embeds, pictures).flatMap(embed => {
+    if (!largeEmojiBoard(embed.description)) return [embed];
+    const combined = [content, embed.description].filter(Boolean).join('\n');
+    if (combined.length > limits.content) throw new PlayError(`emoji boards too large for embed rendering are shown as message content; this view needs ${combined.length} characters, but Discord allows ${limits.content}.`);
+    content = combined;
+    const { description: _, ...rest } = embed;
+    // A colour or URL alone is not an embed; retain titles, fields, footers and media.
+    return rest.title || rest.footer || rest.image || rest.thumbnail || Array.isArray(rest.fields) && rest.fields.length ? [rest] : [];
+  });
   const seen = new Set<string>();
   // An empty row() is usually a conditional control that is hidden right now, so it is dropped.
   const rows = list(view.rows, 'rows', Infinity).filter(value => !(isRecord(value) && value.type === 'row' && Array.isArray(value.controls) && !value.controls.length));

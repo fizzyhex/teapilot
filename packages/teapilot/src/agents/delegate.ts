@@ -7,6 +7,7 @@ import type { AttemptInput, AttemptResult } from './run.js';
 import { instructor } from '../workspace/task.js';
 import { juniorMinCalls, type RequestAllowance } from './allowance.js';
 import type { SavedJunior } from './checkpoint.js';
+import { blockerParameters, blockerSchema, type Blocker } from '../workspace/blocker.js';
 
 export const juniorTypes = ['research', 'write', 'test'] as const;
 export type JuniorType = typeof juniorTypes[number];
@@ -23,7 +24,7 @@ export function juniorTools(tools: AgentTool[]): AgentTool[] {
  * the instructor's context grows by the instruction and the report alone, not by the junior's tool traffic.
  */
 
-export interface JuniorReport { status: 'done' | 'needs_input' | 'stuck'; summary: string; question?: string; evidence?: string[] }
+export interface JuniorReport { status: 'done' | 'needs_input' | 'stuck'; summary: string; question?: string; evidence?: string[]; blocker?: Blocker }
 /**
  * What a junior's own attempt is told: its name, which turn this is, where its report goes, and the folder its
  * instructor's file tools work in when neither has the repository, so both see the same files.
@@ -84,11 +85,13 @@ export function reportTool(role: JuniorRole): AgentTool {
       summary: Type.String({ minLength: 1, maxLength: 4000, description: 'Findings or changes, source locations/checks, and anything unresolved. Large evidence stays in artifacts.' }),
       question: Type.Optional(Type.String({ maxLength: 600, description: 'For needs_input: what you need answered.' })),
       evidence: Type.Optional(Type.Array(Type.String({ maxLength: 80 }), { maxItems: 4, description: 'Artifact or settled receipt IDs supporting this report, when available.' })),
+      blocker: Type.Optional(blockerParameters),
     }),
     execute: async (_id, args) => {
-      const { status, summary, question, evidence } = args as JuniorReport;
+      const { status, summary, question, evidence, blocker } = args as JuniorReport;
       if (status === 'needs_input' && !question?.trim()) throw new Error('needs_input requires a question for your instructor');
-      role.onReport({ status, summary: String(summary ?? '').slice(0, 4000), ...(question ? { question: String(question) } : {}), ...(evidence ? { evidence } : {}) });
+      const parsed = blocker === undefined ? undefined : blockerSchema.parse(blocker);
+      role.onReport({ status, summary: String(summary ?? '').slice(0, 4000), ...(question ? { question: String(question) } : {}), ...(evidence ? { evidence } : {}), ...(status !== 'done' && parsed ? { blocker: parsed } : {}) });
       return { content: [{ type: 'text', text: 'Report sent.' }], details: {}, terminate: true };
     },
   };
@@ -204,7 +207,11 @@ export function delegateTool(parent: AttemptInput, scratch: string, root: string
       const status = result.stopped || result.reason ? 'stuck' : report?.status ?? (result.success ? 'done' : 'stuck');
       await parent.telemetry.event('delegate', { junior: name, juniorType: type, turn: junior.turn, status, ...(stop ? { stopped: stop } : {}), turns: result.turns, toolCalls: result.toolCalls, allocation, used: allowance.usedBy(name), ms: Date.now() - started });
       if (work && flow) {
-        flow.move(work.id, status === 'done' ? 'awaiting_verification' : 'blocked', status === 'done' ? undefined : stop ?? report?.question ?? status);
+        const reasons: Record<string, string> = { approval_denied: 'action not approved', cancelled: 'work cancelled', timeout: 'out of time', tool_limit: 'out of tool calls', search_unavailable: 'web search unavailable' };
+        const reason = stop ? reasons[stop] ?? stop.replaceAll('_', ' ') : report?.blocker?.reason ?? (report?.question ? 'waiting for an answer' : report?.summary.trim().slice(0, 240) || 'reason not recorded');
+        const blocker: Blocker = stop ? { reason: reason.slice(0, 240), next: stop === 'approval_denied' ? 'choose a different approach; do not retry the denied action' : 'inspect the partial work/report before continuing' }
+          : report?.blocker ?? { reason, ...(report?.question ? { next: report.question.trim().slice(0, 240) } : {}) };
+        flow.move(work.id, status === 'done' ? 'awaiting_verification' : 'blocked', undefined, status === 'done' ? undefined : blocker);
         work.result = { status: report?.status ?? (status === 'done' ? 'done' : 'stuck'), ...(reportFile ? { file: reportFile } : {}), consumed: true };
       }
       const lines = [`Junior ${name}, turn ${junior.turn}: ${status}${stop ? ` (${stop})` : ''}`, `${work ? `Task ${work.id}: ${work.state.replaceAll('_', ' ')}${work.state === 'awaiting_verification' ? ' (check the result, then taskwrite verified, blocked or cancelled)' : ''}; ` : ''}label: ${description}; category: ${type}; allowance used: ${allowance.usedBy(name)}/${juniorProfiles.calls}`];

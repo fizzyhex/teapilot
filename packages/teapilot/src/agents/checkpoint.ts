@@ -8,6 +8,7 @@ import { Type } from '@earendil-works/pi-ai';
 import type { ConversationTurn } from '../integration/events.js';
 import { replaceFileSync } from '../replace.js';
 import type { JuniorType } from './delegate.js';
+import { blockerParameters, blockerSchema, type Blocker } from '../workspace/blocker.js';
 
 /**
  * Checkpoints: a long request hands off to a fresh orchestrator before its limits end the work. The host owns the
@@ -29,7 +30,7 @@ const transitions: Record<TaskState, readonly TaskState[]> = {
 export const terminalState = (state: TaskState) => !transitions[state].length;
 
 export interface WorkTask {
-  id: string; label: string; junior?: string; state: TaskState; note?: string;
+  id: string; label: string; junior?: string; state: TaskState; note?: string; blocker?: Blocker;
   /** The junior's last result: `consumed` once an orchestrator has been shown it. */
   result?: { status: 'done' | 'needs_input' | 'stuck' | 'interrupted'; file?: string; consumed: boolean };
 }
@@ -136,16 +137,24 @@ export class Workflow {
   }
   /** The task a junior is working through, if it is still open to more work. */
   taskOf(junior: string): WorkTask | undefined { return [...this.tasks.values()].findLast(task => task.junior === junior && !terminalState(task.state)); }
-  move(id: string, state: TaskState, note?: string): WorkTask {
+  move(id: string, state: TaskState, note?: string, blocker?: Blocker): WorkTask {
     const task = this.tasks.get(id);
     if (!task) throw new Error(`no task ${id}. tasks: ${[...this.tasks.keys()].join(', ') || 'none'}`);
+    const parsed = blocker === undefined ? undefined : blockerSchema.parse(blocker);
+    if (parsed && state !== 'blocked') throw new Error('a blocker needs the blocked state');
     if (task.state === state) {
-      if (note !== undefined) { task.note = note.trim().slice(0, 200) || undefined; this.onTask?.(task); }
+      if (note !== undefined || parsed) {
+        if (note !== undefined) task.note = note.trim().slice(0, 200) || undefined;
+        if (state === 'blocked') task.blocker = parsed ?? (task.note ? { reason: task.note } : undefined);
+        this.onTask?.(task);
+      }
       return task;
     }
     if (!transitions[task.state].includes(state)) throw new Error(`task ${id} is ${task.state}; it can become ${transitions[task.state].join(', ') || 'nothing (final)'}`);
+    if (task.state === 'blocked' || state === 'blocked') task.note = undefined;
     task.state = state;
     if (note !== undefined) task.note = note.trim().slice(0, 200) || undefined;
+    task.blocker = state === 'blocked' ? parsed ?? (task.note ? { reason: task.note } : undefined) : undefined;
     this.onTask?.(task);
     return task;
   }
@@ -259,7 +268,12 @@ const failureAdvice: Partial<Record<HandoffReason, string>> = {
   search_unavailable: 'web search is unavailable. stop now and tell the user, or continue offline if appropriate.',
   missing_tool_call: 'the last announced tool call did not run. inspect existing work and continue with a simpler approach; do not reconstruct or replay the missing call.',
 };
-const taskLine = (task: WorkTask) => `task ${task.id} "${task.label}"${task.junior ? ` (${task.junior})` : ''}: ${task.state.replaceAll('_', ' ')}${task.note ? ` - ${task.note}` : ''}${task.result && !terminalState(task.state) ? `; result ${task.result.status}${task.result.consumed ? '' : ', not yet read by you'}${task.result.file ? ` (${task.result.file})` : ''}` : ''}`;
+const taskLine = (task: WorkTask) => {
+  const reason = task.state === 'blocked' ? task.blocker?.reason ?? task.note ?? 'reason not recorded' : task.note;
+  const next = task.state === 'blocked' && task.blocker?.next ? `; ${task.blocker.needsInput ? 'needs your input' : 'next'}: ${task.blocker.next}` : '';
+  const result = task.result && !terminalState(task.state) ? `; result ${task.result.status}${task.result.consumed ? '' : ', not yet read by you'}${task.result.file ? ` (${task.result.file})` : ''}` : '';
+  return `task ${task.id} "${task.label}"${task.junior ? ` (${task.junior})` : ''}: ${task.state.replaceAll('_', ' ')}${reason ? ` - ${reason}` : ''}${next}${result}`;
+};
 
 /** Live bookkeeping survives compaction without carrying the juniors' transcripts or reports inline. */
 export function workflowTasks(flow: Workflow): string | undefined {
@@ -339,10 +353,11 @@ export function taskwriteTool(flow: Workflow): AgentTool {
       task: Type.String({ maxLength: 12, description: 'Task id from delegate_task, such as t1.' }),
       state: Type.Union([Type.Literal('verified'), Type.Literal('blocked'), Type.Literal('cancelled')]),
       note: Type.Optional(Type.String({ maxLength: 200, description: 'Why, briefly.' })),
+      blocker: Type.Optional(blockerParameters),
     }),
     execute: async (_id, args) => {
-      const { task, state, note } = args as { task: string; state: TaskState; note?: string };
-      const moved = flow.move(String(task), state, note);
+      const { task, state, note, blocker } = args as { task: string; state: TaskState; note?: string; blocker?: Blocker };
+      const moved = flow.move(String(task), state, note, blocker);
       return { content: [{ type: 'text', text: taskLine(moved) }], details: {} };
     },
   };

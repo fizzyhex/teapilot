@@ -2,6 +2,7 @@ import { MESSAGE_LIMIT } from 'pretty-send';
 import { describeCompaction, describeTip, describeTool } from '../presentation.js';
 import type { HostEvent } from '../integration/events.js';
 import { interruptionDetails, type Interruption } from '../interruption.js';
+import { blockerSchema, type Blocker } from '../workspace/blocker.js';
 
 export { chunk, MESSAGE_LIMIT } from 'pretty-send';
 /** Starts the custom id of a table's "view source" button. */
@@ -70,7 +71,7 @@ const taskIcons: Record<string, string> = { open: '♟️', running: '♟️', a
 export class StatusCard {
   private readonly steps: Step[] = [];
   /** Delegated tasks by id; those not yet verified or cancelled show under the header. */
-  private readonly tasks = new Map<string, { label: string; junior?: string; state: string }>();
+  private readonly tasks = new Map<string, { label: string; junior?: string; state: string; blocker?: Blocker }>();
   private phase: CardPhase = 'thinking';
   private running?: string;
   private answer = '';
@@ -95,7 +96,9 @@ export class StatusCard {
     if (event.type === 'compaction' || event.type === 'compaction_failed') { this.phase = 'thinking'; this.steps.push({ note: this.redact(describeCompaction(event)) }); return true; }
     if (event.type === 'tip') { this.steps.push({ note: describeTip(event) }); return true; }
     if (event.type === 'task' && typeof event.id === 'string') {
-      this.tasks.set(event.id, { label: this.redact(String(event.label ?? '')), junior: typeof event.junior === 'string' ? event.junior : undefined, state: String(event.state) });
+      const parsed = event.state === 'blocked' ? blockerSchema.safeParse(event.blocker) : undefined;
+      const blocker = parsed?.success ? { ...parsed.data, reason: this.redact(parsed.data.reason), ...(parsed.data.next ? { next: this.redact(parsed.data.next) } : {}) } : undefined;
+      this.tasks.set(event.id, { label: this.redact(String(event.label ?? '')), junior: typeof event.junior === 'string' ? event.junior : undefined, state: String(event.state), blocker });
       return true;
     }
     return false;
@@ -125,9 +128,17 @@ export class StatusCard {
     const tools = this.steps.flatMap(step => 'reasoning' in step ? [] : [line(step)]).map(step => step.replace(/\s+/g, ' ').trim()).map(text => `-# ${escapeMarkdown(text.length > 150 ? `${text.slice(0, 147)}...` : text)}`);
     let shown = tools.slice(-(this.options.maxSteps ?? 8));
     const ongoing = [...this.tasks].filter(([, task]) => task.state !== 'verified' && task.state !== 'cancelled')
-      .map(([id, task]) => `-# ${taskIcons[task.state] ?? '♟️'} ${id} ${escapeMarkdown(task.label.slice(0, 60))}${task.junior ? ` · ${escapeMarkdown(task.junior)}` : ''} · ${task.state.replaceAll('_', ' ')}`);
-    const compose = () => [header, ...ongoing, ...(tools.length > shown.length ? [`-# … ${tools.length - shown.length} earlier`] : []), ...shown, ...(preview ? [preview] : [])].join('\n');
+      .map(([id, task]) => {
+        const title = `-# ${taskIcons[task.state] ?? '♟️'} ${id} ${escapeMarkdown(task.label.slice(0, 60))}${task.junior ? ` · ${escapeMarkdown(task.junior)}` : ''} · ${task.state.replaceAll('_', ' ')}`;
+        if (task.state !== 'blocked') return title;
+        const reason = escapeMarkdown(tail(task.blocker?.reason ?? 'reason not recorded', 160));
+        const next = task.blocker?.next ? `\n-# ${task.blocker.needsInput ? 'needs your input' : 'next'}: ${escapeMarkdown(tail(task.blocker.next, 160))}` : task.blocker?.needsInput ? '\n-# needs your input' : '';
+        return `${title}... ${reason}${next}`;
+      });
+    let omittedTasks = 0;
+    const compose = () => [header, ...ongoing, ...(omittedTasks ? [`-# … ${omittedTasks} more tasks (details)`] : []), ...(tools.length > shown.length ? [`-# … ${tools.length - shown.length} earlier`] : []), ...shown, ...(preview ? [preview] : [])].join('\n');
     while (shown.length && compose().length > MESSAGE_LIMIT) shown = shown.slice(1);
+    while (ongoing.length && compose().length > MESSAGE_LIMIT) { ongoing.pop(); omittedTasks++; }
     return compose().slice(0, MESSAGE_LIMIT);
   }
 
@@ -150,11 +161,17 @@ export class StatusCard {
       this.result.requestId ? `request ${escapeMarkdown(this.redact(this.result.requestId))}` : undefined,
       this.result.interruption ? this.redact(interruptionDetails(this.result.interruption)) : undefined,
     ].filter(Boolean).join('\n') : '';
+    const tasks = [...this.tasks].filter(([, task]) => task.state !== 'verified' && task.state !== 'cancelled').map(([id, task]) => {
+      const title = `${id} ${task.label} · ${task.state.replaceAll('_', ' ')}`;
+      if (task.state !== 'blocked') return title;
+      const next = task.blocker?.next ? `\n${task.blocker.needsInput ? 'needs your input' : 'next'}: ${task.blocker.next}` : task.blocker?.needsInput ? '\nneeds your input' : '';
+      return `${title}... ${task.blocker?.reason ?? 'reason not recorded'}${next}`;
+    }).join('\n');
     const markdown = steps.map(step => 'reasoning' in step ? step.reasoning.trim().split('\n').map((line, index) => `> ${index ? '' : '💭 '}${escapeMarkdown(line)}`).join('\n') : `- ${escapeMarkdown(line(step))}`).join('\n');
-    const text = [title, diagnostics || undefined, markdown || (this.ended === undefined ? 'No steps yet.' : 'No steps.')].filter(Boolean).join('\n');
+    const text = [title, diagnostics || undefined, tasks ? escapeMarkdown(tasks) : undefined, markdown || (this.ended === undefined ? 'No steps yet.' : 'No steps.')].filter(Boolean).join('\n');
     if (text.length <= MESSAGE_LIMIT) return { text };
     const plain = steps.map(step => 'reasoning' in step ? `\n${step.reasoning.trim()}\n` : `- ${line(step)}`).join('\n');
-    return { text: `${title}\nThe full log is attached.`, file: { name: 'turn-details.md', content: `${this.facts(status)}\n\n${diagnostics ? `${diagnostics}\n\n` : ''}${plain.trim()}\n` } };
+    return { text: `${title}\nThe full log is attached.`, file: { name: 'turn-details.md', content: `${this.facts(status)}\n\n${diagnostics ? `${diagnostics}\n\n` : ''}${tasks ? `${tasks}\n\n` : ''}${plain.trim()}\n` } };
   }
 }
 

@@ -129,7 +129,7 @@ export async function runHost(config: Config, request: HostRequest, dependencies
   const workflow = checkpointLimit > 0 && !request.side && !request.readOnly
     ? Workflow.open(requestId, checkpointLimit, request.scratch && config.scratchpad?.enabled !== false ? request.scratch : undefined) : undefined;
   if (workflow) {
-    workflow.onTask = task => dependencies.onEvent?.({ type: 'task', id: task.id, label: task.label, junior: task.junior, state: task.state });
+    workflow.onTask = task => dependencies.onEvent?.({ type: 'task', id: task.id, label: task.label, junior: task.junior, state: task.state, blocker: task.state === 'blocked' ? task.blocker ?? (task.note ? { reason: task.note } : undefined) : undefined });
     // Tasks a parked workflow left open are still in progress here.
     for (const task of workflow.tasks.values()) workflow.onTask(task);
   }

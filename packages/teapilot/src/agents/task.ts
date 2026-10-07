@@ -1,6 +1,7 @@
 import type { AgentTool } from '@earendil-works/pi-agent-core';
 import { Type } from '@earendil-works/pi-ai';
 import { instructor, type TaskActor, type TaskStore, type TaskUpdate } from '../workspace/task.js';
+import { blockerParameters } from '../workspace/blocker.js';
 
 /** Small, shallow schemas: bookkeeping is optional and never replaces execution or verification. */
 export function taskTools(task: TaskStore, actor: TaskActor = instructor): AgentTool[] {
@@ -17,7 +18,7 @@ export function taskTools(task: TaskStore, actor: TaskActor = instructor): Agent
        query: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: 'Literal catalog text filter.' })),
        tool: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
        request: Type.Optional(Type.String({ minLength: 1, maxLength: 100 })),
-      step: Type.Optional(Type.Object({ id: ref, goal: Type.String({ minLength: 1, maxLength: 240 }), status: Type.Union(['ready', 'working', 'blocked', 'done'].map(value => Type.Literal(value))), acceptance: Type.Optional(Type.String({ maxLength: 240 })), evidence: Type.Optional(evidence) })),
+      step: Type.Optional(Type.Object({ id: ref, goal: Type.String({ minLength: 1, maxLength: 240 }), status: Type.Union(['ready', 'working', 'blocked', 'done'].map(value => Type.Literal(value))), acceptance: Type.Optional(Type.String({ maxLength: 240 })), evidence: Type.Optional(evidence), blocker: Type.Optional(blockerParameters) })),
       claim: Type.Optional(Type.Object({ id: ref, text: Type.String({ minLength: 1, maxLength: 400 }), basis: Type.Union(['observed', 'inferred', 'reported'].map(value => Type.Literal(value))), evidence })),
       remove_step: Type.Optional(ref), remove_claim: Type.Optional(ref),
     }),

@@ -9,12 +9,13 @@ import { scratchLimits, type Kind, type Saved } from './scratch.js';
 import type { RequestRecovery } from '../agents/recovery.js';
 import { planReferenceSchema, type PlanReference } from './plan.js';
 import { skillIdLimit } from './skills.js';
+import { blockerSchema } from './blocker.js';
 
 /** Bounds apply to stored working state as well as the view: history belongs in session transcripts. */
 export const taskLimits = { steps: 8, claims: 16, artifacts: 128, receipts: 64, projectionChars: 6000, retrievalChars: scratchLimits.retrievalChars, stateBytes: 512 * 1024 };
 const id = z.string().regex(/^[\w-]{1,80}$/);
 const refs = z.array(id).max(4);
-export const stepSchema = z.object({ id, goal: z.string().min(1).max(240), status: z.enum(['ready', 'working', 'blocked', 'done']), acceptance: z.string().max(240).default(''), evidence: refs.default([]) }).strict();
+export const stepSchema = z.object({ id, goal: z.string().min(1).max(240), status: z.enum(['ready', 'working', 'blocked', 'done']), acceptance: z.string().max(240).default(''), evidence: refs.default([]), blocker: blockerSchema.optional() }).strict();
 export const claimSchema = z.object({ id, text: z.string().min(1).max(400), basis: z.enum(['observed', 'inferred', 'reported']), evidence: refs.min(1) }).strict();
 const sourceSchema = z.object({ path: z.string().max(2048).optional(), url: z.string().max(2048).optional(), query: z.string().max(200).optional(), offset: z.number().int().nonnegative().optional(), limit: z.number().int().positive().optional(), skill: z.object({ id: z.string().min(1).max(skillIdLimit), file: z.string().min(1).max(240), set: z.string().max(skillIdLimit).optional(), revision: z.string().regex(/^[\da-f]{40}$/).optional() }).strict().optional() }).strict();
 const artifactSchema = z.object({ id, sha256: z.string().regex(/^[a-f0-9]{64}$/), path: z.string().max(2048), bytes: z.number().int().nonnegative().max(8 * 1024 * 1024), lines: z.number().int().nonnegative(), complete: z.boolean(), kind: z.enum(['logs', 'pages', 'outputs']), actor: id, producer: id, producerTool: z.string().max(80).optional(), request: z.string().max(100).optional(), origin: z.enum(['file', 'inventory', 'saved-output', 'transcript']).optional(), source: sourceSchema.optional(), sourceEpoch: z.number().int().nonnegative().optional(), at: z.number() }).strict();
@@ -397,7 +398,8 @@ export class TaskStore {
         const step = stepSchema.parse(input.step); validate(step.evidence);
         if (next.steps.some(item => item.id === step.id && item.actor !== actor.name)) throw new Error('step ID belongs to another actor');
         const index = next.steps.findIndex(item => item.id === step.id && item.actor === actor.name);
-        const value = { ...step, goal: this.redact(step.goal), acceptance: this.redact(step.acceptance), actor: actor.name, request: next.request?.id };
+        const blocker = step.status === 'blocked' && step.blocker ? { ...step.blocker, reason: this.redact(step.blocker.reason), ...(step.blocker.next ? { next: this.redact(step.blocker.next) } : {}) } : undefined;
+        const value = { ...step, blocker, goal: this.redact(step.goal), acceptance: this.redact(step.acceptance), actor: actor.name, request: next.request?.id };
         if (index < 0) next.steps.push(value); else next.steps[index] = value;
       }
       if (input.claim) {
@@ -528,7 +530,7 @@ export class TaskStore {
       const searchable = kind === 'artifacts' ? { ...item, tool: filterTool, request: filterRequest, source: sourceData } : item;
       if (kind === 'artifacts') value = { id: item.id, kind: item.kind, actor: item.actor, producer: item.producer, tool: brief(item.producerTool ?? producer?.tool ?? '', 32), request: brief(item.request ?? producer?.request ?? '', 32), complete: item.complete, bytes: item.bytes, origin: artifactOrigin, source, stale: (artifactOrigin === 'file' || artifactOrigin === 'inventory') && this.state.sourceEpoch > 0 && artifactEpoch !== this.state.sourceEpoch };
       else if (kind === 'receipts') value = { id: item.id, actor: item.actor, request: brief(item.request, 32), tool: brief(item.tool, 32), summary: brief(item.summary, 48), origin: item.origin, source, status: item.status, stale: Boolean(item.stale || ((item.origin === 'file' || item.origin === 'inventory') && this.state.sourceEpoch > 0 && item.sourceEpoch !== this.state.sourceEpoch)), uncertainSource: Boolean(item.uncertainSource) };
-      else if ('goal' in item) value = { id: item.id, actor: item.actor, goal: brief(item.goal, 80), status: item.status };
+      else if ('goal' in item) value = { id: item.id, actor: item.actor, goal: brief(item.goal, 80), status: item.status, blocker: item.blocker };
       else value = { id: item.id, actor: item.actor, text: brief(item.text, 80), basis: item.basis };
       if (filters.query && !JSON.stringify(searchable).includes(filters.query)) return;
       if (filters.tool && filterTool !== filters.tool) return;
