@@ -30,6 +30,10 @@ it('registers reply as a slash command and a message context menu without sessio
   expect(commandText('reply', null, 'hello')).toBeUndefined();
 });
 
+it('registers repost this! in the Apps context menu for server and user installations', () => {
+  expect(commandDefinitions).toContainEqual({ type: 3, name: 'repost this!', integration_types: [0, 1], contexts: [0, 1, 2] });
+});
+
 it('offers reply in user-installed contexts and can drop that for server-only registration', () => {
   const reply = commandDefinitions.filter(command => command.name.toLowerCase() === 'reply');
   expect(reply).toHaveLength(2);

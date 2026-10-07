@@ -111,6 +111,7 @@ export class World {
   private counters = { message: 0, thread: 0, approval: 0, browse: 0 };
   /** Status cards by message id, as the gateway keeps them; a restart forgets them. */
   private cards = new Map<string, CardControls['press']>();
+  private cardResenders = new Map<string, () => Message>();
   /** Plans by the id of their last message, as the gateway keeps them; a restart forgets them. */
   private plans = new Map<string, PlanControls>();
   /** Folder views under /workspace tree, by nonce, as the gateway keeps them; a restart forgets them. */
@@ -186,6 +187,7 @@ export class World {
       close: async () => {
         this.handlers = undefined;
         this.cards.clear();
+        this.cardResenders.clear();
         this.plans.clear();
         this.browsing.clear();
         this.panels.clear();
@@ -258,6 +260,7 @@ export class World {
 
   /** With `replyTo`, the first message replies to it, as the gateway's reply transport does. */
   transport(channel: Channel, replyTo?: Message): DiscordTransport {
+    const cardIds = new Map<string, string>();
     const reply = () => { const to = replyTo; replyTo = undefined; return to; };
     return {
       send: async (text, options) => this.post(channel, bot.name, { content: text, ...(options?.silent ? { flags: 1 << 12 } : {}) }, undefined, reply()).id,
@@ -269,9 +272,20 @@ export class World {
           ...(controls.stop ? [{ type: 2, style: 2, label: 'Stop', custom_id: 'teapilot-card:stop' }] : []),
           { type: 2, style: 2, label: 'Details', custom_id: 'teapilot-card:details' },
         ] }] };
-        const message = id ? this.find(id) : this.post(channel, bot.name, payload);
+        const message = id ? this.find(cardIds.get(id) ?? id) : this.post(channel, bot.name, payload);
         if (id) this.update(message, payload);
         this.cards.set(message.id, controls.press);
+        const register = (current: Message) => this.cardResenders.set(current.id, () => {
+          const fresh = this.post(channel, bot.name, { content: current.content, components: current.components });
+          for (const [alias, latest] of cardIds) if (latest === current.id) cardIds.set(alias, fresh.id);
+          cardIds.set(current.id, fresh.id);
+          this.cards.set(fresh.id, this.cards.get(current.id)!);
+          this.cards.delete(current.id); this.cardResenders.delete(current.id);
+          register(fresh);
+          this.update(current, { content: '-# this card moved to a newer message below.', components: [] });
+          return fresh;
+        });
+        register(message);
         return message.id;
       },
       plan: async (messages, controls, ids = []) => {
@@ -408,6 +422,17 @@ export class World {
     if (custom.startsWith('teapilot-card:')) return this.pressCard(person, message, custom.slice('teapilot-card:'.length) as CardButton);
     if (custom.startsWith(viewSourcePrefix)) return this.pressViewSource(person, message, custom);
     return this.interact(person, message, 'button', custom, `clicked [${this.label(control)}]`);
+  }
+
+  /** The Apps → repost this! message context menu, independent of the message's controls. */
+  async repost(name: string, ref: string): Promise<string> {
+    const person = this.person(name);
+    const message = this.visible(ref, person);
+    const resend = this.cardResenders.get(message.id);
+    if (resend) return `${person.name} used Apps → repost this! on ${message.id}.\n${this.render(resend())}`;
+    const playId = this.handlers?.resendTarget?.(message.channel.id, message.id);
+    if (!playId) return this.render(this.post(message.channel, bot.name, { content: 'this message is not an available card or app.' }, person.name));
+    return this.interact(person, message, 'resend', `play:${playId}:resend`, 'used Apps → repost this!');
   }
 
   /** Like the real gateway: operators may answer approvals, and whitelisted users the ones that allow them. */
@@ -655,6 +680,7 @@ ${this.render(this.post(form.message.channel, bot.name, { content: note }, perso
   private async interact(person: Person, message: Message, kind: PlayInteraction['kind'], custom: string, action: string, values?: string[], fields?: Record<string, string>): Promise<string> {
     const handlers = this.handlers;
     if (!handlers) throw new SimError('teapilot is not connected.');
+    const resend = kind === 'resend';
     const target = parseCustomId(custom);
     if (!target) throw new SimError(`${custom} is not a discord.play control.`);
     const seen: string[] = [`${person.name} ${action} on ${message.id}.`];
@@ -671,7 +697,14 @@ ${this.render(this.post(form.message.channel, bot.name, { content: note }, perso
       seen.push(this.render(this.post(message.channel, bot.name, { content, embeds }, person.name)));
     };
     const interaction: PlayInteraction = {
-      playId: target.playId, controlId: target.id, messageId: message.id, kind, user: { id: person.id, name: person.name }, values, fields,
+      playId: target.playId, controlId: target.id, messageId: message.id, kind: resend ? 'resend' : kind, user: { id: person.id, name: person.name }, values, fields,
+      post: resend ? async payload => {
+        if (state !== 'deferred') throw new Error('repost needs deferUpdate first.');
+        const fresh = this.post(message.channel, bot.name, payload);
+        seen.push(this.render(fresh));
+        notes++;
+        return { id: fresh.id, edit: async next => this.update(fresh, next) };
+      } : undefined,
       openModal: async payload => {
         if (kind === 'modal') throw new Error('A form cannot open another form.');
         first('showModal');

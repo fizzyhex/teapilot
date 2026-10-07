@@ -13,6 +13,28 @@ const owner = { id: '111111111111111111', name: 'owner' };
 const friend = '222222222222222222';
 const stranger = '333333333333333333';
 
+it('repost clicks preserve state, bypass player restrictions, and retire interaction-hosted copies', async () => {
+  const { runtime, store } = await setup();
+  const edit = vi.fn(async (_payload: MessagePayload) => {});
+  const { record } = await runtime.start({ title: 'Counter', channelId: 'c', conversation: 'conv', owner, participants: 'invoker', source: { kind: 'sandbox', code: counter }, post: async () => ({ id: 'original', edit }) });
+  await runtime.interact(act(record.id, 'add', owner.id, { messageId: 'original' }).interaction);
+  const post = vi.fn(async (_payload: MessagePayload) => ({ id: 'reposted', edit }));
+  const click = act(record.id, '', stranger, { kind: 'resend', messageId: 'original', post });
+  await runtime.interact(click.interaction);
+  expect(click.seen.deferred).toBe(true);
+  expect(post).toHaveBeenCalledOnce();
+  expect(record.state).toMatchObject({ count: 1 });
+  expect(record.messageId).toBe('reposted');
+  expect(store.all()[0]!.messageId).toBe('reposted');
+  await vi.waitFor(() => expect(click.seen.updates).toContainEqual(expect.objectContaining({ content: expect.stringContaining('moved'), components: [] })));
+  const stale = act(record.id, '', stranger, { kind: 'resend', messageId: 'original', post });
+  await runtime.interact(stale.interaction);
+  expect(stale.seen.replies.join('')).toContain('moved');
+  expect(post).toHaveBeenCalledOnce();
+  await runtime.interact(act(record.id, 'add', owner.id, { messageId: 'reposted' }).interaction);
+  expect(record.state).toMatchObject({ count: 2 });
+});
+
 it('reports fresh/live state, idle and skipped actions without claiming correctness', async () => {
   const { runtime } = await setup();
   const source = { kind: 'sandbox' as const, code: counter };

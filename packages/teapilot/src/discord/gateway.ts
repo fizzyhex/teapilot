@@ -5,7 +5,7 @@ import type { IncomingMessage } from './access.js';
 import type { SideAnswer } from './aside-store.js';
 import type { CardButton, CardControls, DiscordTransport } from './bridge.js';
 import { browseGone, browseModal, browseModalPrefix, browsePrefix, browseRows, browseSubmit, type BrowseAction, type BrowseSession, type WorkspaceBrowser } from './browse.js';
-import { attachmentOption, commandDefinitions, commandText, interactionLifetimeMs, promptAttachments, promptCommand, promptSetup, replyCommand, replyMenu, treeOption, withoutUserInstall, type PromptSetup } from './commands.js';
+import { attachmentOption, commandDefinitions, commandText, interactionLifetimeMs, promptAttachments, promptCommand, promptSetup, replyCommand, replyMenu, resendMenu, treeOption, withoutUserInstall, type PromptSetup } from './commands.js';
 import { isAside } from '../chat.js';
 import type { Permission } from '../execution/grants.js';
 import { grantPrefix, grantsGone, grantView, type GrantPanel } from './grants-panel.js';
@@ -101,6 +101,7 @@ export interface GatewayChoice {
   transport(): DiscordTransport;
 }
 export interface GatewayHandlers {
+  resendTarget?(channelId: string, messageId: string): string | undefined;
   openBrowser?(channelId: string, messageId: string, user: { id: string; name: string }): string | undefined;
   openEditorForMessage?(messageId: string, user: { id: string; name: string }): string | null | undefined;
   bindFileReply?(messageId: string, conversation: string, path: string, user: { id: string; name: string }): void;
@@ -222,6 +223,11 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
   };
   /** Status cards posted through interactions, whose Resume button carries their turn's updates on through a new one. */
   const resumers = new Map<string, (click: ButtonInteraction) => Promise<void>>();
+  const resenders = new Map<string, (menu: MessageContextMenuCommandInteraction) => Promise<void>>();
+  const rememberResend = (id: string, resend: (menu: MessageContextMenuCommandInteraction) => Promise<void>) => {
+    resenders.set(id, resend);
+    if (resenders.size > cardLimit) resenders.delete(resenders.keys().next().value!);
+  };
   /** A status card: links in its previews stay text rather than growing embeds. `paused` adds the note and button to resume its updates. */
   const cardPayload = (text: string, controls: CardControls, paused = false): CardMessage => ({
     content: paused ? `${text.slice(0, MESSAGE_LIMIT - pauseNote.length - 2)}\n\n${pauseNote}` : text, flags: MessageFlags.SuppressEmbeds, ...quiet,
@@ -311,6 +317,11 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
   /** Posts in `channel`; with `replyTo`, the first message replies to it, without pinging its author. */
   const transport = (channel: SendableChannels, replyTo?: Message): DiscordTransport => {
     const sent = new Map<string, Message>();
+    const snapshots = new Map<string, { payload: CardMessage; controls: CardControls }>();
+    let cardChain: Promise<unknown> = Promise.resolve();
+    const serialCard = <T,>(run: () => Promise<T>): Promise<T> => {
+      const result = cardChain.then(run); cardChain = result.catch(noop); return result;
+    };
     const reply = () => {
       const to = replyTo; replyTo = undefined;
       return to ? { reply: { messageReference: to, failIfNotExists: false }, allowedMentions: { parse: [] as [], repliedUser: false } } : quiet;
@@ -320,12 +331,26 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       async sendFiles(text, files) { return (await channel.send({ content: text, files: attachments(files), ...reply() })).id; },
       async answer(message) { const posted = await channel.send({ ...answerPayload(message), ...reply() }); sent.set(posted.id, posted); return posted.id; },
       async edit(id, text) { const message = sent.get(id) ?? await channel.messages.fetch(id); await message.edit({ content: text, ...quiet }); },
-      async card(text, controls, id) {
+      card(text, controls, id) { return serialCard(async () => {
         const payload = cardPayload(text, controls);
         const message = id ? await (sent.get(id) ?? await channel.messages.fetch(id)).edit(payload) : await channel.send(payload);
+        if (id) sent.set(id, message);
         sent.set(message.id, message); remember(message.id, controls);
+        snapshots.set(message.id, { payload, controls });
+        const register = (current: Message) => rememberResend(current.id, click => serialCard(async () => {
+          if ((sent.get(current.id) ?? current).id !== current.id) throw new Error('this card moved to a newer message below.');
+          const snapshot = snapshots.get(current.id)!;
+          const posted = await channel.send(snapshot.payload);
+          for (const [alias, entry] of sent) if (entry.id === current.id) sent.set(alias, posted);
+          sent.set(posted.id, posted); remember(posted.id, snapshot.controls);
+          snapshots.delete(current.id); snapshots.set(posted.id, snapshot);
+          register(posted);
+          resenders.delete(current.id); cards.delete(current.id);
+          await current.edit({ content: '-# this card moved to a newer message below.', components: [], ...quiet }).catch(noop);
+        }));
+        register(message);
         return message.id;
-      },
+      }); },
       async plan(messages, controls, ids = []) {
         const posted: string[] = [];
         for (const [index, embeds] of messages.entries()) {
@@ -348,10 +373,10 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
   };
 
   /** Posts and edits through `interaction`'s webhook; a click's own message is edited through its reply. */
-  const webhookLink = (interaction: ChatInputCommandInteraction | MessageContextMenuCommandInteraction | ButtonInteraction, hidden: boolean): FeedLink<FeedMessage> => {
+  const webhookLink = (interaction: ChatInputCommandInteraction | MessageContextMenuCommandInteraction | ButtonInteraction, hidden: boolean, firstReply = true): FeedLink<FeedMessage> => {
     const expires = interaction.createdTimestamp + interactionLifetimeMs;
     // A click has no deferred message of its own: its reply is the message it was pressed on, so everything is a follow-up.
-    let first = !interaction.isButton();
+    let first = firstReply && !interaction.isButton();
     const live = () => { if (Date.now() > expires) throw new Error('This Discord interaction expired after 15 minutes. Run /reply again.'); };
     return {
       expires,
@@ -376,11 +401,21 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
   const interactionTransport = (interaction: ChatInputCommandInteraction | MessageContextMenuCommandInteraction | ButtonInteraction,
     { hidden = false, buttons = () => [] }: { hidden?: boolean; buttons?: () => Array<ActionRowBuilder<MessageActionRowComponentBuilder>> } = {}): DiscordTransport => {
     let controls: CardControls | undefined;
+    let cardChain: Promise<unknown> = Promise.resolve();
+    const serialCard = <T,>(run: () => Promise<T>): Promise<T> => {
+      const result = cardChain.then(run); cardChain = result.catch(noop); return result;
+    };
     const feed: InteractionFeed<FeedMessage> = new InteractionFeed(webhookLink(interaction, hidden), {
       log: text => log(`Discord: ${text}`),
       onCard: id => {
         if (controls) remember(id, controls);
-        resumers.delete(id); resumers.set(id, click => feed.resume(webhookLink(click, hidden)));
+        resumers.delete(id); resumers.set(id, click => serialCard(() => feed.resume(webhookLink(click, hidden))));
+        rememberResend(id, click => serialCard(async () => {
+          const old = click.targetMessage.id;
+          if (!resenders.has(old)) throw new Error('this card moved to a newer message below.');
+          await feed.resend(webhookLink(click, hidden, false), { content: '-# this card moved to a newer message below.', components: [], ...quiet });
+          resenders.delete(old); resumers.delete(old); cards.delete(old);
+        }));
         if (resumers.size > cardLimit) resumers.delete(resumers.keys().next().value!);
       },
     });
@@ -390,8 +425,10 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       answer: message => feed.post(answerPayload(message) as CardMessage),
       edit: (id, text) => feed.revise(id, { content: text, ...quiet }),
       card(text, given, id) {
-        controls = given;
-        return feed.showCard(cardPayload(text, given), given.stop ? cardPayload(text, given, true) : undefined, id);
+        return serialCard(async () => {
+          controls = given;
+          return feed.showCard(cardPayload(text, given), given.stop ? cardPayload(text, given, true) : undefined, id);
+        });
       },
       typing: noop,
       askApproval: (text, signal, users = false) => askApproval(text, signal, users, async payload => ({ id: await feed.post(payload) }), (id, payload) => feed.revise(id, payload)),
@@ -641,6 +678,38 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
   });
 
   client.on(Events.InteractionCreate, async interaction => {
+    if (interaction.isMessageContextMenuCommand() && interaction.commandName === resendMenu) {
+      interactionReplies.delete(interaction.id);
+      const message = interaction.targetMessage;
+      const resend = message.author.id === client.user?.id ? resenders.get(message.id) : undefined;
+      const playId = message.author.id === client.user?.id ? handlers.resendTarget?.(interaction.channelId, message.id) : undefined;
+      if (!resend && !playId) {
+        await interaction.reply({ content: 'this message is not an available card or app.', flags: MessageFlags.Ephemeral, ...quiet }).catch(noop);
+        return;
+      }
+      // Finish the private acknowledgement before any public follow-up, so it cannot inherit ephemeral visibility.
+      await interaction.reply({ content: 'reposting…', flags: MessageFlags.Ephemeral, ...quiet });
+      if (resend) {
+        await resend(interaction).then(() => interaction.editReply({ content: 'reposted!', ...quiet })).catch(async error => {
+          await interaction.editReply({ content: `could not repost this card: ${failure(error)}`, ...quiet }).catch(noop);
+        });
+      } else {
+        handlers.component({
+          playId: playId!, controlId: '', messageId: message.id, kind: 'resend', user: { id: interaction.user.id, name: interaction.user.username },
+          defer: async () => {},
+          reply: async content => { await interaction.editReply({ content, ...quiet }); },
+          followUp: async content => { await interaction.editReply({ content, ...quiet }); },
+          openModal: async () => { throw new Error('a repost cannot open a form.'); },
+          update: async payload => { await interaction.webhook.editMessage(message.id, raw(payload, true)); },
+          post: async payload => {
+            const posted = await interaction.followUp(raw(payload));
+            await interaction.editReply({ content: 'reposted!', ...quiet }).catch(noop);
+            return { id: posted.id, edit: async next => { await interaction.webhook.editMessage(posted.id, raw(next, true)); } };
+          },
+        });
+      }
+      return;
+    }
     if (interaction.isMessageContextMenuCommand() && interaction.commandName === browserMenu) {
       const user = { id: interaction.user.id, name: interaction.user.username };
       const editorUrl = handlers.openEditorForMessage?.(interaction.targetMessage.id, user);
@@ -925,6 +994,10 @@ export async function connect(settings: DiscordSettings, handlers: GatewayHandle
       return;
     }
     if (interaction.customId.startsWith(cardPrefix)) {
+      if (!['stop', 'details'].includes(interaction.customId.slice(cardPrefix.length))) {
+        await interaction.reply({ content: 'use Apps → repost this! to bring this card back.', flags: MessageFlags.Ephemeral, ...quiet }).catch(noop);
+        return;
+      }
       const press = cards.get(interaction.message.id);
       let reply: { text: string; file?: { name: string; content: string } };
       try { reply = press ? press(interaction.customId.slice(cardPrefix.length) as CardButton, interaction.user.id) : { text: 'This turn is no longer available: teapilot restarted since, or the turn is too old.' }; }

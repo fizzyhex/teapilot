@@ -36,7 +36,7 @@ export interface WorkTask {
 export interface SavedJunior { name: string; description?: string; agent_type?: JuniorType; assignment?: string; artifacts?: string[]; turns: ConversationTurn[]; scratch: string; turn: number }
 interface Operation { tool: string; call: string; error?: string }
 /** Limits that came due, then failures that would otherwise have ended the request (always forced by the host). */
-export type HandoffReason = 'tool_calls' | 'time' | 'context' | 'model_calls' | 'cancelled' | 'context_limit' | 'ineffective_calls' | 'search_unavailable';
+export type HandoffReason = 'tool_calls' | 'junior_calls' | 'time' | 'context' | 'model_calls' | 'cancelled' | 'context_limit' | 'ineffective_calls' | 'search_unavailable' | 'missing_tool_call';
 
 export interface HostState {
   reason: HandoffReason; forced: boolean; attempts: number;
@@ -139,7 +139,10 @@ export class Workflow {
   move(id: string, state: TaskState, note?: string): WorkTask {
     const task = this.tasks.get(id);
     if (!task) throw new Error(`no task ${id}. tasks: ${[...this.tasks.keys()].join(', ') || 'none'}`);
-    if (task.state === state) return task;
+    if (task.state === state) {
+      if (note !== undefined) { task.note = note.trim().slice(0, 200) || undefined; this.onTask?.(task); }
+      return task;
+    }
     if (!transitions[task.state].includes(state)) throw new Error(`task ${id} is ${task.state}; it can become ${transitions[task.state].join(', ') || 'nothing (final)'}`);
     task.state = state;
     if (note !== undefined) task.note = note.trim().slice(0, 200) || undefined;
@@ -245,8 +248,8 @@ function recentFiles(folder: string): string[] {
 }
 
 const reasons: Record<HandoffReason, string> = {
-  tool_calls: 'out of tool calls', time: 'out of time', context: 'context full', model_calls: 'out of model calls',
-  cancelled: 'action not approved', context_limit: 'hit the context limit', ineffective_calls: 'calls weren’t making progress', search_unavailable: 'search unavailable',
+  tool_calls: 'out of tool calls', junior_calls: 'junior allowance spent', time: 'out of time', context: 'context full', model_calls: 'out of model calls',
+  cancelled: 'action not approved', context_limit: 'hit the context limit', ineffective_calls: 'calls weren’t making progress', search_unavailable: 'search unavailable', missing_tool_call: 'provider sent no usable tool call',
 };
 /** What the next agent is told about a failure handoff, in place of the bare error. */
 const failureAdvice: Partial<Record<HandoffReason, string>> = {
@@ -254,8 +257,15 @@ const failureAdvice: Partial<Record<HandoffReason, string>> = {
   context_limit: 'the previous agent hit the context limit. try orchestration with `delegate_task`, or a narrower approach.',
   ineffective_calls: 'the previous agent\'s tools were returning the same results repeatedly. consider alternate routes.',
   search_unavailable: 'web search is unavailable. stop now and tell the user, or continue offline if appropriate.',
+  missing_tool_call: 'the last announced tool call did not run. inspect existing work and continue with a simpler approach; do not reconstruct or replay the missing call.',
 };
 const taskLine = (task: WorkTask) => `task ${task.id} "${task.label}"${task.junior ? ` (${task.junior})` : ''}: ${task.state.replaceAll('_', ' ')}${task.note ? ` - ${task.note}` : ''}${task.result && !terminalState(task.state) ? `; result ${task.result.status}${task.result.consumed ? '' : ', not yet read by you'}${task.result.file ? ` (${task.result.file})` : ''}` : ''}`;
+
+/** Live bookkeeping survives compaction without carrying the juniors' transcripts or reports inline. */
+export function workflowTasks(flow: Workflow): string | undefined {
+  if (!flow.tasks.size) return undefined;
+  return [...flow.tasks.values()].map(task => `- ${taskLine(task)}`).join('\n');
+}
 
 /** What the next orchestrator is told: small, with the host's facts first and the agent's words marked as such. */
 /** `withdrawn` names tools the host has taken away since the handoff was written, which it may still suggest. */

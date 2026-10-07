@@ -116,10 +116,11 @@ export function delegateTool(parent: AttemptInput, scratch: string, root: string
   }
   let identities: Promise<Array<{ username: string; leased: boolean }>> | undefined;
   const limit = parent.config.policy.limits.maxJuniorTurns ?? defaultJuniorTurns;
+  const playContract = parent.play ? 'discord.play default sandbox: one entry module; only @teapilot/discord-play can be imported. share static data through inline constants or declared text assets (ctx.readText), not relative module imports.' : undefined;
   let sent = 0;
   const tool: AgentTool = {
     name: 'delegate_task', label: 'Delegate',
-    description: 'Delegate self-contained work to a junior agent. Use proactively for complex or separable work. Juniors only know the prompt and provided artifacts, so include all necessary context, instructions, and expected output. Your job is to integrate and verify results.',
+    description: `Delegate self-contained work to a junior agent. Use proactively for complex or separable work. Juniors only know the prompt and provided artifacts, so include all necessary context, instructions, and expected output. Your job is to integrate and verify results.${playContract ? ` ${playContract}` : ''}`,
     parameters: Type.Object({
       junior: Type.Optional(Type.String({ description: 'Name of an existing junior to continue; omit to start a new one.' })),
       label: Type.String({ minLength: 1, maxLength: 80, description: 'A 3-5 word label for this assignment; it names the task.' }),
@@ -171,6 +172,7 @@ export function delegateTool(parent: AttemptInput, scratch: string, root: string
       if (work && flow) flow.move(work.id, 'running');
       let report: JuniorReport | undefined;
       const started = Date.now();
+      const assignment = playContract ? `${prompt}\n\n[host runtime]\n${playContract}` : prompt;
       clock.pause();
       let result: AttemptResult;
       try {
@@ -180,10 +182,10 @@ export function delegateTool(parent: AttemptInput, scratch: string, root: string
           budget: parent.budget, telemetry: parent.telemetry, approve: parent.approve, beforeMutation: parent.beforeMutation,
           authorization: parent.authorization, activePermissions: parent.activePermissions, requestCapabilities: parent.requestCapabilities,
           workspace: parent.workspace, webController: parent.webController, play: parent.play, searchUnavailable: parent.searchUnavailable, attempt: parent.attempt,
-          signal: signal ?? parent.signal, history: junior.turns, scratch: junior.scratch, prompt, requestText: prompt,
+          signal: signal ?? parent.signal, history: junior.turns, scratch: junior.scratch, prompt: assignment, requestText: assignment,
           recovery: parent.recovery, task: parent.task, taskActor: { name, objective: prompt, artifacts: artifactIds },
           readOnly: parent.readOnly, taskId: parent.taskId, allowance, budgetReservation: callId,
-          currentRequest: prompt,
+          currentRequest: assignment,
           // Its words are for the instructor, not the person: only what its tools do is shown.
           onEvent: event => { if (event.type.startsWith('tool_execution_') || event.type === 'compaction_start') parent.onEvent?.({ ...event, junior: name }); },
           onActivity: activity => parent.onActivity?.(activity && { ...activity, label: `${name} (${description}): ${activity.label}` }),
@@ -209,6 +211,10 @@ export function delegateTool(parent: AttemptInput, scratch: string, root: string
       if (result.changedFiles?.length) lines.push(`Files changed: ${result.changedFiles.join(', ')}`);
       if (result.check) lines.push(`Checks: ${result.check}`);
       if (result.stopped === 'approval_denied') lines.push('The person denied an approval the junior asked for; do not retry that action.');
+      else if (work?.state === 'blocked') {
+        const left = Math.max(0, Math.min(juniorProfiles.calls, allowance.juniorMaxCalls) - allowance.usedBy(name));
+        lines.push(`recovery: inspect the partial work/report before settling ${work.id}; blocked is not cancelled. ${left >= juniorMinCalls ? `continue ${name} with a narrower assignment or a different approach` : 'use a new junior for the remaining work (this junior has too few calls left)'}, passing the relevant files and constraints.`);
+      }
       const artifacts = parent.task?.snapshot().artifacts.filter(item => item.actor === name && item.at >= started).slice(-4).map(item => item.id) ?? [];
       if (artifacts.length) lines.push(`Evidence artifacts: ${artifacts.join(', ')}`);
       if (report?.evidence?.length) lines.push(`Reported evidence (unverified): ${report.evidence.join(', ')}`);
@@ -216,5 +222,5 @@ export function delegateTool(parent: AttemptInput, scratch: string, root: string
       return { content: [{ type: 'text', text: lines.join('\n') }], details: { junior: name, artifacts, ...(work ? { task: work.id } : {}) } };
     },
   };
-  return { tool, get exhausted() { return sent >= limit || allowance.delegationExhausted || allowance.availableDelegationCapacity() < juniorMinCalls; } };
+  return { tool, get used() { return sent; }, get exhausted() { return sent >= limit || allowance.delegationExhausted || allowance.availableDelegationCapacity() < juniorMinCalls; } };
 }

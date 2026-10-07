@@ -83,7 +83,7 @@ async function playWorld() {
   cleanups.push(() => rm(directory, { recursive: true, force: true }));
   let runtime!: PlayRuntime;
   const gateway = await world.connect({ token: 't', allowedUserIds: [people.op.id], channelIds: [channelId], root: directory, startMode: 'ask' },
-    { message: vi.fn(), command: vi.fn(), reply: vi.fn(), component: interaction => void runtime.interact(interaction), asides: { keep: vi.fn(), find: vi.fn(), summarise: vi.fn() } }, vi.fn());
+    { message: vi.fn(), command: vi.fn(), reply: vi.fn(), component: interaction => void runtime.interact(interaction), resendTarget: (channel, message) => runtime.resendTarget(channel, message), asides: { keep: vi.fn(), find: vi.fn(), summarise: vi.fn() } }, vi.fn());
   runtime = new PlayRuntime({ store: new PlayStore(directory), surface: gateway.play, log: world.log, clock });
   cleanups.push(() => runtime.close());
   const { record } = await runtime.start({ title: 'Counter', channelId, conversation: 'dm:x', owner: { id: people.op.id, name: 'op' }, source: { kind: 'sandbox', code: counter } });
@@ -127,6 +127,55 @@ it('resends a buried app at the bottom and turns away clicks on the old copy', a
   expect(world.render(world.find(fresh))).toContain('Count 1');
   expect(world.logs.filter(line => line.startsWith('⚠'))).toEqual([]);
   expect(await world.click('op', fresh, 'add')).toContain('Count 2');
+});
+
+it('routes the repost context menu without changing game state or player permissions', async () => {
+  const { world, clock, record, message } = await playWorld();
+  await world.click('op', message, 'add');
+  expect(await world.repost('stranger', message)).toContain('Count 1');
+  const fresh = record.messageId!;
+  expect(fresh).not.toBe(message);
+  clock.advance(2000);
+  await vi.waitFor(() => expect(world.find(message).components).toEqual([]));
+  expect(await world.click('stranger', fresh, 'add')).toContain('Only @op can use this app.');
+  expect(await world.click('op', fresh, 'add')).toContain('Count 2');
+  await world.repost('op', fresh);
+  expect(record.messageId).not.toBe(fresh);
+  expect(world.logs.filter(line => line.startsWith('⚠'))).toEqual([]);
+});
+
+it('reposts a game with all 25 control slots filled and rejects old or unrelated messages', async () => {
+  const { world, runtime, record, message } = await playWorld();
+  const full = counter.replace("row(select('pick', ['a', 'b', 'c'], { max: 2 }))", "...Array.from({ length: 4 }, (_, i) => row(...Array.from({ length: 5 }, (_, j) => button('b' + i + '_' + j, 'B'))))")
+    .replace("button('say', 'Say', { opens: modal('words', 'Say', [field('word', 'Word', { max: 5 })]) })", "button('c', 'C'), button('d', 'D'), button('e', 'E')");
+  const { record: updated } = await runtime.update(record.id, 'dm:x', { kind: 'sandbox', code: full }, false);
+  await world.quiet(100, 2000);
+  expect(world.find(message).components.flatMap(row => row.components)).toHaveLength(25);
+  await world.repost('stranger', message);
+  expect(updated.messageId).not.toBe(message);
+  expect(world.find(updated.messageId!).components.flatMap(row => row.components)).toHaveLength(25);
+  expect(await world.repost('op', message)).toContain('not an available card or app');
+  const unrelated = await world.transport(world.channel('channel')).send('ordinary message');
+  expect(await world.repost('op', unrelated)).toContain('not an available card or app');
+});
+
+it('reposts cards repeatedly and keeps updates and controls on the newest message', async () => {
+  const world = new World();
+  const transport = world.transport(world.channel('channel'));
+  const press = vi.fn(() => ({ text: 'details' }));
+  const original = await transport.card('working', { stop: true, press });
+  await world.repost('stranger', original);
+  const fresh = world.messages.at(-1)!.id;
+  await transport.card('latest work', { stop: true, press }, original);
+  expect(world.find(fresh).content).toBe('latest work');
+  await world.repost('op', fresh);
+  const newest = world.messages.at(-1)!.id;
+  await transport.card('done', { stop: false, press }, original);
+  expect(world.find(newest).content).toBe('done');
+  expect(world.find(original).components).toEqual([]);
+  expect(world.find(fresh).components).toEqual([]);
+  await world.click('op', newest, 'details');
+  expect(press).toHaveBeenCalledWith('details', people.op.id);
 });
 
 it('holds Components V2 answers to Discord\'s rules, shows them, and reads tables back for view source', async () => {

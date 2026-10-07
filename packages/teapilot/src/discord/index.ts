@@ -520,6 +520,7 @@ export async function serveDiscord({ config, settings, signal, connect, clock, s
     allowed,
     component: interaction => void (surface ? play.interact(interaction) : interaction.reply('teapilot is still starting; try again in a moment.')).catch(failed('App interaction')),
     openBrowser: (channelId, messageId, user) => browser?.launch(channelId, messageId, user),
+    resendTarget: (channelId, messageId) => play.resendTarget(channelId, messageId),
     openEditorForMessage: (messageId, user) => browserHost?.editFileMessage(messageId, user.id),
     bindFileReply: (messageId, conversation, path, user) => browserHost?.bindFileReply(messageId, conversation, path, user.id),
     asides: { keep: answer => asides.keep(answer), find: id => asides.find(id), summarise: summariser({ config, root, access, queue, run, signal, skills: userId => skillStore.effective({ userId, operator: access.roleOf(userId) === 'operator' }) }) },

@@ -143,7 +143,7 @@
 {#if editMode}
   {#if EditorPage}<EditorPage />{:else}<div class="editor-loading">opening editor…</div>{/if}
 {:else}
-<main class:dark>
+<main class="play" class:dark>
   <section class="paper" aria-label="game">
     <header><span>{view?.title ?? 'discord.play'}</span><button onclick={toggleTheme} aria-label="switch theme">{dark ? 'light' : 'dark'}</button></header>
     <div class="frame">

@@ -48,7 +48,7 @@ export class InteractionFeed<P> {
   async showCard(payload: P, paused: P | undefined, id?: string): Promise<string> {
     if (id) await this.revise(id, payload); else id = await this.post(payload);
     this.card = { id: this.ids.get(id) ?? id, payload, paused };
-    if (!id.startsWith('held:')) this.options.onCard?.(id);
+    if (!this.card.id.startsWith('held:')) this.options.onCard?.(this.card.id);
     return id;
   }
 
@@ -68,6 +68,19 @@ export class InteractionFeed<P> {
     }
     for (const [id, payload] of edits) await link.revise(id, payload).catch(error => this.options.log(`could not update a message on resume: ${error instanceof Error ? error.message : String(error)}`));
     this.schedule();
+  }
+
+  /** Reposts the latest card and redirects the turn's original id to its new copy. */
+  async resend(link: FeedLink<P>, retire: P): Promise<void> {
+    if (!this.card) throw new Error('this card is no longer available.');
+    await this.resume(link);
+    const old = this.card.id;
+    const id = await link.post(this.card.payload);
+    for (const [alias, current] of this.ids) if (current === old) this.ids.set(alias, id);
+    this.ids.set(old, id);
+    this.card.id = id;
+    this.options.onCard?.(id);
+    await link.revise(old, retire).catch(error => this.options.log(`could not retire the old card: ${error instanceof Error ? error.message : String(error)}`));
   }
 
   private schedule(): void {

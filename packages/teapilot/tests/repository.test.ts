@@ -262,6 +262,33 @@ it('repeated searches warn, then refuse further searches instead of aborting', (
   expect(evidence.searchExhausted).toBe(true);
 });
 
+it('keeps search-loop counts across checkpoints despite reordered hits and changed snippets', () => {
+  const recovery = new RequestRecovery();
+  const thresholds = { repeatedToolCalls: 2, consecutiveFailures: 2, maxEscalations: 2 };
+  const hits = [{ url: 'https://example.com/map', snippet: 'map' }, { url: 'https://example.com/tiles', snippet: 'tiles' }];
+  const first = new Evidence(thresholds, [], undefined, recovery, false, 'instructor#0');
+  first.observe('web_search', { query: 'map' }, false, JSON.stringify(hits), undefined, undefined, 'hash-1');
+  const next = new Evidence(thresholds, [], undefined, recovery, false, 'instructor#1');
+  next.observe('web_search', { query: 'tile map' }, false, JSON.stringify(hits.toReversed().map(hit => ({ ...hit, snippet: 'updated' }))), undefined, undefined, 'hash-2');
+  expect(next.warning).toContain('Stop searching');
+  next.observe('web_search', { query: 'level map' }, false, JSON.stringify(hits));
+  expect(next.searchExhausted).toBe(true);
+  const fresh = new Evidence(thresholds, [], undefined, recovery, false, 'instructor#2');
+  fresh.observe('web_search', { query: 'different source' }, false, JSON.stringify([{ url: 'https://example.org/new' }]));
+  expect(fresh.warning).toBeUndefined();
+});
+
+it('withdraws identical search queries across checkpoints even when tail results change', () => {
+  const recovery = new RequestRecovery();
+  const thresholds = { repeatedToolCalls: 2, consecutiveFailures: 2, maxEscalations: 2 };
+  for (let index = 0; index < 3; index++) {
+    const evidence = new Evidence(thresholds, [], undefined, recovery, false, `instructor#${index}`);
+    evidence.observe('web_search', { query: index ? ' LEVEL   map ' : 'level map' }, false, JSON.stringify([{ url: `https://example.com/${index}` }]));
+    if (index === 1) expect(evidence.warning).toContain('Stop searching');
+    if (index === 2) expect(evidence.searchExhausted).toBe(true);
+  }
+});
+
 it('does not treat fresh saved-output pointers as new inspection evidence', () => {
   const evidence = new Evidence({ repeatedToolCalls: 2, consecutiveFailures: 2, maxEscalations: 2 });
   for (let index = 1; index <= 3; index++) evidence.observe('read', { path: 'source.txt' }, false, `same body\nFull output saved to .scratch/read-${index}.txt [artifact a-${index}]`);

@@ -150,11 +150,27 @@ export class Evidence {
     const play = name.startsWith('play_');
     const byResult = inspection || play;
     // Fresh handles are storage metadata, not progress. A full result/image identity distinguishes changes hidden by a preview.
-    const observed = identity ?? result?.replace(savedLine, '').trim();
-    const signature = `${name}:${['read', 'edit', 'write'].includes(name) ? data.path ?? '' : ''}:${createHash('sha256').update(JSON.stringify(byResult && observed !== undefined ? [name, observed] : [name, args])).digest('hex')}${this.context && `:${this.context}`}`;
+    let observed = identity ?? result?.replace(savedLine, '').trim();
+    // Search ranking/snippet churn is not new evidence. Fresh contexts can reread files, but should not buy
+    // another search loop merely by handing off; saved search output remains in the scratchpad.
+    if (search && result) {
+      try {
+        const hits = JSON.parse(result.replace(savedLine, '').trim()) as Array<{ url?: string }>;
+        if (Array.isArray(hits) && hits.length && hits.every(hit => typeof hit.url === 'string')) observed = JSON.stringify([...new Set(hits.map(hit => hit.url))].sort());
+      } catch { /* non-JSON search replies still use their complete identity */ }
+    }
+    let signature = `${name}:${['read', 'edit', 'write'].includes(name) ? data.path ?? '' : ''}:${createHash('sha256').update(JSON.stringify(byResult && observed !== undefined ? [name, observed] : [name, args])).digest('hex')}${this.context && !search ? `:${this.context}` : ''}`;
     if (name === 'bash') this.recovery.commands.set(signature, String(data.command ?? ''));
-    const count = (this.recovery.repeated.get(signature) ?? 0) + 1;
+    let count = (this.recovery.repeated.get(signature) ?? 0) + 1;
     this.recovery.repeated.set(signature, count);
+    // The same query in one request is not a new research strategy, even when an engine shuffles its tail hits.
+    const query = search && (args as { query?: unknown })?.query;
+    if (typeof query === 'string') {
+      const key = `web_search:query:${createHash('sha256').update(query.trim().replace(/\s+/g, ' ').toLowerCase()).digest('hex')}`;
+      const repeated = (this.recovery.repeated.get(key) ?? 0) + 1;
+      this.recovery.repeated.set(key, repeated);
+      if (repeated >= count) { signature = key; count = repeated; }
+    }
     if (count >= this.thresholds.repeatedToolCalls) {
       if (inspection && !this.recovery.inspectionWarnings.has(signature)) {
         this.recovery.inspectionWarnings.add(signature);

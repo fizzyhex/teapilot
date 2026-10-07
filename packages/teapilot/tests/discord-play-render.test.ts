@@ -68,6 +68,18 @@ it('disables every control for a finished app, but keeps link buttons', () => {
   ]);
 });
 
+it('leaves app controls intact with repost available only from the context menu', () => {
+  const rows = [row(select('pick', ['a'])), ...Array.from({ length: 4 }, (_, i) => row(button(`b${i}`, 'B')))];
+  const payload = renderView('a1', { rows }, true);
+  expect(payload.components).toHaveLength(5);
+  expect(payload.components[0]!.components).toHaveLength(1);
+  expect(payload.components.flatMap(row => row.components).some(control => control.label === 'repost this!')).toBe(false);
+  expect(() => checkMessage(payload)).not.toThrow();
+  const full = renderView('a1', { rows: Array.from({ length: 5 }, (_, i) => row(...Array.from({ length: 5 }, (_, j) => button(`b${i}_${j}`, 'B')))) });
+  expect(full.components.flatMap(row => row.components)).toHaveLength(25);
+  expect(() => checkMessage(full)).not.toThrow();
+});
+
 it.each([
   ['too many rows', { rows: Array.from({ length: 6 }, (_, i) => row(button(`b${i}`, 'B'))) }, /rows has 6 entries/],
   ['too many buttons', { rows: [row(...Array.from({ length: 6 }, (_, i) => button(`b${i}`, 'B')))] }, /Row 1 has 6 entries/],

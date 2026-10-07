@@ -565,7 +565,10 @@ async function forcedCheckpoint(flow: Workflow, attempt: AttemptResult): Promise
 /** A failure that would end the request, as a checkpoint; not for the agent a failure already handed to, so failures never chain. */
 async function failover(flow: Workflow, attempt: AttemptResult, last?: { reason: HandoffReason; generation: number }): Promise<CheckpointRecord | undefined> {
   const failures: Record<string, HandoffReason> = { approval_denied: 'cancelled', context_limit: 'context_limit', search_unavailable: 'search_unavailable', ineffective_calls: 'ineffective_calls' };
-  const reason = failures[attempt.stopped ?? ''] ?? failures[attempt.reason ?? ''];
+  const termination = attempt.ending?.termination;
+  // One clean-context recovery for an unusable announced call, not for outages or confirmed provider loops.
+  const missingCall = attempt.reason === 'provider_error' && attempt.ending?.stopReason === 'toolUse' && termination?.finishReason === 'tool_calls' && !termination.toolData && !termination.parsedCalls && !termination.eosReason;
+  const reason = failures[attempt.stopped ?? ''] ?? failures[attempt.reason ?? ''] ?? (missingCall ? 'missing_tool_call' : undefined);
   if (!reason || !flow.canCheckpoint || last?.generation === flow.generation) return undefined;
   return flow.checkpoint({ reason, forced: true, attempts: 0 });
 }

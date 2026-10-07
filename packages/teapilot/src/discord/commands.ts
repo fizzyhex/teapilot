@@ -28,6 +28,7 @@ export const collabCommand = 'collab';
 export const treeOption = 'dir';
 export const replyMenu = 'Reply';
 export const browserMenu = 'Open In Browser';
+export const resendMenu = 'repost this!';
 
 const value = (description: string, values: readonly string[]): Option =>
   ({ type: 3, name: 'value', description, required: true, choices: values.map(item => ({ name: item, value: item })) });
@@ -86,6 +87,7 @@ export const commandDefinitions: CommandDefinition[] = [
   },
   { type: 3, name: replyMenu, ...everywhere },
   { type: 3, name: browserMenu, ...everywhere },
+  { type: 3, name: resendMenu, ...everywhere },
   // Also where teapilot is not invited, where they act on the conversation /reply or /prompt keeps there.
   { name: 'convo', description: 'Your conversation with teapilot here', options: [
     subcommand('clear', 'Clear its context; the workspace keeps its files'),

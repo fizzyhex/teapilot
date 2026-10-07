@@ -3,6 +3,29 @@ import { InteractionFeed, type FeedLink } from '../src/discord/feed.js';
 
 afterEach(() => { vi.useRealTimers(); });
 
+it('reposts the latest paused card repeatedly and sends later updates to the new copy', async () => {
+  vi.useFakeTimers();
+  const messages = new Map<string, string>();
+  const sent: string[] = [];
+  const cards: string[] = [];
+  const feed = new InteractionFeed(webhook('first', 1000, messages, sent), { log: () => undefined, onCard: id => cards.push(id) });
+  const original = await feed.showCard('working', 'paused');
+  await vi.advanceTimersByTimeAsync(1000);
+  await feed.showCard('latest work', 'latest paused', original);
+  await feed.resend(webhook('click', 1000, messages, sent), 'moved');
+  const fresh = cards.at(-1)!;
+  expect(messages.get(original)).toBe('moved');
+  expect(messages.get(fresh)).toBe('latest work');
+  await feed.showCard('done', undefined, original);
+  expect(messages.get(fresh)).toBe('done');
+  await feed.resend(webhook('again', 1000, messages, sent), 'moved');
+  const newest = cards.at(-1)!;
+  await feed.showCard('final', undefined, original);
+  expect(messages.get(fresh)).toBe('moved');
+  expect(messages.get(newest)).toBe('final');
+  expect(messages.get(original)).toBe('moved');
+});
+
 /** A webhook that records what reached Discord, and refuses everything once it has expired. */
 function webhook(name: string, lifetimeMs: number, messages: Map<string, string>, sent: string[]): FeedLink<string> {
   const expires = Date.now() + lifetimeMs;

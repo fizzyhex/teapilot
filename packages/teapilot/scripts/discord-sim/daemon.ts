@@ -182,6 +182,7 @@ async function handle(body: Body): Promise<Record<string, unknown>> {
     case 'slash': input(); return { text: await world.slash(as, String(body.text), body.in as string | undefined, body.choose as number | undefined, body.oneShot === true) };
     case 'complete': return { text: await world.complete(as, String(body.text), String(body.typed ?? ''), body.in as string | undefined) };
     case 'click': input(); return { text: await world.click(as, String(body.message), String(body.control)) };
+    case 'repost': input(); return { text: await world.repost(as, String(body.message)) };
     case 'select': input(); return { text: await world.select(as, String(body.message), String(body.control), body.values as string[]) };
     case 'submit': input(); return { text: await world.submit(as, body.fields as Record<string, string>) };
     case 'approve': {

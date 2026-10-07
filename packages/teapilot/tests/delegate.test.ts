@@ -5,6 +5,7 @@ import { completion, events, fixture, mockServer } from './helpers.js';
 import { runAttempt } from '../src/agents/run.js';
 import { delegateTool, juniorAllowance, juniorName, juniorPrompt } from '../src/agents/delegate.js';
 import { RequestAllowance } from '../src/agents/allowance.js';
+import { Workflow } from '../src/agents/checkpoint.js';
 import { TaskStore } from '../src/workspace/task.js';
 import { Scratch } from '../src/workspace/scratch.js';
 import { SpendGovernor } from '../src/inference/budget.js';
@@ -83,6 +84,24 @@ it('hands a task to a junior in a clean context and sees only its report', async
   const [instructor] = await readdir(join(f.scratch, 'sessions'));
   expect(await readFile(join(f.scratch, 'sessions', instructor!), 'utf8')).toContain('delegate_task');
   expect((await events(f.config)).find(event => event.type === 'delegate')).toMatchObject({ junior: 'junior-alfa', turn: 1, status: 'done' });
+});
+
+it('refreshes host task bookkeeping after delegation and settlement without duplicate projections', async () => {
+  const bodies: any[] = [];
+  const f = await setup((body, _req, res) => {
+    if (junior(body)) return completion(res, { tool: { name: 'report', arguments: { status: 'done', summary: 'checked the source' } } });
+    bodies.push(body);
+    completion(res, bodies.length === 1 ? { tool: { name: 'delegate_task', arguments: { label: 'Inspect source data', prompt: 'inspect source', agent_type: 'research', artifacts: [] } } }
+      : bodies.length === 2 ? { tool: { name: 'taskwrite', arguments: { task: 't1', state: 'verified', note: 'checked result' } } } : { text: 'done' });
+  });
+  await run(f, { scratch: f.scratch, workflow: new Workflow('r', 0) });
+  const projection = (body: any) => body.messages.filter((message: any) => typeof message.content === 'string' && message.content.includes('[workflow tasks:'));
+  expect(projection(bodies[0])).toHaveLength(0);
+  expect(projection(bodies[1])).toHaveLength(1);
+  expect(projection(bodies[1])[0].content).toContain('awaiting verification');
+  expect(projection(bodies[2])).toHaveLength(1);
+  expect(projection(bodies[2])[0].content).toContain('verified - checked result');
+  expect(projection(bodies[2])[0].content).not.toContain('awaiting verification');
 });
 
 it('continues the same junior with its history, and passes its questions back', async () => {
@@ -270,6 +289,22 @@ it('requires the complete schema on every call and retains a junior assignment a
   expect(children).toHaveLength(3);
 });
 
+it('shares the active app runtime contract at delegation, without loading an implementation or skill', async () => {
+  const f = await setup((_body, _req, res) => completion(res, { text: 'unused' }));
+  const children: any[] = [];
+  const allowance = new RequestAllowance({ calls: 40, modelCalls: 50, timeoutMs: 10_000, delegations: 6 });
+  const parent = { ...f, tier: 'normal' as const, workload: 'coder' as const, web: false, prompt: 'parent', approve: async () => true, play: {} as any };
+  const delegated = delegateTool(parent, f.scratch, f.cwd, { pause() {}, resume() {} }, async child => {
+    children.push(child); return { success: true, text: 'done', turns: 1, toolCalls: 0 };
+  }, allowance);
+  expect(delegated.tool.description).toContain('not relative module imports');
+  await delegated.tool.execute('a', { label: 'Write app engine', prompt: 'write app engine', agent_type: 'write', artifacts: [] });
+  expect(children[0].prompt).toContain('[host runtime]');
+  expect(children[0].prompt).toContain('ctx.readText');
+  expect(children[0].currentRequest).toBe(children[0].prompt);
+  expect(children[0].requestText).toBe(children[0].prompt);
+});
+
 it('inherits parent read-only safety for every agent_type and accepts legacy saved juniors', async () => {
   const f = await setup((_body, _req, res) => completion(res, { text: 'unused' }));
   const task = TaskStore.open(f.config.stateDir, 'typed-juniors', 'overall goal', f.scratch);
@@ -343,6 +378,21 @@ it('points a spent junior at a new one, and a starved request at a checkpoint', 
   const handoff = delegateTool({ ...parent, workflow }, f.scratch, f.cwd, { pause() {}, resume() {} }, async () => { throw new Error('not started'); }, starved);
   expect((await handoff.tool.execute('c', args)).content[0]).toMatchObject({ text: expect.stringContaining('call checkpoint') });
   expect(handoff.exhausted).toBe(true);
+});
+
+it('returns actionable recovery with a blocked task and its report pointer', async () => {
+  const f = await setup((_body, _req, res) => completion(res, { text: 'unused' }));
+  const workflow = new Workflow('r', 3);
+  const allowance = new RequestAllowance({ calls: 40, modelCalls: 50, timeoutMs: 10_000, delegations: 6 }, undefined, { juniorPool: 40 });
+  const parent = { ...f, workflow, tier: 'normal' as const, workload: 'coder' as const, web: false, prompt: 'parent', approve: async () => true };
+  const delegated = delegateTool(parent, f.scratch, f.cwd, { pause() {}, resume() {} }, async child => {
+    for (let index = 0; index < 15; index++) allowance.consumeTool(child.junior!.name);
+    return { success: false, text: 'partial data in level.txt', reason: 'ineffective_calls', turns: 1, toolCalls: 15 };
+  }, allowance);
+  const reply = await delegated.tool.execute('a', { label: 'Encode level data', prompt: 'encode level', agent_type: 'write', artifacts: [] });
+  expect(reply.content[0]).toMatchObject({ text: expect.stringContaining('blocked is not cancelled') });
+  expect(reply.content[0]).toMatchObject({ text: expect.stringContaining('use a new junior for the remaining work') });
+  expect(workflow.tasks.get('t1')).toMatchObject({ state: 'blocked', result: { file: expect.stringContaining('turn-1.md') } });
 });
 
 it('publishes bounded required arguments without imposing a description word-count rule', async () => {

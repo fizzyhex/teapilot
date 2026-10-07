@@ -43,6 +43,7 @@ const usage = `Usage: node scripts/agent-discord.mjs <command>
   complete <name> <command> [<typed>] [--as P] [--in C]
                                      what Discord offers while typing an option, e.g. complete d "/workspace tree" sr
   click <name> <message> <control> [--as P]
+  repost <name> <message> [--as P]     use Apps → repost this! on a card or game
   select <name> <message> <control> <value...> [--as P]
   submit <name> [--field id=value ...] [--as P]      the form P has open
   approve <name> [--deny] [--as P]   answer the newest waiting approval
@@ -185,6 +186,7 @@ async function client(argv) {
   }
   else if (command === 'complete') { need(1, '<command> [<typed>]'); body = { op: 'complete', as: values.as, in: values.in, text: args[0], typed: args[1] ?? '' }; }
   else if (command === 'click') { need(2, '<message> <control>'); body = { op: 'click', as: values.as, message: args[0], control: args[1] }; }
+  else if (command === 'repost') { need(1, '<message>'); body = { op: 'repost', as: values.as, message: args[0] }; }
   else if (command === 'select') { need(3, '<message> <control> <value...>'); body = { op: 'select', as: values.as, message: args[0], control: args[1], values: args.slice(2) }; }
   else if (command === 'submit') {
     const fields = Object.fromEntries(values.field.map(entry => {

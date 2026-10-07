@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runHost, type CheckpointView } from '../src/host.js';
-import { checkpointCard, continuation, latest, taskwriteTool, Workflow, type CheckpointDecision } from '../src/agents/checkpoint.js';
+import { checkpointCard, continuation, latest, taskwriteTool, workflowTasks, Workflow, type CheckpointDecision } from '../src/agents/checkpoint.js';
 import { completion, events, fixture, jev, mockServer, type Handler } from './helpers.js';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -36,6 +36,19 @@ const sent = (body: any) => JSON.stringify(body.messages);
 const generation = (body: any) => /\[checkpoint (\d+)\] you are continuing/.exec(sent(body))?.[1];
 
 describe('workflow state', () => {
+  it('projects current task states and lets a repeated state refresh its note', async () => {
+    const flow = new Workflow('r', 3);
+    const task = flow.openTask('level data', 'junior-alfa');
+    flow.move(task.id, 'blocked', 'needs research');
+    task.result = { status: 'stuck', file: 'reports/turn-1.md', consumed: true };
+    expect(workflowTasks(flow)).toContain('blocked - needs research; result stuck (reports/turn-1.md)');
+    await taskwriteTool(flow).execute('x', { task: task.id, state: 'blocked', note: 'source unavailable; try another' });
+    expect(workflowTasks(flow)).toContain('blocked - source unavailable; try another');
+    flow.move(task.id, 'verified', 'checked partial output');
+    expect(workflowTasks(flow)).toContain('verified - checked partial output');
+    expect(workflowTasks(flow)).not.toContain('result stuck');
+    expect(workflowTasks(new Workflow('empty', 3))).toBeUndefined();
+  });
   it('enforces task transitions and lets taskwrite reach only verified, blocked or cancelled', async () => {
     const flow = new Workflow('r', 3);
     const task = flow.openTask('level data', 'junior-alfa');
@@ -158,6 +171,54 @@ describe('workflow state', () => {
 });
 
 describe('checkpoints through the host', () => {
+  it('offers a checkpoint when delegation is spent, even with instructor calls remaining', async () => {
+    const bodies: any[] = [];
+    const f = await setup((body, req, res) => {
+      if (req.url === '/jev') return jev(res, 'coder.normal');
+      if (req.url?.endsWith('/models')) { res.end('{}'); return; }
+      bodies.push(body);
+      if (toolNames(body).includes('report')) return completion(res, { tool: { name: 'report', arguments: { status: 'done', summary: 'first phase ready' } } });
+      if (generation(body)) return completion(res, { text: 'continued with renewed delegation.' });
+      if (toolNames(body).includes('checkpoint')) return completion(res, { tool: { name: 'checkpoint', arguments: { status: 'first phase ready', next: 'verify first phase and delegate next' } } });
+      return completion(res, { tool: { name: 'delegate_task', arguments: { label: 'Inspect first phase', prompt: 'inspect first phase', agent_type: 'research', artifacts: [] } } });
+    });
+    f.config.policy.limits.maxJuniorTurns = 1;
+    const views: CheckpointView[] = [];
+    const result = await runHost(f.config, { cwd: f.cwd, prompt: 'Build app', scratch: f.scratch }, {
+      approve: async () => true, onCheckpoint: async view => { views.push(view); return { action: 'continue' }; },
+    });
+    expect(result.success).toBe(true);
+    expect(views).toHaveLength(1);
+    expect(views[0]!.record.host.reason).toBe('junior_calls');
+    const due = bodies.find(body => toolNames(body).includes('checkpoint'));
+    expect(sent(due)).toContain('junior allowance for this window is spent');
+    expect(toolNames(bodies.find(body => generation(body)))).toContain('delegate_task');
+  });
+  it.each([false, true])('gives missing tool calls one fresh-context recovery, without chaining (still broken: %s)', async broken => {
+    const bodies: any[] = [];
+    const f = await setup((body, req, res) => {
+      if (req.url === '/jev') return jev(res, 'coder.normal');
+      if (req.url?.endsWith('/models')) { res.end('{}'); return; }
+      bodies.push(body);
+      if (generation(body) && !broken) return completion(res, { text: 'finished with a simpler approach.' });
+      res.setHeader('Content-Type', 'text/event-stream');
+      const common = { id: 'missing-call', object: 'chat.completion.chunk', created: 1, model: 'mock-model' };
+      res.write(`data: ${JSON.stringify({ ...common, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ ...common, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`);
+      res.end('data: [DONE]\n\n');
+    });
+    f.config.policy.escalation.maxEscalations = 0;
+    const views: CheckpointView[] = [];
+    const result = await runHost(f.config, { cwd: f.cwd, prompt: 'Build app', scratch: f.scratch }, {
+      approve: async () => true, onCheckpoint: async view => { views.push(view); return { action: 'continue' }; },
+    });
+    expect(result.success).toBe(!broken);
+    expect(result.attempts).toBe(2);
+    expect(views).toHaveLength(1);
+    expect(views[0]!.record.host.reason).toBe('missing_tool_call');
+    expect(sent(bodies.find(body => generation(body)))).toContain('do not reconstruct or replay the missing call');
+    expect(bodies).toHaveLength(4);
+  });
   it('hands off to a fresh orchestrator with the host facts first, without spending the window on the checkpoint', async () => {
     const bodies: any[] = [];
     const f = await setup((body, req, res) => {
