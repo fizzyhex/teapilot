@@ -138,8 +138,9 @@ export class TabbyDriver implements RuntimeDriver {
   readonly id = 'nvidia';
   readonly label = nvidiaLabel;
   readonly ownership = 'managed' as const;
-  // A 27B first token after a long prompt can take a while; the stall timeout resets on every token.
-  readonly requestTimeoutMs = 120000;
+  // Nothing streams while a prompt is read: a cold 110K-token prompt takes ~3.5 minutes on an RTX 3090.
+  // The stall timeout resets on every token.
+  readonly requestTimeoutMs = 360000;
   constructor(private readonly io: TabbyBoundaries) {}
 
   get baseUrl(): string { return `http://127.0.0.1:${this.io.port}/v1`; }
@@ -194,6 +195,10 @@ export class TabbyDriver implements RuntimeDriver {
   private async owns(install: TabbyInstall, port: number, signal: AbortSignal): Promise<boolean> {
     try { const response = await this.request('/v1/model/list', { signal, key: install.keys.admin, port }); await response.body?.cancel(); return response.ok; }
     catch { signal.throwIfAborted(); return false; }
+  }
+  /** What the server names as the drafter once the preset is loaded; an MTP head is named after the model it belongs to. */
+  private get drafterId(): string | undefined {
+    return this.io.preset.load.mtp ? this.io.preset.model.folder : this.io.preset.drafter?.folder;
   }
   private async loadedDrafter(install: TabbyInstall, signal: AbortSignal): Promise<string | undefined> {
     try {
@@ -324,6 +329,9 @@ export class TabbyDriver implements RuntimeDriver {
     const preset = this.io.preset;
     const loaded = install.preset === preset.id;
     const models = quote(this.paths.models);
+    const offload = Boolean(preset.vision && preset.load.visionOffload);
+    // Settings the load request cannot carry; API loads take them from these defaults.
+    const defaults = ['max_batch_size', 'tool_format', ...offload ? ['vision_offload'] : [], ...preset.load.reserveMiB ? ['autosplit_reserve'] : [], ...preset.load.mtp ? ['draft_mode'] : []];
     await mkdir(this.paths.models, { recursive: true });
     await writeFile(join(this.paths.source, 'config.yml'), [
       '# Written by TeaPilot for its managed Optimized NVIDIA runtime. Rerun teapilot setup to change it.',
@@ -332,10 +340,11 @@ export class TabbyDriver implements RuntimeDriver {
       ...loaded ? [`  model_name: ${quote(preset.model.folder)}`] : [],
       `  max_seq_len: ${preset.context}`, `  cache_size: ${preset.context}`, `  cache_mode: ${preset.load.cache_mode}`, `  max_batch_size: ${preset.load.max_batch_size}`,
       `  tool_format: ${preset.load.tool_format}`,
-      // Parser and vision_offload settings are not part of the load request; API loads use config defaults.
-      ...preset.vision ? ['  vision: true', ...preset.load.visionOffload ? ['  vision_offload: true'] : []] : [],
-      `  use_as_default: ["max_batch_size", "tool_format"${preset.vision && preset.load.visionOffload ? ', "vision_offload"' : ''}]`,
+      ...preset.vision ? ['  vision: true', ...offload ? ['  vision_offload: true'] : []] : [],
+      ...preset.load.reserveMiB ? [`  autosplit_reserve: [${preset.load.reserveMiB}]`] : [],
+      `  use_as_default: [${defaults.map(name => `"${name}"`).join(', ')}]`,
       'draft_model:', `  draft_model_dir: ${models}`,
+      ...preset.load.mtp ? ['  draft_mode: mtp'] : [],
       ...loaded && preset.drafter ? [`  draft_model_name: ${quote(preset.drafter.folder)}`] : [],
       '',
     ].join('\n'), { mode: 0o600 });
@@ -408,7 +417,7 @@ export class TabbyDriver implements RuntimeDriver {
   private async load(install: TabbyInstall, ui: SetupUI, signal: AbortSignal): Promise<void> {
     const preset = this.io.preset;
     const current = await this.currentModel(install, signal);
-    if (current?.id === preset.model.folder && current.parameters?.max_seq_len === preset.context && Boolean(current.parameters.use_vision) === Boolean(preset.vision) && await this.loadedDrafter(install, signal) === preset.drafter?.folder) {
+    if (current?.id === preset.model.folder && current.parameters?.max_seq_len === preset.context && Boolean(current.parameters.use_vision) === Boolean(preset.vision) && await this.loadedDrafter(install, signal) === this.drafterId) {
       ui.log('The model is already loaded.');
       return;
     }
@@ -452,7 +461,7 @@ export class TabbyDriver implements RuntimeDriver {
         throw new RuntimeError('declined', 'Download declined; existing configuration is unchanged.');
       }
       for (const item of missing) await during(ui, `Downloading ${item.folder}...`, () => this.fetchRepository(install, item, ui, signal));
-    } else ui.log('Using the downloaded model and drafter.');
+    } else ui.log(`Using the downloaded model${preset.drafter ? ' and drafter' : ''}.`);
     await during(ui, 'Loading the model onto the GPU...', () => this.load(install, ui, signal));
     // The served model must be visible through the OpenAI-compatible API it will be used through.
     const served = await this.request('/v1/models', { signal, key: install.keys.api }).then(response => response.json() as Promise<{ data?: Array<{ id?: string }> }>).catch(() => ({ data: [] }));
@@ -512,8 +521,8 @@ export class TabbyDriver implements RuntimeDriver {
     const current = healthy ? await this.currentModel(install, signal) : undefined;
     const drafter = current?.id ? await this.loadedDrafter(install, signal) : undefined;
     const warnings: string[] = [];
-    if (current?.id && this.io.preset.drafter && drafter !== this.io.preset.drafter.folder) {
-      warnings.push('The drafter is not loaded, so generation is about 3x slower. Load it with teapilot runtime start.');
+    if (current?.id && this.drafterId && drafter !== this.drafterId) {
+      warnings.push('The drafter is not loaded, so generation is slower. Load it with teapilot runtime start.');
     }
     if (await this.healthy(signal, this.io.fallbackPort) && await this.owns(install, this.io.fallbackPort, signal)) {
       warnings.push(`A second Optimized NVIDIA server is running on port ${this.io.fallbackPort} and competing for GPU memory, which makes generation very slow. Stop both with teapilot runtime stop, then run teapilot runtime start.`);
@@ -523,7 +532,7 @@ export class TabbyDriver implements RuntimeDriver {
     }
     return {
       ownership: 'managed', ready: Boolean(current?.id), version: `TabbyAPI ${short(install.revision)}`, baseUrl: this.baseUrl,
-      detail: `${healthy ? current?.id ? `model ${current.id} loaded${drafter ? ` with drafter ${drafter}` : ''}` : 'no model loaded' : 'stopped'}; ${hardware}`,
+      detail: `${healthy ? current?.id ? `model ${current.id} loaded${drafter ? drafter === current.id ? ' with MTP drafting' : ` with drafter ${drafter}` : ''}` : 'no model loaded' : 'stopped'}; ${hardware}`,
       ...warnings.length ? { warnings } : {},
     };
   }

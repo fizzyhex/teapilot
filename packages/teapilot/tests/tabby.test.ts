@@ -69,7 +69,9 @@ async function tabbyServer(root: string) {
     }
     if (path === '/v1/model/load') {
       if (state.loadError) { sse(response, [{ model_type: 'draft', module: 1, modules: 2, status: 'processing' }, { error: { message: state.loadError } }]); return; }
-      state.loaded = { id: body.model_name, max_seq_len: body.max_seq_len, draft: body.draft_model?.draft_model_name, vision: body.vision };
+      // An MTP head comes from the server settings and is named after its model.
+      const mtp = (await readFile(join(root, 'tabbyAPI', 'config.yml'), 'utf8').catch(() => '')).includes('draft_mode: mtp');
+      state.loaded = { id: body.model_name, max_seq_len: body.max_seq_len, draft: body.draft_model?.draft_model_name ?? (mtp ? body.model_name : undefined), vision: body.vision };
       sse(response, [
         { model_type: 'draft', module: 1, modules: 1, status: 'finished' },
         { model_type: 'model', module: 32, modules: 64, status: 'processing' },
@@ -140,9 +142,11 @@ it('installs a pinned runtime, starts it, downloads and loads the preset as sepa
   const config = await readFile(join(h.root, 'tabbyAPI', 'config.yml'), 'utf8');
   expect(config).toContain(`port: ${h.tabby.port}`);
   expect(config).toContain('host: 127.0.0.1');
-  expect(config).toContain('cache_size: 32768');
+  expect(config).toContain('cache_size: 114688');
   expect(config).toContain('tool_format: qwen3_coder');
-  expect(config).toContain('use_as_default: ["max_batch_size", "tool_format"]');
+  expect(config).toContain('autosplit_reserve: [1536]');
+  expect(config).toContain('draft_mode: mtp');
+  expect(config).toContain('use_as_default: ["max_batch_size", "tool_format", "autosplit_reserve", "draft_mode"]');
   expect(config).toContain('vision: true');
   expect(config).not.toContain('vision_offload');
   expect(config).not.toContain('model_name');
@@ -153,13 +157,12 @@ it('installs a pinned runtime, starts it, downloads and loads the preset as sepa
   const downloads = h.tabby.state.requests.filter(item => item.path === '/v1/download');
   expect(downloads.map(item => item.body)).toEqual([
     { repo_id: 'Honkware/Qwen3.8-27B-heretic-ara-exl3-4.0bpw', revision: '1d09f16a35dc3c23b9634741bf61e6c746fcce21', folder_name: preset.model.folder },
-    { repo_id: 'alphakek/Qwen3.8-27B-heretic-ara-DFlash2', revision: '75930a33a8bbbcef25e93f7c4123e5e4424c2da7', folder_name: preset.drafter!.folder },
   ]);
   expect(downloads.every(item => item.auth === `Bearer ${saved.keys.admin}`)).toBe(true);
   expect(h.tabby.state.requests.find(item => item.path === '/v1/model/load')!.body).toEqual({
-    model_name: preset.model.folder, max_seq_len: 32768, cache_size: 32768, cache_mode: 'Q8', vision: true, draft_model: { draft_model_name: preset.drafter!.folder },
+    model_name: preset.model.folder, max_seq_len: 114688, cache_size: 114688, cache_mode: 'Q8', vision: true,
   });
-  expect(saved.downloads).toEqual({ [preset.model.folder]: preset.model.revision, [preset.drafter!.folder]: preset.drafter!.revision });
+  expect(saved.downloads).toEqual({ [preset.model.folder]: preset.model.revision });
   expect(prompts.lines).toContain('Loading model: 50%');
   // A restart loads the same deployment without setup.
   expect(await readFile(join(h.root, 'tabbyAPI', 'config.yml'), 'utf8')).toContain(`model_name: "${preset.model.folder}"`);
@@ -168,7 +171,7 @@ it('installs a pinned runtime, starts it, downloads and loads the preset as sepa
   expect(provisioned).toEqual([{
     roles: ['capable'], source: expect.any(String), apiKeyEnv: 'TABBY_API_KEY', apiKey: saved.keys.api,
     model: {
-      id: preset.model.folder, provider: 'tabbyapi', baseUrl: `http://127.0.0.1:${h.tabby.port}/v1`, contextTokens: 32768, maxOutputTokens: 16384,
+      id: preset.model.folder, provider: 'tabbyapi', baseUrl: `http://127.0.0.1:${h.tabby.port}/v1`, contextTokens: 114688, maxOutputTokens: 16384,
       toolCalling: true, vision: true, supportsDeveloperRole: false, supportsUsage: true, sampling: preset.sampling,
       reasoning: { type: 'chat_template_kwargs', values: { off: { enable_thinking: false }, low: { enable_thinking: true, reasoning_effort: 'low' }, medium: { enable_thinking: true, reasoning_effort: 'medium' }, xhigh: { enable_thinking: true, reasoning_effort: 'xhigh' } } },
     },
@@ -194,7 +197,7 @@ it('reuses a healthy managed install, its downloads and its loaded model', async
   expect(h.tabby.state.requests.map(item => item.path)).not.toContain('/v1/model/load');
 
   // After a restart the server is started again, and loads the model itself from its config.
-  h.tabby.state.up = false; h.tabby.state.loaded = { id: preset.model.folder, max_seq_len: 32768, draft: preset.drafter!.folder, vision: true };
+  h.tabby.state.up = false; h.tabby.state.loaded = { id: preset.model.folder, max_seq_len: 114688, draft: preset.model.folder, vision: true };
   const launch = vi.fn(async () => { h.tabby.state.up = true; return 1; });
   await tabbyDriver({ ...h.boundaries, launch }).start(context());
   expect(launch).toHaveBeenCalledTimes(1);
@@ -208,7 +211,7 @@ it('never reuses a download it did not see finish', async () => {
   await mkdir(join(h.root, 'models', preset.model.folder), { recursive: true });
   await writeFile(join(h.root, 'models', preset.model.folder, 'partial'), 'x');
   await h.driver.provision(context());
-  expect(h.tabby.state.requests.filter(item => item.path === '/v1/download').map(item => item.body.folder_name)).toEqual([preset.model.folder, preset.drafter!.folder]);
+  expect(h.tabby.state.requests.filter(item => item.path === '/v1/download').map(item => item.body.folder_name)).toEqual([preset.model.folder]);
   expect(existsSync(join(h.root, 'models', preset.model.folder, 'partial'))).toBe(false);
 });
 
@@ -257,7 +260,7 @@ it('reports state cheaply, gives hints for its own endpoint, and stops only its 
   expect(await h.driver.inspect(signal())).toMatchObject({ ready: false, detail: 'not installed' });
   await h.driver.ensure(context()); const [provisioned] = await h.driver.provision(context());
   const model = { ...(await loadConfig(h.root, {})).models.capable, ...provisioned!.model };
-  expect(await h.driver.inspect(signal())).toMatchObject({ ready: true, version: `TabbyAPI ${preset.runtimeRevision.slice(0, 7)}`, detail: `model ${preset.model.folder} loaded with drafter ${preset.drafter!.folder}; NVIDIA GeForce RTX 3090 (GPU 0, 24 GB, driver 610.60)` });
+  expect(await h.driver.inspect(signal())).toMatchObject({ ready: true, version: `TabbyAPI ${preset.runtimeRevision.slice(0, 7)}`, detail: `model ${preset.model.folder} loaded with MTP drafting; NVIDIA GeForce RTX 3090 (GPU 0, 24 GB, driver 610.60)` });
   expect((await h.driver.inspect(signal())).warnings).toBeUndefined();
   expect(h.tabby.state.requests.map(item => item.path)).not.toContain('/v1/chat/completions');
   expect(await h.driver.hint(model, signal())).toBeUndefined();
@@ -335,8 +338,20 @@ it('reloads a model running without its drafter, and warns about it and about a 
   expect((await h.driver.inspect(signal())).warnings).toEqual([expect.stringContaining('drafter is not loaded'), expect.stringContaining('logging errors')]);
   h.tabby.state.requests.length = 0;
   await h.driver.start(context());
-  expect(h.tabby.state.requests.find(item => item.path === '/v1/model/load')?.body).toMatchObject({ draft_model: { draft_model_name: preset.drafter!.folder } });
+  expect(h.tabby.state.loaded!.draft).toBe(preset.model.folder);
   expect((await h.driver.inspect(signal())).warnings).toEqual([expect.stringContaining('logging errors')]);
+});
+
+it('downloads and loads a separate drafter when a preset names one', async () => {
+  const drafter = { repository: 'example/drafter', revision: 'abc123', folder: 'drafter', bytes: 1000 };
+  const h = await harness({ preset: { ...preset, drafter, load: { ...preset.load, mtp: false } } });
+  await h.driver.ensure(context());
+  expect(await readFile(join(h.root, 'tabbyAPI', 'config.yml'), 'utf8')).not.toContain('draft_mode:');
+  await h.driver.provision(context());
+  expect(h.tabby.state.requests.filter(item => item.path === '/v1/download').map(item => item.body.folder_name)).toEqual([preset.model.folder, 'drafter']);
+  expect(h.tabby.state.requests.find(item => item.path === '/v1/model/load')?.body).toMatchObject({ draft_model: { draft_model_name: 'drafter' } });
+  expect(await readFile(join(h.root, 'tabbyAPI', 'config.yml'), 'utf8')).toContain('draft_model_name: "drafter"');
+  expect((await h.driver.inspect(signal())).detail).toContain('loaded with drafter drafter');
 });
 
 it('reloads a model running without vision, and keeps vision offload to the server settings', async () => {
@@ -351,7 +366,7 @@ it('reloads a model running without vision, and keeps vision offload to the serv
   await offloaded.driver.ensure(context());
   const config = await readFile(join(offloaded.root, 'tabbyAPI', 'config.yml'), 'utf8');
   expect(config).toContain('vision_offload: true');
-  expect(config).toContain('use_as_default: ["max_batch_size", "tool_format", "vision_offload"]');
+  expect(config).toContain('use_as_default: ["max_batch_size", "tool_format", "vision_offload", "autosplit_reserve", "draft_mode"]');
 });
 
 it('sets a large server log aside before starting the server', async () => {
@@ -381,7 +396,7 @@ it('sets up Optimized NVIDIA end to end: only verified reasoning tiers are enabl
   // Qwen's sampling travels with every request; probes alone decode greedily.
   expect(h.tabby.state.chats.every(body => body.top_k === 20 && body.temperature === 0)).toBe(true);
   // The review shows the normal tier dropping to its own reply length once reasoning verifies; context is shared.
-  expect(prompts.lines.join('\n')).toContain('Tiers:     normal 32,768 / 4,096 output · reasoning 32,768 / 8,192 output · deep 32,768 / 16,384 output');
+  expect(prompts.lines.join('\n')).toContain('Tiers:     normal 114,688 / 4,096 output · reasoning 114,688 / 8,192 output · deep 114,688 / 16,384 output');
   expect(await manageRuntimes('status', saved, prompts, signal(), runtimes)).toBe(true);
 }, 60000);
 

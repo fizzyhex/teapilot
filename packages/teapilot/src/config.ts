@@ -68,7 +68,7 @@ export const policySchema = z.object({
   permissions: z.array(z.enum(['inference', 'repository.read', 'repository.write', 'repository.shell', 'web.search', 'discord.play'])),
   disabledCapabilities: z.array(z.string()),
   budget: z.object({ requestUsd: money, dailyUsd: money, approvalThresholdUsd: money }).strict(),
-  limits: z.object({ maxTurns: z.number().int().min(1).max(1000), maxToolCalls: z.number().int().min(1).max(300), attemptTimeoutMs: z.number().int().min(1000).max(3_600_000), requestTimeoutMs: z.number().int().min(1000).max(120_000), commandTimeoutSeconds: z.number().int().min(1).max(600), maxPromptChars: z.number().int().min(1).max(20_000),
+  limits: z.object({ maxTurns: z.number().int().min(1).max(1000), maxToolCalls: z.number().int().min(1).max(300), attemptTimeoutMs: z.number().int().min(1000).max(3_600_000), requestTimeoutMs: z.number().int().min(1000).max(600_000), commandTimeoutSeconds: z.number().int().min(1).max(600), maxPromptChars: z.number().int().min(1).max(20_000),
     /** delegate_task messages one attempt may send to its juniors (agents/delegate.ts); 6 when unset. */
      maxJuniorTurns: z.number().int().min(0).max(30).optional(), planningToolCalls: z.number().int().min(1).max(300).optional(),
      instructorToolCalls: z.number().int().min(1).max(300).optional(), juniorToolCalls: z.number().int().min(1).max(300).optional(),
